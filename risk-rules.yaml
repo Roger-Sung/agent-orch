@@ -1,120 +1,130 @@
-# risk-rules.yaml — CONTRACT DRAFT (M0)
+# risk-rules.yaml — EXAMPLE ruleset (not loaded unless you ask for it)
 #
 # Why this file exists
 # --------------------
-# Intake currently hard-codes the risk heuristics of one specific deployment:
-# a tuple of keywords that mark a task as high risk, another that hints at the
-# execution target, and a table that maps a task description to a tracked
-# execution pattern. Those literals name private files and private subsystems,
-# so they cannot ship with the engine.
+# Intake decides how risky a task is by looking for words in its description.
+# Which words matter belongs to the system being dispatched for — its private
+# file names, its stores, its subsystems — not to the engine. Those literals
+# are therefore supplied by the deployment and never committed here.
 #
-# The split is therefore:
-#   * engine  — matching, precedence, and the resulting routing decision
-#   * ruleset — the keywords themselves, supplied by the deployment
+# The engine ships with generic built-in defaults and an EMPTY external
+# ruleset. Nothing below is active until a deployment points at a file:
 #
-# The engine ships with an EMPTY default ruleset. With no ruleset loaded every
-# task classifies as `low` risk and no stop gate is forced; a deployment that
-# wants risk-based gating must supply its own file. The examples below are
-# deliberately generic — a deployment's own file will name its own private
-# paths and subsystems, and those names never belong in this repository.
+#     export ORCH_RISK_RULES=~/.config/agent-orch/risk-rules.yaml
 #
-# Resolution order (engine behaviour, not configurable per rule):
-#   1. every rule whose keyword matches the task text is collected
-#   2. the highest severity category wins for the risk level
-#   3. actions are a union: any matched `require_stop_gate` forces the gate
-#   4. ties inside a category are resolved by file order (first wins)
+# This file is a worked example of the format. Copy it, then replace the rules
+# with your own vocabulary.
 #
-# Entry schema
-# ------------
-#   keyword   (required) the literal or pattern to look for in the task text
-#   category  (required) high_risk | medium_risk | stop_gate | target_hint
-#   action    (required) mark_high_risk | mark_medium_risk | require_stop_gate
-#                        | require_human_ack | hint_target
-#   match     (optional) substring (default) | word | regex
-#   target    (optional) only meaningful for category target_hint
-#   note      (optional) one line of rationale, surfaced in the intake record
+# Failure behaviour (implemented in orchestrator/risk_rules.py):
+#   * unset            -> empty ruleset, silent
+#   * set but missing  -> empty ruleset + warning on stderr
+#   * malformed        -> refuses to start; a half-parsed risk file would make
+#                         the operator believe gating was on while it was not
+#
+# External rules can only raise an assessment, never lower one: the built-in
+# defaults still apply and this file is unioned with them.
+#
+# Format note: rules are a mapping keyed by rule id rather than a sequence.
+# The engine has exactly one YAML subset parser and it is mapping-only;
+# introducing a second parser to gain list syntax would be a worse trade than
+# keying by id, and the id has to be unique anyway.
+#
+# Entry schema:
+#   keyword   the literal or pattern to look for (defaults to the rule id)
+#   category  high_risk | medium_risk | stop_gate | target_hint
+#   action    mark_high_risk | mark_medium_risk | require_stop_gate
+#             | require_human_ack | hint_target
+#   match     substring (default) | word | regex
+#   target    only meaningful with action hint_target
+#   note      one line of rationale
 
 version: 1
 
 defaults:
-  # Applied when no rule matches. Keep conservative: a deployment that ships
-  # no ruleset gets no false sense of gating.
+  # Applied when nothing matches. Keep it conservative: a deployment that
+  # ships no rules should not gain a false sense of gating.
   risk: low
   require_stop_gate: false
-  case_sensitive: false
 
 rules:
   # --- irreversible outward effects ------------------------------------
-  - keyword: publish
+  publish:
+    keyword: publish
     category: stop_gate
     action: require_stop_gate
     match: word
-    note: result leaves the machine and cannot be recalled
+    note: the result leaves the machine and cannot be recalled
 
-  - keyword: deploy
+  deploy:
+    keyword: deploy
     category: stop_gate
     action: require_stop_gate
     match: word
     note: changes what is running for someone other than the operator
 
-  - keyword: delete
+  delete:
+    keyword: delete
     category: stop_gate
     action: require_stop_gate
     match: word
     note: destructive and usually irreversible
 
   # --- persistent state -------------------------------------------------
-  - keyword: migration
+  schema_migration:
+    keyword: migration
     category: high_risk
     action: mark_high_risk
     match: word
-    note: schema or data shape changes are hard to roll back
+    note: schema and data shape changes are hard to roll back
 
-  - keyword: credential
+  credential_handling:
+    keyword: credential
     category: high_risk
     action: require_human_ack
-    match: substring
     note: anything touching secrets needs an explicit human acknowledgement
 
   # --- control plane of the orchestrator itself -------------------------
-  - keyword: scheduler
+  scheduler:
+    keyword: scheduler
     category: high_risk
     action: mark_high_risk
     match: word
     note: a broken scheduler silently stops all later work
 
-  - keyword: daemon
+  daemon_control:
+    keyword: daemon
     category: high_risk
     action: mark_high_risk
     match: word
 
   # --- softer signals ---------------------------------------------------
-  - keyword: notification
+  notification:
+    keyword: notification
     category: medium_risk
     action: mark_medium_risk
-    match: substring
 
-  - keyword: '(?:refactor|rename)\s+public\s+api'
+  public_api_rename:
+    keyword: '(?:refactor|rename)\\s+public\\s+api'
     category: medium_risk
     action: mark_medium_risk
     match: regex
 
   # --- target hints -----------------------------------------------------
   # Used to guess which component a task is about when the caller did not say.
-  - keyword: provider
+  provider_hint:
+    keyword: provider
     category: target_hint
     action: hint_target
     target: provider-adapter
     match: word
 
-  - keyword: intake
+  intake_hint:
+    keyword: intake
     category: target_hint
     action: hint_target
     target: intake
     match: word
 
 # Deployment-specific rules — private file names, private subsystem names,
-# personal knowledge-base paths, local database file names — are supplied by
-# the calling system in its own copy of this file and are intentionally absent
-# here. See docs/ for the loading contract:
-#   ORCH_RISK_RULES=<path>   or   orch start --risk-rules <path>
+# personal knowledge-base paths, local database file names — belong in the
+# deployment's own copy of this file and are intentionally absent here.

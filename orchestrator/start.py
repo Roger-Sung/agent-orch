@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .ipc import atomic_write_text, daemon_is_running, enqueue_request
+from .risk_rules import load_risk_rules
 
 
 TASK_TYPE_KEYWORDS: dict[str, set[str]] = {
@@ -1189,8 +1190,12 @@ def _has_concrete_target(text: str) -> bool:
 
 def _signals(text: str, task_type: str, approved_spec_given: bool, scope_ambiguous: bool) -> list[dict[str, Any]]:
     lowered = text.lower()
-    path_high = any(keyword in lowered for keyword in HIGH_RISK_KEYWORDS)
-    path_medium = any(keyword in lowered for keyword in MEDIUM_RISK_KEYWORDS)
+    # Built-in generic defaults first, then whatever vocabulary the deployment
+    # declared. An external file can only ever raise the assessment: it must
+    # not be able to talk the engine out of a risk its own defaults found.
+    external = load_risk_rules().evaluate(text)
+    path_high = any(keyword in lowered for keyword in HIGH_RISK_KEYWORDS) or external["high"]
+    path_medium = any(keyword in lowered for keyword in MEDIUM_RISK_KEYWORDS) or external["medium"]
     openspec_present = approved_spec_given or any(keyword in lowered for keyword in OPENSPEC_PRESENT_KEYWORDS)
     openspec_required = (
         task_type == "apply"
@@ -1307,6 +1312,8 @@ def _approved_spec_text(task_record: dict[str, Any]) -> bool:
 
 def _stop_gate(text: str, risk: dict[str, str]) -> bool:
     lowered = text.lower()
+    if load_risk_rules().evaluate(text)["require_stop_gate"]:
+        return True
     return (
         ("smoke" in lowered and ("gated" in lowered or "stop-gate" in lowered or "stop gate" in lowered))
         or
