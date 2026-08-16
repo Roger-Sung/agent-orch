@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the orchestrator daemon.
+
+  Replace every <PLACEHOLDER> before use, then install to
+  ~/Library/LaunchAgents/ and load it. No absolute paths are baked in on
+  purpose: this file is meant to be filled in per machine, not copied verbatim.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>agent-orch.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>&lt;REPO_ROOT&gt;/packaging/run-daemon.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>&lt;LOG_DIR&gt;/agent-orch.log</string>
+    <key>StandardErrorPath</key>
+    <string>&lt;LOG_DIR&gt;/agent-orch.error.log</string>
+    <key>WorkingDirectory</key>
+    <string>&lt;REPO_ROOT&gt;</string>
+</dict>
+</plist>
