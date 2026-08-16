@@ -1,0 +1,26 @@
+version: 1
+type: demo-loop
+initial_stage: draft
+max_transitions: 10
+stages:
+  draft:
+    owner: claude
+    attempt_cap: 2
+    timeout: 30
+    prompt: "Draft the requested change and hand it to review."
+    outcomes:
+      submit: review
+  review:
+    owner: codex
+    attempt_cap: 2
+    timeout: 30
+    prompt: "Review the draft. Block back to draft or allow completion."
+    outcomes:
+      block: draft
+      allow: done
+  done:
+    terminal: done
+edge_caps:
+  draft.submit: 4
+  review.block: 1
+  review.allow: 1
