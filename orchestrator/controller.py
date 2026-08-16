@@ -8,9 +8,11 @@ import sqlite3
 import shlex
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from .containment import Sentinel, Violation, protected_roots_from_env
 from .db import connect
 from .profile import Profile, ProfileError, canonical_json, load_profile, profile_from_snapshot, sha256_bytes
 from .runner import ProviderPreflightResult, RunResult, SubprocessRunner, classify_result
@@ -33,8 +35,15 @@ class Controller:
         runner: Any | None = None,
         read_only: bool = False,
         event_callback: Any | None = None,
+        protected_roots: tuple[Path, ...] | None = None,
     ):
         self.home = home.resolve()
+        # L2 watches these; empty means detection is off. The engine ships with
+        # no opinion about which directories on someone else's machine matter,
+        # so a deployment declares them (ORCH_PROTECTED_ROOTS) or passes them in.
+        self.protected_roots = (
+            tuple(protected_roots) if protected_roots is not None else protected_roots_from_env()
+        )
         self.tasks_dir = self.home / "tasks"
         self.conn = connect(self.home / "orchestrator.db", read_only=read_only)
         self.runner = runner or SubprocessRunner()
@@ -234,11 +243,64 @@ class Controller:
             )
 
     def _invoke_runner(self, task: sqlite3.Row, stage: Any, prompt: str, log_path: Path) -> RunResult:
-        """有 workspace 才走 containment；沒有就維持原本的呼叫方式（既有 runner 不受影響）。"""
+        """有 workspace 才走 containment；沒有就維持原本的呼叫方式（既有 runner 不受影響）。
+
+        L1 (the sandbox) lives in the runner, because it has to wrap the child
+        process. L2 (detection) lives here, because it has to bracket the run
+        and because the consequence of a hit — quarantine the task, do not
+        advance it — is the controller's decision to make.
+        """
         workspace = self._workspace_for(task)
         if workspace is None:
             return self.runner.run(stage.owner, prompt, stage.timeout, log_path)
-        return self.runner.run(stage.owner, prompt, stage.timeout, log_path, workspace=workspace)
+
+        sentinel = self._sentinel_for(workspace)
+        before = sentinel.snapshot() if sentinel is not None else None
+        result = self.runner.run(stage.owner, prompt, stage.timeout, log_path, workspace=workspace)
+        if sentinel is None or before is None:
+            return result
+        violations = sentinel.compare(before)
+        if not violations:
+            return result
+        return self._record_workspace_escape(task, log_path, result, violations)
+
+    def _sentinel_for(self, workspace: Path) -> Sentinel | None:
+        roots = self.protected_roots
+        if not roots:
+            return None
+        return Sentinel(roots=tuple(roots), workspace=workspace)
+
+    def _record_workspace_escape(
+        self, task: sqlite3.Row, log_path: Path, result: RunResult, violations: list[Violation]
+    ) -> RunResult:
+        """A stage wrote outside its workspace. Stop, quarantine, keep the evidence.
+
+        The stage may well have "succeeded" by its own account — that is the
+        dangerous case, and why this overrides the run's own classification
+        instead of being folded into it.
+        """
+        payload = {
+            "task_id": task["id"],
+            "workspace_dir": task["workspace_dir"],
+            "detected_at": _iso_now(),
+            "violations": [item.as_dict() for item in violations],
+        }
+        evidence_path = log_path.parent / "containment-violations.json"
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write(
+            evidence_path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+        )
+        self._quarantine(task["id"], None, evidence_path, "workspace_escape")
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"containment_violation_count={len(violations)}\n"
+                f"containment_evidence={evidence_path}\n"
+            )
+        return replace(
+            result,
+            containment_stop="workspace_escape",
+            containment_violations=tuple(item.as_dict() for item in violations),
+        )
 
     def _workspace_for(self, task: sqlite3.Row) -> Path | None:
         try:
