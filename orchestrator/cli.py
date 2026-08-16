@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .controller import Controller, ControllerError
 from .daemon import run_daemon
+from .runner import ALLOW_UNSANDBOXED_ENV
 from .ipc import IPCError, daemon_is_running, enqueue_request, wait_for_result
 from .profile import ProfileError
 from .start import (
@@ -32,6 +33,14 @@ def default_home() -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python3 -m orchestrator", description="agent-orch: a stateful dispatcher for multi-provider agent tasks")
+    parser.add_argument(
+        "--allow-unsandboxed",
+        action="store_true",
+        help=(
+            "run mutating stages without the L1 write sandbox. Only meaningful on a host where "
+            "sandbox-exec is missing; without this flag such a host refuses to run them at all."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     start = subparsers.add_parser("start", help="intake, preflight, and route a stateful lifecycle task")
@@ -140,6 +149,11 @@ def _broker_and_wait(home: Path, args: argparse.Namespace) -> tuple[dict, bool]:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if getattr(args, "allow_unsandboxed", False):
+        # Passed to stage subprocesses through the environment, so a daemon
+        # started with the flag keeps the opt-out and a stage never has to
+        # guess. It is deliberately noisy to set.
+        os.environ[ALLOW_UNSANDBOXED_ENV] = "1"
     home = default_home()
 
     if args.command == "start":

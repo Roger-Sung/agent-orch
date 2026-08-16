@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .containment import ContainmentError, prepare_sandbox
+
 
 OUTCOME_RE = re.compile(r"^ORCHESTRATOR_OUTCOME:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE)
 RATE_LIMIT_SIGNATURES = (
@@ -82,6 +84,7 @@ def prepare_containment(workspace: Path, log_path: Path) -> dict[str, str]:
 
     gitconfig = containment_root / "gitconfig"
     identity = _git_identity()
+    (containment_root / "identity-source").write_text(identity["source"] + "\n", encoding="utf-8")
     gitconfig.write_text(
         "[user]\n"
         f"\tname = {identity['name']}\n"
@@ -109,24 +112,72 @@ def prepare_containment(workspace: Path, log_path: Path) -> dict[str, str]:
     return env
 
 
-def _git_identity() -> dict[str, str]:
-    """保留 commit 身分：containment gitconfig 取代 global config，沒有它 commit 會直接失敗。"""
-    identity = {"name": "agent-orch", "email": "orchestrator@orch.invalid"}
-    for key in ("name", "email"):
-        try:
-            result = subprocess.run(
-                ["git", "config", "--global", f"user.{key}"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        value = result.stdout.strip()
-        if value:
-            identity[key] = value
-    return identity
+ALLOW_UNSANDBOXED_ENV = "ORCH_ALLOW_UNSANDBOXED"
+
+
+def allow_unsandboxed_requested(env: dict[str, str] | None = None) -> bool:
+    """True only when the operator explicitly accepted running without L1.
+
+    Set by `--allow-unsandboxed` on the CLI, or directly in the environment for
+    a service launcher. Anything other than an explicit truthy value means no:
+    the whole point is that an unconfined mutating stage has to be asked for.
+    """
+    raw = (env if env is not None else os.environ).get(ALLOW_UNSANDBOXED_ENV, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+DEFAULT_GIT_IDENTITY = {"name": "agent-orch", "email": "orchestrator@orch.invalid"}
+GIT_IDENTITY_ENV = "ORCH_GIT_IDENTITY"
+_IDENTITY_LITERAL_RE = re.compile(r"^\s*(?P<name>[^<>]+?)\s*<(?P<email>[^<>@\s]+@[^<>\s]+)>\s*$")
+
+
+def _git_identity(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Resolve the commit identity for a contained stage.
+
+    Containment replaces the global git config, and a commit with no identity
+    fails outright, so one has to be written. The question is *whose*.
+
+    Default: a fixed synthetic identity. The previous behaviour — read the
+    machine's global `user.name`/`user.email` and use them — silently stamped
+    the operator's real name and address onto every commit an agent made,
+    including any evidence later published. See docs/decisions/0001.
+
+    Opt in explicitly with ORCH_GIT_IDENTITY:
+      * ``global``            resolve from `git config --global` (old behaviour)
+      * ``Name <a@b.example>``  use this literal
+
+    A malformed value fails the stage rather than falling back to `global`;
+    silently using the real identity is the failure mode being designed out.
+    """
+    source = (env if env is not None else os.environ).get(GIT_IDENTITY_ENV, "").strip()
+    if not source:
+        return {**DEFAULT_GIT_IDENTITY, "source": "default"}
+    if source == "global":
+        identity = dict(DEFAULT_GIT_IDENTITY)
+        for key in ("name", "email"):
+            try:
+                result = subprocess.run(
+                    ["git", "config", "--global", f"user.{key}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            value = result.stdout.strip()
+            if value:
+                identity[key] = value
+        # The resolved value is deliberately not recorded anywhere: only the
+        # fact that a global identity was used travels into the stage record,
+        # so evidence stays sanitizable by construction.
+        return {**identity, "source": "global"}
+    match = _IDENTITY_LITERAL_RE.match(source)
+    if match is None:
+        raise ContainmentError(
+            f"{GIT_IDENTITY_ENV} must be 'global' or 'Name <address@host>'; refusing to guess"
+        )
+    return {"name": match.group("name"), "email": match.group("email"), "source": "env-literal"}
 
 
 @dataclass(frozen=True)
@@ -150,6 +201,12 @@ class RunResult:
     classification: str
     reason: str
     timed_out: bool = False
+    #: Set when containment itself stopped the stage (sandbox unavailable,
+    #: identity misconfigured, or a write outside the workspace was detected).
+    #: It short-circuits classification so the stop reason stays specific
+    #: instead of collapsing into a generic non-zero exit.
+    containment_stop: str | None = None
+    containment_violations: tuple[dict[str, str], ...] = ()
     started_at_ms: int | None = None
     ended_at_ms: int | None = None
     duration_ms: int | None = None
@@ -169,6 +226,21 @@ def classify_result(
     source: RunResult | None = None,
 ) -> RunResult:
     telemetry = _telemetry_from(source)
+    if source is not None and source.containment_stop is not None:
+        # Containment outranks every other signal: a stage that escaped its
+        # workspace, or never got a sandbox, must not be reported as a plain
+        # non-zero exit — the operator needs to know which of the two happened.
+        return RunResult(
+            exit_code,
+            output,
+            None,
+            "blocked",
+            source.containment_stop,
+            timed_out,
+            containment_stop=source.containment_stop,
+            containment_violations=source.containment_violations,
+            **telemetry,
+        )
     if timed_out:
         return RunResult(exit_code, output, None, "blocked", "timeout", True, **telemetry)
     if exit_code != 0:
@@ -281,7 +353,32 @@ class SubprocessRunner:
         workspace: Path | None = None,
     ) -> RunResult:
         command = self._command(owner) + [prompt]
-        containment_env = prepare_containment(workspace, log_path) if workspace is not None else None
+        model_command = command
+        containment_env = None
+        if workspace is not None:
+            try:
+                containment_env = prepare_containment(workspace, log_path)
+            except ContainmentError as exc:
+                return self._containment_stop(
+                    log_path, owner, command, "containment_identity_invalid", str(exc)
+                )
+            decision = prepare_sandbox(
+                workspace,
+                log_path.parent / "containment",
+                allow_unsandboxed=allow_unsandboxed_requested(),
+            )
+            if decision.blocks_run:
+                return self._containment_stop(
+                    log_path,
+                    owner,
+                    command,
+                    "sandbox_unavailable",
+                    "L1 sandbox is unavailable on this host and --allow-unsandboxed was not given; "
+                    "refusing to run a mutating stage unconfined",
+                )
+            containment_env["ORCH_CONTAINMENT_SANDBOX"] = decision.mode
+            model_command = command
+            command = decision.wrap(command)
         started = time.time()
         exit_code: int | None = None
         output = ""
@@ -334,11 +431,36 @@ class SubprocessRunner:
             started_at_ms=_ms(started),
             ended_at_ms=_ms(ended),
             duration_ms=max(0, _ms(ended) - _ms(started)),
-            model=SubprocessRunner._model_from_command(command) or "unspecified",
+            model=SubprocessRunner._model_from_command(model_command) or "unspecified",
             usage_input_tokens=usage["input_tokens"],
             usage_output_tokens=usage["output_tokens"],
             usage_total_tokens=usage["total_tokens"],
             usage_unavailable_reason=usage["unavailable_reason"],
+        )
+
+    def _containment_stop(
+        self, log_path: Path, owner: str, command: list[str], reason: str, message: str
+    ) -> RunResult:
+        """Report a stage that was never allowed to start, with its own reason.
+
+        The log still gets written, because "why did nothing run" is exactly
+        the question an operator asks next.
+        """
+        now = time.time()
+        text = f"{reason}: {message}\n"
+        self._write_log(log_path, owner, command, now, now, None, False, text, message, None)
+        return RunResult(
+            None,
+            text,
+            None,
+            "raw",
+            "raw",
+            False,
+            containment_stop=reason,
+            started_at_ms=_ms(now),
+            ended_at_ms=_ms(now),
+            duration_ms=0,
+            model=SubprocessRunner._model_from_command(command) or "unspecified",
         )
 
     @staticmethod
