@@ -20,6 +20,26 @@ from the deployment's `AIOS_*` namespace to `ORCH_*`
 `ORCH_CONTAINMENT*`, `AIOS_FAKE_AGENT_*` → `ORCH_FAKE_AGENT_*`). The upstream
 prefix named a private system and would have been meaningless here.
 
+> **Migration note — this rename is a breaking change for the original
+> deployment.** The moment that deployment stops carrying its own copy of the
+> code and consumes this repository as an upstream dependency, its service
+> launcher and its launchd plist still export the old `AIOS_*` names. Nothing
+> reads them any more, so the provider commands fall back to their defaults
+> and the daemon fails at the first stage — quietly, because a missing
+> optional environment variable is not an error. Rename them in the same
+> change that switches to the dependency; do not stage it as a follow-up.
+>
+> Checklist for that switch:
+> - `run-daemon.sh` (or equivalent launcher): `AIOS_ORCH_CLAUDE_COMMAND`,
+>   `AIOS_ORCH_CODEX_COMMAND`, `AIOS_ORCH_CLAUDE_MODEL`, `AIOS_ORCH_CODEX_MODEL`
+> - launchd plist: any `AIOS_ORCH_*` entry in `EnvironmentVariables`
+> - shell profiles, cron entries, or wrappers that export `AIOS_ORCH_HOME`,
+>   `AIOS_ORCH_POLL_INTERVAL`, `AIOS_ORCH_WAIT_TIMEOUT`
+> - anything asserting on `AIOS_CONTAINMENT` / `AIOS_CONTAINMENT_WORKSPACE`
+>
+> Quick check after the switch: `env | grep AIOS_` should be empty, and a
+> provider smoke task should reach `done`.
+
 ## Engine
 
 | Upstream path | Disposition | Notes |
