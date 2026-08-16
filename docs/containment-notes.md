@@ -1,8 +1,11 @@
-# Containment notes
+# Containment notes (superseded)
 
-Working notes on how the containment layers behave in practice. These are the
-things that were surprising while building them, kept here so the eventual
-`docs/threat-model.md` can be written from evidence rather than memory.
+> **These notes have been folded into [`threat-model.md`](threat-model.md).**
+> They are kept because they are the raw working record — what actually bit
+> during development, in the order it bit — while the threat model is the
+> organised version a reader should start from.
+
+Working notes on how the containment layers behave in practice.
 
 ## L1 — what the allowlist necessarily gives up
 
