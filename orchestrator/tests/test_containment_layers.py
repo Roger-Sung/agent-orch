@@ -26,6 +26,7 @@ from pathlib import Path
 from orchestrator.containment import (
     DEFAULT_SENTINEL_EXCLUDES,
     SANDBOX_EXEC,
+    write_allowlist,
     ContainmentError,
     Sentinel,
     build_sandbox_profile,
@@ -46,6 +47,29 @@ from orchestrator.runner import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def uncontained_base() -> Path | None:
+    """A directory the L1 allowlist does *not* cover, for fixtures to live in.
+
+    The allowlist necessarily includes the temporary directories, so a fixture
+    under /tmp proves nothing about whether writes are blocked — the test would
+    pass while asserting nothing. Usually the repository itself is a fine host,
+    but not when the repository has been cloned into /tmp, which is exactly
+    what a clean-checkout check does. So pick the first candidate that is
+    genuinely outside every allowlisted root, and skip loudly if there is none.
+    """
+    allowed = write_allowlist(Path("/nonexistent-workspace"), Path("/nonexistent-artifacts"))
+
+    def covered(path: Path) -> bool:
+        real = os.path.realpath(path)
+        return any(real == root or real.startswith(root + os.sep) for root in allowed)
+
+    for candidate in (REPO_ROOT, Path.home() / ".agent-orch-test-fixtures"):
+        candidate.mkdir(parents=True, exist_ok=True)
+        if not covered(candidate):
+            return candidate
+    return None
 
 PROFILE_YAML = """\
 version: 1
@@ -71,7 +95,10 @@ class SandboxFixture(unittest.TestCase):
     """Base fixture: a workspace and a sibling protected tree, both outside /tmp."""
 
     def setUp(self) -> None:
-        self.base = Path(tempfile.mkdtemp(prefix=".containment-test-", dir=REPO_ROOT))
+        host = uncontained_base()
+        if host is None:
+            self.skipTest("no directory outside the L1 allowlist is available to host fixtures")
+        self.base = Path(tempfile.mkdtemp(prefix=".containment-test-", dir=host))
         self.workspace = self.base / "workspace"
         self.workspace.mkdir()
         self.artifacts = self.base / "artifacts"

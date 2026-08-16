@@ -4,6 +4,9 @@ __pycache__/
 # Local scan secrets must never be committed; the canonical location is
 # ~/.config/agent-orch/lint.secrets, outside the repository.
 *.secrets
+# ...except the test fixture, which holds only synthetic values and has to be
+# present for the scanner's own tests to run in a fresh clone.
+!tools/tests/fixtures/secrets-example.secrets
 # Runtime state of a local orchestrator home.
 /orch-home/
 /output/
