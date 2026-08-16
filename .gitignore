@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+# Local scan secrets must never be committed; the canonical location is
+# ~/.config/agent-orch/lint.secrets, outside the repository.
+*.secrets
+# Runtime state of a local orchestrator home.
+/orch-home/
+/output/

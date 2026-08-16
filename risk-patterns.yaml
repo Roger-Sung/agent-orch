@@ -1,0 +1,142 @@
+# risk-patterns.yaml — forbidden-pattern rules for tools/sanitize-lint.py
+#
+# Contract:
+#   * This file holds RULES only. It must never hold a real secret value.
+#   * Rules whose detection depends on site-specific literals (a person's
+#     name, an employer's domain) declare `requires_secrets: true` and carry
+#     no regex; the operator supplies the literal at scan time through
+#     `--secrets-file`, which stays out of version control.
+#   * Regexes are written so that this file does not match itself (character
+#     classes such as `memory[/]active` instead of the bare literal), which
+#     keeps a full-repo scan clean without excluding the rules file.
+#
+# Entry schema:
+#   id                 unique rule identifier (also the secrets-file key for
+#                      `requires_secrets` rules)
+#   category           grouping used in reports (path | pii | secret | infra | org)
+#   severity           high | medium | low
+#   description        one line, human readable
+#   regex              Python `re` syntax; omitted for requires_secrets rules
+#   allow              optional list of regexes; a match is suppressed when the
+#                      matched text also matches one of these
+#   mask               replacement string printed in reports instead of the hit
+#   requires_secrets   true when the literal must come from --secrets-file
+
+version: 1
+
+exclude_dirs:
+  - .git
+  - .hg
+  - __pycache__
+  - node_modules
+  - .venv
+  - venv
+  - .mypy_cache
+  - .pytest_cache
+
+exclude_suffixes:
+  - .pyc
+  - .pyo
+  - .so
+  - .dylib
+  - .png
+  - .jpg
+  - .jpeg
+  - .gif
+  - .pdf
+  - .zip
+  - .gz
+  - .sqlite
+  - .db
+
+# Relative to the scan root. Only applied while walking a directory: a file
+# named explicitly on the command line is always scanned, so the golden
+# fixture can be linted on purpose.
+exclude_paths:
+  - 'tools/tests/fixtures/forbidden-*'
+  - '*.secrets'
+  - '*.local.yaml'
+
+patterns:
+  - id: local_home_path
+    category: path
+    severity: high
+    description: Absolute home directory of a local operator account
+    regex: '(?:/Users|/home)/(?!\*|<|\$|USER\b)[A-Za-z0-9._-]{2,}'
+    mask: '/Users/***/'
+
+  - id: email_address
+    category: pii
+    severity: high
+    description: Email address that may identify a person or an employer
+    regex: '[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    mask: '<redacted-email>'
+    allow:
+      - '@example\.(?:com|org|net)'
+      - '@[A-Za-z0-9.-]*\.(?:local|invalid|test)'
+      - '@users\.noreply\.github\.com'
+      - '^noreply@'
+
+  - id: person_name
+    category: pii
+    severity: high
+    description: Real name of the operator or of a colleague
+    requires_secrets: true
+
+  - id: discord_webhook
+    category: secret
+    severity: high
+    description: Discord webhook endpoint (bearer-equivalent credential)
+    regex: 'https?://(?:[A-Za-z0-9-]+\.)?discord(?:app)?\.com/api/webhooks/\d{5,}'
+    mask: '<redacted-webhook>'
+
+  - id: discord_snowflake
+    category: secret
+    severity: medium
+    description: 17-19 digit identifier (channel, thread, guild, user)
+    regex: '(?<![\d.])\d{17,19}(?![\d.])'
+    mask: '<redacted-id>'
+
+  - id: push_or_tunnel_host
+    category: infra
+    severity: high
+    description: Notification topic host or private tunnel hostname
+    regex: '(?:ntfy\.[A-Za-z0-9.-]+|[A-Za-z0-9-]+\.ts\.net|[A-Za-z0-9-]+\.trycloudflare\.com|[A-Za-z0-9-]+\.ngrok(?:-free)?\.(?:app|io)|tailscale\.com)'
+    mask: '<redacted-host>'
+
+  - id: company_domain
+    category: org
+    severity: high
+    description: Employer domain, internal host, or internal project code name
+    requires_secrets: true
+
+  - id: api_token_prefix
+    category: secret
+    severity: high
+    description: Well-known API token prefixes
+    # The leading lookbehind keeps ordinary prose out (e.g. "risk-proportional"
+    # would otherwise match the sk- alternative); the digit lookahead on the
+    # sk- form keeps hyphenated English words out.
+    regex: '(?<![A-Za-z0-9_-])(?:sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{16,}|gho_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})'
+    mask: '<redacted-token>'
+
+  - id: private_memory_path
+    category: path
+    severity: high
+    description: Private long-term memory store path of the calling system
+    regex: 'memory[/]active'
+    mask: '<redacted-private-path>'
+
+  - id: runtime_env_file
+    category: secret
+    severity: high
+    description: Runtime credential file consumed by the daemon launcher
+    regex: '[.]orch[.]env'
+    mask: '<redacted-env-file>'
+
+  - id: company_access_tooling
+    category: org
+    severity: high
+    description: Employer network access helper and its scoped wrappers
+    regex: 'company[-](?:access|git|web|db)\b'
+    mask: '<redacted-tooling>'

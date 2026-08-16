@@ -1,0 +1,14 @@
+CLEAN FIXTURE — sanitize-lint must exit zero on this file, both with and
+without a secrets file. It exercises the placeholder conventions the repo uses
+so that a future over-broad regex shows up as a false positive here.
+
+workspace root: ${WORKSPACE}
+operator home placeholder: /Users/<name>/code/orch
+env placeholder: $HOME/.config/orch
+contact: noreply@example.com
+support: help@example.org
+task id: 7f3a91c2
+numeric ids stay short: 4211, 1699884120
+demo host: localhost:8765
+demo agent identity: orchestrator@orch.invalid
+license: all rights reserved, source-available for evaluation

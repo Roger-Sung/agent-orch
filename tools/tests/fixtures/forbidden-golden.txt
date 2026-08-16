@@ -1,0 +1,42 @@
+GOLDEN FIXTURE — every value below is synthetic and must stay synthetic.
+Purpose: sanitize-lint must exit non-zero on this file. If it ever exits zero,
+a rule regex has been broken and the scanner is silently green.
+This file is excluded from directory walks; the test passes it explicitly.
+
+# local_home_path
+launcher plist references /Users/examplename/code/orch/run-daemon.sh
+linux variant: /home/examplename/.config/orch
+
+# email_address
+maintainer contact: alice.example.person@fakemail.tld
+
+# discord_webhook
+notify_url = https://discord.com/api/webhooks/123456789012345678/FakeWebhookTokenAbCdEf000000
+
+# discord_snowflake
+thread_id = 987654321098765432
+
+# push_or_tunnel_host
+push_host = ntfy.fake-notify.tld
+mesh_host = fake-box.ts.net
+tunnel_a = fake-tunnel.trycloudflare.com
+tunnel_b = fake-demo.ngrok.app
+mesh_admin = tailscale.com
+
+# api_token_prefix
+openai_style = sk-FAKE0000000000000000000
+github_pat_a = ghp_FAKE000000000000000000
+github_pat_b = gho_FAKE000000000000000000
+github_pat_c = github_pat_FAKE00000000000000000
+slack_style  = xoxb-FAKE0000000000
+aws_style    = AKIAFAKE0000000000AB
+
+# private_memory_path
+sync_target = memory/active/index.yaml
+
+# runtime_env_file
+credential_source = .orch.env
+
+# company_access_tooling
+helper_invocation = company-access status
+scoped_wrapper = company-git fetch

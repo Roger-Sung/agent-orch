@@ -1,0 +1,50 @@
+Copyright (c) 2026 the author of this repository. All rights reserved.
+
+SOURCE-AVAILABLE FOR REFERENCE AND EVALUATION ONLY
+
+This repository is published so that it can be read: by hiring managers,
+interviewers, reviewers, and anyone else assessing the author's engineering
+work. It is not open source, and no open-source license is granted, implied,
+or intended.
+
+1. Permitted, without a separate agreement
+   a. Viewing, reading, and reviewing the source code.
+   b. Making a temporary local copy for the sole purpose of reading it or
+      evaluating the author's work (for example, cloning the repository to
+      read it in an editor, or running the bundled demo locally to see how it
+      behaves).
+   c. Quoting short excerpts when discussing or assessing this work, with
+      attribution to this repository.
+
+2. Not permitted, without prior written permission from the copyright holder
+   a. Use of this software, in whole or in part, in any product, service,
+      internal tool, or other software, whether commercial or not.
+   b. Redistribution, publication, sublicensing, sale, or hosting of this
+      software or of any derivative work, in source or binary form.
+   c. Modification for any purpose other than the local evaluation described
+      in section 1(b).
+   d. Use of this software, or any part of it, as training data or as input
+      for machine-learning model training or fine-tuning.
+
+3. Reservation of rights
+   All rights not expressly granted above are reserved by the copyright
+   holder. Nothing here grants any right in any trademark, service mark, or
+   trade name.
+
+4. No warranty
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+5. No liability
+   IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+   ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OF OR
+   OTHER DEALINGS IN THE SOFTWARE.
+
+6. Termination
+   Any use outside the permissions in section 1 terminates the permissions in
+   section 1 automatically.
+
+For any use beyond section 1, contact the copyright holder through the
+repository's hosting platform to request written permission.
