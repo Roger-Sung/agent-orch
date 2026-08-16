@@ -65,11 +65,20 @@ and publishing them would leak the shape of a private system for no benefit.
 
 They are removed here. The generic terms (`orchestrator/`, `router/`,
 `scheduler/`, `daemon/`, `lock/`, `memory/`, `dispatch/`, `persistent-state`)
-remain as built-in defaults. The externalisation contract that lets a
-deployment supply its own vocabulary is drafted in `risk-rules.yaml` at the
-repository root; **the loader is not implemented yet** — that is tracked as
-M1 work, and until it lands a deployment cannot restore its own keywords
-without editing the source. This is a known, deliberate gap, not an oversight.
+remain as built-in defaults. A deployment supplies its own vocabulary through
+`ORCH_RISK_RULES`, pointing at a file in the format documented in
+`risk-rules.yaml` at the repository root (which is an example, not an active
+ruleset). The loader lives in `orchestrator/risk_rules.py`: an unset variable
+means an empty ruleset, a configured-but-missing file warns and continues
+empty, and a malformed file refuses to load rather than silently classifying
+every task as low risk. External rules can only raise an assessment, never
+lower one.
+
+One deviation from the original contract draft: rules are a mapping keyed by
+rule id rather than a sequence, because the engine has exactly one YAML subset
+parser and it is mapping-only. Adding a second parser to gain list syntax
+would have been a worse trade than keying by an id that has to be unique
+anyway.
 
 ## Profiles
 
@@ -137,8 +146,10 @@ Two rewrites deserve calling out because they changed meaning, not just words:
 
 Tracked so that the gap is visible rather than discovered later:
 
-- Containment layers L1 (write allowlist) and L2 (out-of-workspace write
-  detection) — the security work this extraction exists to make safe.
-- The `risk-rules.yaml` loader.
-- `docs/threat-model.md`, including the scanner's line-by-line matching limit.
+- `docs/threat-model.md`, including the scanner's line-by-line matching limit
+  and the residual gaps L3 would close (separate UNIX identity, network egress
+  allowlist).
+- A recorded end-to-end run under L1 to confirm the provider CLI write
+  allowlist is complete in practice; today it comes from an observed-write
+  probe, not from a full task under the sandbox.
 - README, architecture and lifecycle diagrams, recorded demo.
