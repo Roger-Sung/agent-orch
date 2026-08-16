@@ -1,0 +1,34 @@
+version: 1
+type: artifact-validation
+initial_stage: validate
+max_transitions: 4
+stages:
+  validate:
+    owner: claude
+    attempt_cap: 1
+    timeout: 900
+    prompt: "You are running a validation harness. All paths below are relative to your working directory, which is the task workspace. Treat the task input as the authoritative brief. Validate readiness and produce only the requested validation artifact. Do not implement the subject system, enqueue a real run of it, mutate any persistent store, commit, push, reset, clean, or write external state. When the validation artifact is complete, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: validated"
+    outcomes:
+      validated: review
+  review:
+    owner: codex
+    attempt_cap: 1
+    timeout: 900
+    prompt: "Review the validation harness output against the brief. Do not implement the subject system, enqueue a real run of it, mutate any persistent store, commit, push, reset, clean, or write external state. If the harness carries no High or Medium blocker, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: ready. If a blocker remains, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: needs_revision"
+    outcomes:
+      ready: done
+      needs_revision: revise
+  revise:
+    owner: claude
+    attempt_cap: 1
+    timeout: 900
+    prompt: "Revise only the validation harness artifacts to address the review blockers. Do not implement the subject system, enqueue a real run of it, mutate any persistent store, commit, push, reset, clean, or write external state. When complete, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: revised"
+    outcomes:
+      revised: review
+  done:
+    terminal: done
+edge_caps:
+  validate.validated: 1
+  review.ready: 1
+  review.needs_revision: 1
+  revise.revised: 1

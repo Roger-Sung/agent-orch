@@ -1,0 +1,28 @@
+version: 1
+type: spec-review
+initial_stage: codex_review
+max_transitions: 4
+stages:
+  codex_review:
+    owner: codex
+    attempt_cap: 2
+    timeout: 600
+    prompt: "You are reviewing a specification. All paths below are relative to your working directory, which is the task workspace. Read the task input, the routing decision embedded in it, and any spec files it references. Preserve unrelated user changes. Do not commit, push, reset, clean, run a stop gate, or make provider network calls beyond this provider process. Review three axes separately: Product/Spec alignment, Platform constraints, and Verification evidence; at this stage assess whether the evidence plan is sufficient, not whether unexecuted checks passed. If the spec contains tasks, validate Blocked by completeness, absence of cycles, safe parallelism, and risk-proportional completion evidence; tasks carrying no dependency metadata stay sequential. Write a concise report to reports/spec-review-report.md with an explicit verdict per axis and findings ordered High, Medium, Low, each grounded in a file reference. A FAIL or UNKNOWN axis cannot be masked by another axis passing. If the spec is ready for final review, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: reviewed"
+    outcomes:
+      reviewed: claude_review
+  claude_review:
+    owner: claude
+    attempt_cap: 2
+    timeout: 600
+    prompt: "You are the second reviewer, from a different provider family than the first. All paths below are relative to your working directory, which is the task workspace. Read the task input and reports/spec-review-report.md. Preserve unrelated user changes. Do not commit, push, reset, clean, run a stop gate, or make provider network calls beyond this provider process. Independently confirm the Product/Spec alignment, Platform constraints, and Verification evidence-plan verdicts; do not let one passing axis mask a failed or unknown one, and do not claim that unexecuted checks passed. Write reports/spec-review-second-opinion.md. If every axis is assessable and no High or Medium blocking issue remains, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: ready. If any axis is failed or unknown, or a High or Medium blocking issue remains, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: blocked"
+    outcomes:
+      ready: done
+      blocked: failed
+  done:
+    terminal: done
+  failed:
+    terminal: failed
+edge_caps:
+  codex_review.reviewed: 1
+  claude_review.ready: 1
+  claude_review.blocked: 1

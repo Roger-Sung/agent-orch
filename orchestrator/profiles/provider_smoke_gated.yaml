@@ -1,0 +1,24 @@
+version: 1
+type: provider-smoke
+initial_stage: draft
+max_transitions: 3
+stages:
+  draft:
+    owner: claude
+    attempt_cap: 1
+    timeout: 120
+    prompt: "Gated provider smoke stage. Return a one-line deterministic draft. Do not read external network content, write persistent state, run shell commands, or depend on prior artifacts. If the provider path is healthy, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: drafted"
+    outcomes:
+      drafted: review
+  review:
+    owner: codex
+    attempt_cap: 1
+    timeout: 120
+    prompt: "Gated provider smoke review stage. Read the task input and confirm only that the routed provider path reached this stage. Do not read external network content, write persistent state, run shell commands, or depend on prior artifacts. If the path is healthy, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: ready"
+    outcomes:
+      ready: done
+  done:
+    terminal: done
+edge_caps:
+  draft.drafted: 1
+  review.ready: 1

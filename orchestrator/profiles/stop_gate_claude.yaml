@@ -1,0 +1,18 @@
+version: 1
+type: stop-gate
+initial_stage: review
+max_transitions: 2
+stages:
+  review:
+    owner: claude
+    attempt_cap: 2
+    timeout: 600
+    prompt: "You are the stop-gate reviewer for a task executed by Codex, a different provider family from your own — the point of this stage is that the executor cannot clear itself. Read the task input carefully: the task record, the routing decision, the processed execution result, the original pattern with its executor and reviewer, the expected review output path, and the required review schema. Preserve unrelated user changes. Do not commit, push, reset, clean, escalate, apply an ALLOW or BLOCK decision yourself, publish, deploy, or write external state. Write the stop-gate review to the review output path named in the task input, using the required schema exactly. Lead the Findings section with High and Medium blockers. If no High or Medium blocker remains for the later manual gate decision, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: allow. If any High or Medium blocker remains, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: block"
+    outcomes:
+      allow: done
+      block: done
+  done:
+    terminal: done
+edge_caps:
+  review.allow: 1
+  review.block: 1

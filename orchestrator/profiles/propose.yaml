@@ -1,0 +1,26 @@
+version: 1
+type: propose
+initial_stage: draft
+max_transitions: 10
+stages:
+  draft:
+    owner: claude
+    attempt_cap: 2
+    timeout: 600
+    prompt: "You are drafting a specification. The brief is in the task input above. All paths below are relative to your working directory, which is the task workspace. First read review-notes.md if it exists and address every item in it, then write your complete spec to spec-draft.md, replacing any previous version. Stay inside the brief. Look up facts you can verify yourself from the repository, existing specs, or runtime evidence; never promote your own suggestion or inference into a user decision. If an open question would change scope, architecture, persistent state, routing, or how the work gets verified, record only the single highest-priority question with your recommended answer and its trade-off, and let review block on it. If the spec contains implementation tasks, give each one an explicit Blocked by (write none when it has no dependency) and observable completion evidence; mark a task parallel-safe only when it shares no dependency, no mutable state, no overlapping files, and no contract risk with another task. When the draft is complete, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: drafted"
+    outcomes:
+      drafted: review
+  review:
+    owner: codex
+    attempt_cap: 2
+    timeout: 600
+    prompt: "You are reviewing a specification. All paths below are relative to your working directory, which is the task workspace. Read spec-draft.md and check it against the brief in the task input above for High-severity gaps or contradictions. Judge three axes separately: Product/Spec alignment, Platform constraints, and Verification evidence; at this stage judge whether the evidence plan is sufficient, not whether unexecuted checks passed. A FAIL or UNKNOWN on any axis cannot be masked by a PASS on another. If the spec contains tasks, check that Blocked by is complete and acyclic, that parallel-safe claims hold, and that completion evidence is proportional to the risk. Write your findings to review-notes.md in the same directory. If any High-severity gap remains, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: needs_convergence. If all three axes are acceptable and nothing High remains, print exactly one typed outcome: ORCHESTRATOR_OUTCOME: ready"
+    outcomes:
+      needs_convergence: draft
+      ready: done
+  done:
+    terminal: done
+edge_caps:
+  draft.drafted: 5
+  review.needs_convergence: 2
+  review.ready: 1
