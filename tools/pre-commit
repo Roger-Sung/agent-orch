@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# agent-orch pre-commit hook: refuse to record a commit that carries a
+# forbidden pattern.
+#
+# Install:  ln -sf ../../tools/pre-commit .git/hooks/pre-commit
+#
+# Fail-closed by design. The scanner needs site-local literals it must never
+# store in the repository; if that file is missing the hook aborts the commit
+# rather than running a partial scan and reporting success.
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+LINT="$REPO_ROOT/tools/sanitize-lint.py"
+SECRETS="${AGENT_ORCH_LINT_SECRETS:-$HOME/.config/agent-orch/lint.secrets}"
+
+if [ ! -f "$SECRETS" ]; then
+    echo "pre-commit: missing secrets file: $SECRETS" >&2
+    echo "pre-commit: refusing to run a partial scan. Create it, or point" >&2
+    echo "            AGENT_ORCH_LINT_SECRETS at it." >&2
+    exit 1
+fi
+
+# Scan the staged content, not the working tree: what gets committed is what
+# matters. Staged blobs are materialised in a temporary directory so that the
+# scan sees exactly the tree this commit would record.
+STAGED_DIR="$(mktemp -d)"
+trap 'rm -rf "$STAGED_DIR"' EXIT
+
+# Portable to bash 3.2 (the system bash on macOS): no mapfile, no arrays.
+STAGED_COUNT=0
+while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    mkdir -p "$STAGED_DIR/$(dirname "$path")"
+    git show ":$path" > "$STAGED_DIR/$path" 2>/dev/null || true
+    STAGED_COUNT=$((STAGED_COUNT + 1))
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+
+if [ "$STAGED_COUNT" -eq 0 ]; then
+    exit 0
+fi
+
+if ! python3 "$LINT" "$STAGED_DIR" --rules "$REPO_ROOT/risk-patterns.yaml" \
+        --root "$STAGED_DIR" --secrets-file "$SECRETS"; then
+    echo "" >&2
+    echo "pre-commit: sanitization scan failed — commit refused." >&2
+    echo "pre-commit: fix the findings above. Do not bypass with --no-verify;" >&2
+    echo "            a dirty commit cannot be cleaned up later without a" >&2
+    echo "            history rewrite, which the project forbids." >&2
+    exit 1
+fi
