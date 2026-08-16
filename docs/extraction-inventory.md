@@ -40,6 +40,39 @@ prefix named a private system and would have been meaningless here.
 > Quick check after the switch: `env | grep AIOS_` should be empty, and a
 > provider smoke task should reach `done`.
 
+> **Migration note — declare the protected roots, or L2 does nothing.** The
+> out-of-workspace write detection is off until `ORCH_PROTECTED_ROOTS` names
+> what to watch (`os.pathsep`-separated absolute paths). The engine ships with
+> no default because it has no business guessing which directories on someone
+> else's machine matter — but the consequence is easy to miss: a deployment
+> that switches to this dependency and does not set the variable has L1 only,
+> and the incident that motivated all of this (a stage rewriting a live store
+> outside its workspace) would be prevented but not *detected* if L1 were ever
+> unavailable.
+>
+> For the deployment this was extracted from, that means at minimum its own
+> home directory — the store that was damaged lives there. Set it in the same
+> launcher that exports the provider commands:
+>
+> ```sh
+> export ORCH_PROTECTED_ROOTS="$HOME/<deployment-home>"
+> ```
+>
+> Verify it took effect, rather than assuming:
+> 1. `python3 -c "from orchestrator.containment import protected_roots_from_env as r; print(r())"`
+>    inside the daemon's environment — it must print your roots, not `()`.
+> 2. Run a task with a workspace whose stage writes one file outside that
+>    workspace (the fake agent in `orchestrator/examples/` is enough). The task
+>    must end `blocked` with reason `workspace_escape`, and a row must appear
+>    in the `quarantine` table with the offending path in its evidence file.
+> 3. Confirm the reverse: a stage that writes only inside its workspace still
+>    reaches `done`. A detection layer that blocks everything is as useless as
+>    one that blocks nothing.
+>
+> Keep the roots away from directories holding large, legitimately changing
+> files (build outputs, caches); see `docs/containment-notes.md` for why that
+> costs more than it sounds.
+
 ## Engine
 
 | Upstream path | Disposition | Notes |
