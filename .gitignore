@@ -7,3 +7,5 @@ __pycache__/
 # Runtime state of a local orchestrator home.
 /orch-home/
 /output/
+.containment-test-*/
+.sbtest-*/
