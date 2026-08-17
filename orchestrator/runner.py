@@ -351,6 +351,7 @@ class SubprocessRunner:
         log_path: Path,
         *,
         workspace: Path | None = None,
+        protected_roots: tuple[Path, ...] | None = None,
     ) -> RunResult:
         command = self._command(owner) + [prompt]
         model_command = command
@@ -362,11 +363,19 @@ class SubprocessRunner:
                 return self._containment_stop(
                     log_path, owner, command, "containment_identity_invalid", str(exc)
                 )
-            decision = prepare_sandbox(
-                workspace,
-                log_path.parent / "containment",
-                allow_unsandboxed=allow_unsandboxed_requested(),
-            )
+            try:
+                decision = prepare_sandbox(
+                    workspace,
+                    log_path.parent / "containment",
+                    allow_unsandboxed=allow_unsandboxed_requested(),
+                    protected_roots=protected_roots,
+                )
+            except ContainmentError as exc:
+                # A declared write root that overlaps a protected root is a
+                # contradiction, not a preference. Refuse the stage and say so.
+                return self._containment_stop(
+                    log_path, owner, command, "containment_config_conflict", str(exc)
+                )
             if decision.blocks_run:
                 return self._containment_stop(
                     log_path,

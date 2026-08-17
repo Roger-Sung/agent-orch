@@ -310,7 +310,7 @@ class EscapingRunner:
 
         return ProviderPreflightResult("pass", "provider_preflight_pass", "", 0, ["fake"], None, 0, 0)
 
-    def run(self, owner, prompt, timeout, log_path, *, workspace=None):
+    def run(self, owner, prompt, timeout, log_path, *, workspace=None, protected_roots=None):
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("ORCHESTRATOR_OUTCOME: pass\n", encoding="utf-8")
         self.target.write_text("written by an escaped stage", encoding="utf-8")

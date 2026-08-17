@@ -138,7 +138,7 @@ class RecordingRunner:
     def __init__(self):
         self.calls: list[dict] = []
 
-    def run(self, owner, prompt, timeout, log_path, *, workspace=None):
+    def run(self, owner, prompt, timeout, log_path, *, workspace=None, protected_roots=None):
         self.calls.append({"owner": owner, "workspace": workspace})
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("ORCHESTRATOR_OUTCOME: pass\n", encoding="utf-8")

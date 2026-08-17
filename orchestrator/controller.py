@@ -256,13 +256,29 @@ class Controller:
 
         sentinel = self._sentinel_for(workspace)
         before = sentinel.snapshot() if sentinel is not None else None
-        result = self.runner.run(stage.owner, prompt, stage.timeout, log_path, workspace=workspace)
+        result = self._runner_run_contained(stage, prompt, log_path, workspace)
         if sentinel is None or before is None:
             return result
         violations = sentinel.compare(before)
         if not violations:
             return result
         return self._record_workspace_escape(task, log_path, result, violations)
+
+    def _runner_run_contained(self, stage: Any, prompt: str, log_path: Path, workspace: Path) -> RunResult:
+        """Hand the runner this controller's protected roots.
+
+        L1 needs them to reject a declared write root that overlaps something
+        L2 is watching. Passing them explicitly keeps a controller constructed
+        with roots in code consistent with one configured from the environment.
+        """
+        return self.runner.run(
+            stage.owner,
+            prompt,
+            stage.timeout,
+            log_path,
+            workspace=workspace,
+            protected_roots=self.protected_roots,
+        )
 
     def _sentinel_for(self, workspace: Path) -> Sentinel | None:
         roots = self.protected_roots
