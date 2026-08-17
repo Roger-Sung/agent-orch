@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -11,6 +12,31 @@ from typing import Any
 
 from .ipc import atomic_write_text, daemon_is_running, enqueue_request
 from .risk_rules import load_risk_rules
+
+
+PROFILES_DIR_ENV = "ORCH_PROFILES_DIR"
+
+
+def profiles_dir() -> Path:
+    """Where the tracked execution patterns look for their stage machines.
+
+    Defaults to the profiles shipped with the package. A deployment that keeps
+    its own prompts — which is the expected case, since a prompt encodes what
+    *that* system wants a stage to do — points ORCH_PROFILES_DIR at its own
+    directory. Without this, using the engine as an upstream dependency would
+    silently run the generic example profiles.
+
+    A configured directory that does not exist is an error rather than a
+    silent fallback: falling back would run prompts the operator did not
+    choose, which is exactly the failure worth being noisy about.
+    """
+    configured = os.environ.get(PROFILES_DIR_ENV)
+    if not configured:
+        return Path(__file__).resolve().parent / "profiles"
+    path = Path(os.path.expanduser(configured))
+    if not path.is_dir():
+        raise ValueError(f"{PROFILES_DIR_ENV} is not a directory: {path}")
+    return path
 
 
 TASK_TYPE_KEYWORDS: dict[str, set[str]] = {
@@ -37,44 +63,46 @@ HIGH_RISK_KEYWORDS = (
 )
 MEDIUM_RISK_KEYWORDS = ("publish", "deploy", "webhook", "send", "inbox.md", "recap", "metadata")
 STOP_GATE_KEYWORDS = ("publish", "deploy", "send", "delete", "drop")
-TRACKED_EXECUTION_PATTERNS = {
-    "propose_spec": {
-        "type": "propose",
-        "profile": Path(__file__).resolve().parent / "profiles" / "propose.yaml",
-    },
-    "spec_review": {
-        "type": "spec-review",
-        "profile": Path(__file__).resolve().parent / "profiles" / "spec_review.yaml",
-    },
-    "codex_implement_claude_review": {
-        "type": "apply",
-        "profile": Path(__file__).resolve().parent / "profiles" / "codex_implement_claude_review.yaml",
-    },
-    "claude_apply_codex_review": {
-        "type": "apply",
-        "profile": Path(__file__).resolve().parent / "profiles" / "claude_apply_codex_review.yaml",
-    },
-    "provider_smoke": {
-        "type": "provider-smoke",
-        "profile": Path(__file__).resolve().parent / "profiles" / "provider_smoke.yaml",
-    },
-    "provider_smoke_gated": {
-        "type": "provider-smoke",
-        "profile": Path(__file__).resolve().parent / "profiles" / "provider_smoke_gated.yaml",
-    },
-}
-STOP_GATE_REVIEWER_PROFILES = {
-    "codex": {
-        "owner": "claude",
-        "type": "stop-gate",
-        "profile": Path(__file__).resolve().parent / "profiles" / "stop_gate_claude.yaml",
-    },
-    "claude": {
-        "owner": "codex",
-        "type": "stop-gate",
-        "profile": Path(__file__).resolve().parent / "profiles" / "stop_gate_codex.yaml",
-    },
-}
+def _tracked_execution_patterns() -> dict[str, dict[str, object]]:
+    return {
+        "propose_spec": {
+            "type": "propose",
+            "profile": profiles_dir() / "propose.yaml",
+        },
+        "spec_review": {
+            "type": "spec-review",
+            "profile": profiles_dir() / "spec_review.yaml",
+        },
+        "codex_implement_claude_review": {
+            "type": "apply",
+            "profile": profiles_dir() / "codex_implement_claude_review.yaml",
+        },
+        "claude_apply_codex_review": {
+            "type": "apply",
+            "profile": profiles_dir() / "claude_apply_codex_review.yaml",
+        },
+        "provider_smoke": {
+            "type": "provider-smoke",
+            "profile": profiles_dir() / "provider_smoke.yaml",
+        },
+        "provider_smoke_gated": {
+            "type": "provider-smoke",
+            "profile": profiles_dir() / "provider_smoke_gated.yaml",
+        },
+    }
+def _stop_gate_reviewer_profiles() -> dict[str, dict[str, object]]:
+    return {
+        "codex": {
+            "owner": "claude",
+            "type": "stop-gate",
+            "profile": profiles_dir() / "stop_gate_claude.yaml",
+        },
+        "claude": {
+            "owner": "codex",
+            "type": "stop-gate",
+            "profile": profiles_dir() / "stop_gate_codex.yaml",
+        },
+    }
 OPENSPEC_PRESENT_KEYWORDS = (
     "openspec/",
     "specs/",
@@ -474,7 +502,7 @@ def run_gate_run(home: Path, task_id: str) -> dict[str, Any]:
 
     gate, execution_result = _require_pending_stop_gate(task_id, task_record, routing)
     executor = routing.get("executor") or gate.get("executor")
-    reviewer = STOP_GATE_REVIEWER_PROFILES.get(str(executor))
+    reviewer = _stop_gate_reviewer_profiles().get(str(executor))
     if reviewer is None:
         raise ValueError(f"unsupported stop-gate executor for cross-provider review: {executor!r}")
     if not daemon_is_running(home):
@@ -1462,7 +1490,7 @@ def _enqueue_for_routing(
     reason: str,
 ) -> dict[str, Any]:
     pattern = routing.get("pattern")
-    tracked = TRACKED_EXECUTION_PATTERNS.get(pattern)
+    tracked = _tracked_execution_patterns().get(pattern)
     if tracked is None:
         return {
             "status": "blocked",

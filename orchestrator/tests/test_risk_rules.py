@@ -207,3 +207,35 @@ class IntakeIntegrationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProfilesDirTest(unittest.TestCase):
+    """A deployment must be able to supply its own prompts, or the switch to
+    this package as an upstream dependency silently runs the example profiles."""
+
+    def test_default_is_the_packaged_profiles(self) -> None:
+        from orchestrator.start import profiles_dir
+
+        with unittest.mock.patch.dict("os.environ", {}, clear=False):
+            import os
+
+            os.environ.pop("ORCH_PROFILES_DIR", None)
+            self.assertEqual(profiles_dir().name, "profiles")
+            self.assertTrue((profiles_dir() / "propose.yaml").is_file())
+
+    def test_environment_override_is_honoured_per_call(self) -> None:
+        from orchestrator.start import _tracked_execution_patterns, profiles_dir
+
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "propose.yaml").write_text("", encoding="utf-8")
+            with unittest.mock.patch.dict("os.environ", {"ORCH_PROFILES_DIR": directory}):
+                self.assertEqual(profiles_dir(), Path(directory))
+                resolved = _tracked_execution_patterns()["propose_spec"]["profile"]
+                self.assertEqual(Path(resolved).parent, Path(directory))
+
+    def test_a_missing_directory_is_an_error_not_a_silent_fallback(self) -> None:
+        from orchestrator.start import profiles_dir
+
+        with unittest.mock.patch.dict("os.environ", {"ORCH_PROFILES_DIR": "/nonexistent/profiles"}):
+            with self.assertRaises(ValueError):
+                profiles_dir()
