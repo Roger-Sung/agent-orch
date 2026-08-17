@@ -116,6 +116,30 @@ that decision. Three properties bound it:
   protected root past the check and an adjacent name (`/x/cache-notes` beside
   `/x/cache`) is not mistaken for containment.
 
+How the overlap check decides, and where it errs:
+
+- Every pair is compared in both the lexical and the resolved form, so a
+  symlink cannot hide either side of an overlap.
+- Identity is checked with `(st_dev, st_ino)` along the whole ancestor chain,
+  not just on the pair itself. Aliasing is not hypothetical on macOS:
+  firmlinks make `/Users/<name>` and `/System/Volumes/Data/Users/<name>` the
+  same directory while `realpath` reports each spelling unchanged, so the
+  aliased spelling of an ancestor would otherwise read as an unrelated tree.
+  Walking ancestors by identity covers firmlinks, bind mounts, and a second
+  mount of the same volume without needing to know which produced the alias.
+- Comparison also runs casefolded, because macOS volumes are case-insensitive
+  by default and `realpath` does not fold case. **This deliberately over-refuses
+  on a case-sensitive volume**: `/cache/Foo` and `/cache/foo` are distinct
+  directories there, and the guard will refuse the pair anyway. That is an
+  accepted bias, not an oversight — a refused configuration is a message an
+  operator can act on in seconds, while an admitted overlap is silent and
+  discovered by damage. Anyone who genuinely needs two case-variant roots on a
+  case-sensitive volume can rename one.
+- A runner that cannot receive the protected roots at all is refused rather
+  than run: the stage stops with `runner_cannot_enforce_guard` unless the same
+  roots are already declared in the environment, where the runner will read
+  them. A guard that quietly stops applying is worse than a stage that stops.
+
 What remains the deployment's responsibility: a declared root is not watched by
 L2 unless it is also a protected root — and it cannot be both. Anything
 genuinely precious does not belong on this list.
@@ -205,6 +229,8 @@ Ranked by what an operator should worry about first.
 | L1 fails closed without `sandbox-exec` | automated test, with a distinct stop reason |
 | Declared write roots widen only the named paths | automated tests |
 | A write root overlapping a protected root refuses the stage | automated tests, both directions |
+| Aliased spellings of a protected root are caught | automated tests against a firmlinked volume |
+| A runner that cannot enforce the guard refuses the stage | automated test |
 | L2 detects modification, creation, deletion | automated tests |
 | L2 ignores unchanged touches and excluded subtrees | automated tests |
 | L2 still flags paths adjacent to an exclusion | automated test |
