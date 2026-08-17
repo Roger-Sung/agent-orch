@@ -40,7 +40,7 @@ from orchestrator.containment import (
     protected_roots_from_env,
     sandbox_available,
 )
-from orchestrator.controller import Controller, _accepts_protected_roots
+from orchestrator.controller import Controller, _protected_roots_support
 from orchestrator.runner import (
     ALLOW_UNSANDBOXED_ENV,
     GIT_IDENTITY_ENV,
@@ -678,7 +678,52 @@ class LegacyRunnerInterfaceTest(SandboxFixture):
                 log_path.write_text("ORCHESTRATOR_OUTCOME: pass\n", encoding="utf-8")
                 return RunResult(0, "ORCHESTRATOR_OUTCOME: pass\n", None, "raw", "raw")
 
-        self.assertEqual(self._run(LegacyRunner(), (self.protected,)), "done")
+        # Nothing is lost when the environment already declares the same roots:
+        # the runner reads them there, so the guard still applies.
+        with unittest.mock.patch.dict(os.environ, {"ORCH_PROTECTED_ROOTS": str(self.protected)}):
+            self.assertEqual(self._run(LegacyRunner(), (self.protected,)), "done")
+
+    def test_a_legacy_runner_is_refused_when_roots_would_be_dropped(self) -> None:
+        """Fail-closed: a guard that silently stops applying is worse than a stop."""
+
+        class LegacyRunner:
+            def preflight(self, owner, timeout=5):
+                from orchestrator.runner import ProviderPreflightResult
+
+                return ProviderPreflightResult("pass", "provider_preflight_pass", "", 0, ["fake"], None, 0, 0)
+
+            def run(self, owner, prompt, timeout, log_path, *, workspace=None):
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text("ORCHESTRATOR_OUTCOME: pass\n", encoding="utf-8")
+                return RunResult(0, "ORCHESTRATOR_OUTCOME: pass\n", None, "raw", "raw")
+
+        with unittest.mock.patch.dict(os.environ, {"ORCH_PROTECTED_ROOTS": ""}):
+            controller = Controller(self.home, runner=LegacyRunner(), protected_roots=(self.protected,))
+            try:
+                task_id = controller.submit(
+                    "containment-test", self.profile_path, self.input_path,
+                    task_id=str(uuid.uuid4()), workspace=self.workspace,
+                )
+                controller.run_until_stop(task_id)
+                status = controller.status(task_id)
+                self.assertEqual(status["task"]["status"], "blocked")
+                self.assertEqual(status["transitions"][-1]["reason"], "runner_cannot_enforce_guard")
+            finally:
+                controller.close()
+
+    def test_a_runner_without_protected_roots_still_works_when_none_are_configured(self) -> None:
+        class LegacyRunner:
+            def preflight(self, owner, timeout=5):
+                from orchestrator.runner import ProviderPreflightResult
+
+                return ProviderPreflightResult("pass", "provider_preflight_pass", "", 0, ["fake"], None, 0, 0)
+
+            def run(self, owner, prompt, timeout, log_path, *, workspace=None):
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text("ORCHESTRATOR_OUTCOME: pass\n", encoding="utf-8")
+                return RunResult(0, "ORCHESTRATOR_OUTCOME: pass\n", None, "raw", "raw")
+
+        self.assertEqual(self._run(LegacyRunner(), ()), "done")
 
     def test_the_capability_check_reads_the_signature(self) -> None:
         def legacy(owner, prompt, timeout, log_path, *, workspace=None):
@@ -690,9 +735,22 @@ class LegacyRunnerInterfaceTest(SandboxFixture):
         def wildcard(owner, prompt, timeout, log_path, **kwargs):
             ...
 
-        self.assertFalse(_accepts_protected_roots(legacy))
-        self.assertTrue(_accepts_protected_roots(current))
-        self.assertTrue(_accepts_protected_roots(wildcard))
+        self.assertEqual(_protected_roots_support(legacy), "none")
+        self.assertEqual(_protected_roots_support(current), "explicit")
+        self.assertEqual(_protected_roots_support(wildcard), "var_keyword")
+
+    def test_a_positional_only_parameter_does_not_count_as_support(self) -> None:
+        """The name is there but it cannot be passed by keyword.
+
+        Counting it as support would raise TypeError at the call site — exactly
+        the failure the check exists to prevent.
+        """
+        namespace: dict = {}
+        exec(
+            "def positional_only(owner, prompt, timeout, log_path, protected_roots, /):\n    ...",
+            namespace,
+        )
+        self.assertEqual(_protected_roots_support(namespace["positional_only"]), "none")
 
     def test_a_typeerror_from_inside_the_runner_is_not_swallowed(self) -> None:
         """The reason the check is by signature and not by catching TypeError."""
@@ -708,3 +766,72 @@ class LegacyRunnerInterfaceTest(SandboxFixture):
 
         status = self._run(BuggyRunner(), (self.protected,))
         self.assertEqual(status, "blocked")
+
+
+class AliasedRootTest(SandboxFixture):
+    """Path aliasing is not hypothetical on macOS (N2).
+
+    Firmlinks make /Users/<name> and /System/Volumes/Data/Users/<name> the same
+    directory, same device and inode, while realpath reports each spelling
+    unchanged. Declaring the aliased spelling of an ancestor of a protected root
+    therefore looked like an unrelated tree while granting write access straight
+    through it. The guard walks ancestors and compares identity, so it does not
+    need to know which mechanism produced the alias.
+    """
+
+    def test_identity_beats_spelling_for_an_ancestor(self) -> None:
+        alias = Path("/System/Volumes/Data") / str(self.protected).lstrip(os.sep)
+        if not alias.exists():
+            self.skipTest("no firmlinked data volume on this host")
+        self.assertNotEqual(os.path.realpath(alias), os.path.realpath(self.protected))
+        with self.assertRaises(ContainmentConfigError):
+            validate_extra_write_roots([alias.parent], [self.protected])
+
+    def test_the_reverse_direction_is_also_caught(self) -> None:
+        alias = Path("/System/Volumes/Data") / str(self.protected).lstrip(os.sep)
+        if not alias.exists():
+            self.skipTest("no firmlinked data volume on this host")
+        with self.assertRaises(ContainmentConfigError):
+            validate_extra_write_roots([self.protected / "cache"], [alias])
+
+    def test_a_hardlinked_alias_of_a_protected_root_is_caught(self) -> None:
+        """Mechanism-agnostic: same (dev, ino) reached by any means."""
+        alias = self.base / "alias"
+        try:
+            os.link(self.protected, alias, follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            self.skipTest("this filesystem does not allow directory hard links")
+        with self.assertRaises(ContainmentConfigError):
+            validate_extra_write_roots([alias], [self.protected])
+
+    def test_unrelated_trees_on_the_same_volume_are_still_allowed(self) -> None:
+        """The ancestor walk must not degrade into refusing everything."""
+        cache = self.base / "unrelated-cache"
+        cache.mkdir()
+        validate_extra_write_roots([cache], [self.protected])
+
+
+class ContainmentArtifactFailureTest(SandboxFixture):
+    """Every containment artifact write, not just the hook (N5)."""
+
+    def test_a_failure_writing_the_gitconfig_is_a_setup_failure(self) -> None:
+        log_path = self.artifacts / "stage.log"
+        with unittest.mock.patch(
+            "pathlib.Path.write_text", side_effect=OSError(28, "No space left on device")
+        ):
+            with self.assertRaises(SandboxSetupError):
+                prepare_containment(self.workspace, log_path)
+
+    def test_that_failure_reaches_the_stage_as_a_setup_failure(self) -> None:
+        log_path = self.artifacts / "stage.log"
+        with unittest.mock.patch(
+            "orchestrator.runner.prepare_containment",
+            side_effect=SandboxSetupError("cannot write containment gitconfig: disk full"),
+        ):
+            result = SubprocessRunner().run(
+                "claude", "prompt", 5, log_path, workspace=self.workspace, protected_roots=()
+            )
+        self.assertEqual(result.containment_stop, "sandbox_setup_failed")
+        classified = classify_result(result.exit_code, result.output, {"pass"}, source=result)
+        self.assertEqual(classified.reason, "sandbox_setup_failed")
+        self.assertNotEqual(classified.reason, "containment_identity_invalid")

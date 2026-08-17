@@ -24,20 +24,32 @@ ACTIVE_STATUSES = {"queued", "running"}
 RESUMABLE_STATUSES = {"waiting_user", "paused", "blocked"}
 
 
-def _accepts_protected_roots(run: Any) -> bool:
-    """Whether a runner's run() takes the protected_roots keyword.
+def _protected_roots_support(run: Any) -> str:
+    """How a runner's run() can receive protected_roots: explicit, var_keyword, or none.
 
     Checked by signature rather than by catching TypeError: catching would also
     swallow a genuine TypeError raised *inside* the runner, turning a real bug
-    into a silent fallback. A runner accepting **kwargs is assumed to cope.
+    into a silent fallback. The three answers get different treatment because
+    they carry different guarantees — see the caller.
     """
     try:
         parameters = inspect.signature(run).parameters
     except (TypeError, ValueError):  # builtins and C callables
-        return False
-    if "protected_roots" in parameters:
-        return True
-    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        return "none"
+    candidate = parameters.get("protected_roots")
+    if candidate is not None:
+        # A positional-only parameter carries the right name but cannot be
+        # passed by keyword; treating it as support would raise TypeError at the
+        # call site, which is the very failure this check exists to avoid.
+        if candidate.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return "explicit"
+        return "none"
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return "var_keyword"
+    return "none"
 
 
 class ControllerError(RuntimeError):
@@ -290,21 +302,43 @@ class Controller:
         L2 is watching. Passing them explicitly keeps a controller constructed
         with roots in code consistent with one configured from the environment.
         """
-        kwargs: dict[str, Any] = {"workspace": workspace}
-        if _accepts_protected_roots(self.runner.run):
-            kwargs["protected_roots"] = self.protected_roots
-        elif self.protected_roots:
-            # A runner predating this argument cannot be told which roots are
-            # watched, so its L1 guard falls back to the environment. Say so
-            # once rather than either crashing the stage or pretending the
-            # controller-level configuration reached it.
-            self._warn_once(
-                "runner_missing_protected_roots",
-                f"{type(self.runner).__name__}.run() does not accept protected_roots; "
-                "the write-root overlap guard will use ORCH_PROTECTED_ROOTS instead of "
-                "the roots configured on this controller",
+        support = _protected_roots_support(self.runner.run)
+        if support == "explicit":
+            return self.runner.run(
+                stage.owner, prompt, stage.timeout, log_path,
+                workspace=workspace, protected_roots=self.protected_roots,
             )
-        return self.runner.run(stage.owner, prompt, stage.timeout, log_path, **kwargs)
+        if support == "var_keyword":
+            # The roots do reach the runner, but whether a **kwargs wrapper
+            # forwards them cannot be established from here. Say so once.
+            self._warn_once(
+                "runner_var_keyword_protected_roots",
+                f"{type(self.runner).__name__}.run() accepts protected_roots only through "
+                "**kwargs; the overlap guard depends on that wrapper forwarding them",
+            )
+            return self.runner.run(
+                stage.owner, prompt, stage.timeout, log_path,
+                workspace=workspace, protected_roots=self.protected_roots,
+            )
+        # No support at all. The roots would simply be dropped, turning a
+        # fail-closed guard into a fail-open one, so only proceed when nothing
+        # is actually lost: the environment already declares the same roots and
+        # the runner will read them there.
+        environment_roots = {Path(os.path.realpath(root)) for root in protected_roots_from_env()}
+        configured_roots = {Path(os.path.realpath(root)) for root in self.protected_roots}
+        if configured_roots - environment_roots:
+            missing = ", ".join(sorted(str(root) for root in configured_roots - environment_roots))
+            return RunResult(
+                None,
+                f"runner_cannot_enforce_guard: {type(self.runner).__name__}.run() cannot accept "
+                f"protected_roots, and these are not declared in the environment either: {missing}. "
+                "Refusing rather than running a mutating stage with the write-root guard disabled.\n",
+                None,
+                "raw",
+                "raw",
+                containment_stop="runner_cannot_enforce_guard",
+            )
+        return self.runner.run(stage.owner, prompt, stage.timeout, log_path, workspace=workspace)
 
     def _warn_once(self, key: str, message: str) -> None:
         if key in self._warned:
