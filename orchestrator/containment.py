@@ -73,6 +73,23 @@ class ContainmentError(RuntimeError):
     """Containment could not be established. Always fail closed on this."""
 
 
+class ContainmentConfigError(ContainmentError):
+    """The configuration contradicts itself — e.g. a write root over a protected root.
+
+    Distinct from an environment failure because the operator's next action is
+    different: this one needs a configuration change, not a disk or a permission.
+    """
+
+
+class SandboxSetupError(ContainmentError):
+    """The sandbox could not be set up for an environmental reason.
+
+    A full disk or an unwritable artifact directory is not a misconfiguration of
+    the containment policy, and reporting it as one sends the operator looking in
+    the wrong place.
+    """
+
+
 # ---------------------------------------------------------------------------
 # L1 — sandbox-exec write allowlist
 # ---------------------------------------------------------------------------
@@ -200,12 +217,15 @@ def prepare_sandbox(
     if allow_unsandboxed:
         return SandboxDecision("unsandboxed", "sandbox_explicitly_disabled")
 
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SandboxSetupError(f"cannot create the stage artifact directory: {exc}") from exc
     profile_path = artifact_dir / "sandbox.sb"
     try:
         profile_path.write_text(build_sandbox_profile(workspace, artifact_dir, declared_extra), encoding="utf-8")
-    except OSError as exc:  # pragma: no cover - depends on a broken filesystem
-        raise ContainmentError(f"cannot write sandbox profile: {exc}") from exc
+    except OSError as exc:
+        raise SandboxSetupError(f"cannot write sandbox profile: {exc}") from exc
     return SandboxDecision("sandboxed", "sandbox_active", profile_path)
 
 
@@ -355,14 +375,63 @@ def extra_write_roots_from_env(value: str | None = None) -> tuple[Path, ...]:
     return tuple(roots)
 
 
-def _contains(outer: str, inner: str) -> bool:
-    """Path containment on resolved paths, component-aware.
+def _fold(path: str) -> str:
+    """Casefolded form, used *in addition* to the exact comparison.
 
-    Not a string prefix test: `/a/b` must not be treated as containing
-    `/a/bc`. An over-broad answer here would let a declared write root
-    swallow a protected root, which is the whole thing this check prevents.
+    macOS filesystems are case-insensitive by default and `realpath` does not
+    normalise case, so `/users/<name>` and `/Users/<name>` resolve to different
+    strings while naming the same directory. Comparing both ways can only ever
+    refuse more configurations, never fewer, which is the safe direction for a
+    guard: a case-sensitive filesystem might see two genuinely distinct paths
+    rejected, and that is a far cheaper mistake than admitting an overlap.
     """
-    return inner == outer or inner.startswith(outer + os.sep)
+    return path.casefold()
+
+
+def _same_object(first: str, second: str) -> bool:
+    """Identity via the filesystem, when both paths exist.
+
+    Catches what string work cannot: case variants on a case-insensitive
+    volume, hardlinked directories, and two mount paths for one tree.
+    """
+    try:
+        left = os.stat(first)
+        right = os.stat(second)
+    except OSError:
+        return False
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _contains(outer: str, inner: str) -> bool:
+    """Whether `outer` contains `inner`, component-aware.
+
+    Not a plain string prefix test: `/a/b` must not count as containing
+    `/a/bc`. Trailing separators are trimmed first, because the filesystem root
+    is the one path whose separator is also its whole name — without that,
+    `outer="/"` builds the prefix `"//"`, matches nothing, and a declared write
+    root of `/` sails through the overlap guard while allowlisting the entire
+    filesystem.
+    """
+    trimmed_outer = outer.rstrip(os.sep) or os.sep
+    trimmed_inner = inner.rstrip(os.sep) or os.sep
+    if trimmed_outer == trimmed_inner or _fold(trimmed_outer) == _fold(trimmed_inner):
+        return True
+    prefix = trimmed_outer if trimmed_outer.endswith(os.sep) else trimmed_outer + os.sep
+    return trimmed_inner.startswith(prefix) or _fold(trimmed_inner).startswith(_fold(prefix))
+
+
+def _forms(path: str | os.PathLike[str]) -> tuple[str, str]:
+    """The two forms a path has to be judged in.
+
+    Lexical (expanded, absolutised, symlinks intact) and resolved. Both matter:
+    resolving alone hides the case where a *protected root is itself a symlink
+    living inside a declared write root* — the target lies outside, so nothing
+    looks wrong, while the stage can rewrite the link and re-point the sentinel
+    anchor at a decoy tree of identical content. Comparing the lexical form as
+    well catches that the link sits in writable space.
+    """
+    lexical = os.path.abspath(os.path.expanduser(str(path)))
+    return lexical, os.path.realpath(lexical)
 
 
 def validate_extra_write_roots(
@@ -375,21 +444,29 @@ def validate_extra_write_roots(
     clean because the write was "allowed". Overlap in either direction is a
     configuration error, and it fails closed rather than silently letting the
     allowlist punch a hole in the detection layer.
+
+    Every comparison runs over both the lexical and the resolved form of each
+    path, plus a filesystem-identity check, so a symlink cannot hide an overlap
+    and a case variant cannot slip past on a case-insensitive volume.
     """
-    resolved_protected = [(str(item), os.path.realpath(os.path.expanduser(str(item)))) for item in protected]
-    if not resolved_protected:
+    watched = [(str(item), *_forms(item)) for item in protected]
+    if not watched:
         return
     conflicts: list[str] = []
     for item in extra:
         declared = str(item)
-        real_extra = os.path.realpath(os.path.expanduser(declared))
-        for original, real_protected in resolved_protected:
-            if _contains(real_protected, real_extra):
+        extra_forms = _forms(item)
+        for original, protected_lexical, protected_resolved in watched:
+            protected_forms = (protected_lexical, protected_resolved)
+            if any(_same_object(e, p) for e in extra_forms for p in protected_forms):
+                conflicts.append(f"{declared} is the same directory as protected root {original}")
+                continue
+            if any(_contains(p, e) for e in extra_forms for p in protected_forms):
                 conflicts.append(f"{declared} is inside protected root {original}")
-            elif _contains(real_extra, real_protected):
+            elif any(_contains(e, p) for e in extra_forms for p in protected_forms):
                 conflicts.append(f"{declared} contains protected root {original}")
     if conflicts:
-        raise ContainmentError(
+        raise ContainmentConfigError(
             f"{EXTRA_WRITE_ROOTS_ENV} overlaps {PROTECTED_ROOTS_ENV}: "
             + "; ".join(conflicts)
             + ". A write root that covers a protected root would let L1 permit exactly what L2 watches for."
