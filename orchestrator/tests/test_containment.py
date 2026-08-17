@@ -1,9 +1,14 @@
-"""Worktree + Git containment：把 stage 關在 worktree 裡，並讓結果無法經由 Git 離開。
+"""Worktree + git containment: keep a stage inside its worktree and stop a result
+leaving through git.
 
-這不是 process sandbox——agent 仍是同一個 UNIX user，可讀寫 worktree 以外的檔案、可連外網。
+This module covers the git dimension only. Write confinement is L1 and L2, tested
+in test_containment_layers.py; process isolation and network egress are not
+implemented at all, and the agent runs as the same UNIX user throughout.
 
-重點不是「prompt 有沒有叫 agent 不要 push」，而是「就算它想 push 也做不到」。
-執行：python3 -m unittest orchestrator.tests.test_containment
+The point is not whether a prompt told the agent not to push, but that pushing
+fails even when it tries.
+
+Run: python3 -m unittest orchestrator.tests.test_containment
 """
 
 from __future__ import annotations
@@ -71,7 +76,8 @@ class PrepareContainmentTest(unittest.TestCase):
         self.assertEqual(env["GIT_ASKPASS"], "/usr/bin/false")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(env["ORCH_CONTAINMENT"], "worktree+git")
-        # CLI 仍然需要 HOME / PATH 才能跑，containment 不是把環境清空。
+        # A CLI still needs HOME and PATH; containment strips credentials, not the
+        # whole environment.
         self.assertIn("PATH", env)
 
     def test_containment_artifacts_live_next_to_the_stage_log(self):
@@ -81,12 +87,13 @@ class PrepareContainmentTest(unittest.TestCase):
         hook = artifacts / "hooks" / "pre-push"
         self.assertTrue(hook.is_file())
         self.assertTrue(os.access(hook, os.X_OK))
-        # 不寫進 worktree：避免 agent 把 containment 設定一起 commit 出去。
+        # Kept out of the worktree so an agent cannot commit the containment
+        # configuration along with its work.
         self.assertFalse((self.workspace / "containment").exists())
 
 
 class ContainmentBlocksPushTest(unittest.TestCase):
-    """用真的 git repo 驗證：containment 環境下 commit 可以、push 不行。"""
+    """Against a real git repository: under containment, commit works and push does not."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -109,7 +116,7 @@ class ContainmentBlocksPushTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_push_succeeds_without_containment(self):
-        """對照組：沒有 containment 時 push 是會成功的——證明測試環境本身沒問題。"""
+        """Control: without containment the push succeeds, proving the test setup itself is sound."""
         result = _git(self.workspace, "push", "origin", "main")
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -118,7 +125,7 @@ class ContainmentBlocksPushTest(unittest.TestCase):
         result = _git(self.workspace, "push", "origin", "main", env=env)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("agent-orch containment", result.stderr)
-        # remote 真的沒有拿到任何東西
+        # The remote really received nothing
         refs = subprocess.run(
             ["git", "-C", str(self.remote), "for-each-ref"], capture_output=True, text=True, check=False
         )
@@ -133,7 +140,7 @@ class ContainmentBlocksPushTest(unittest.TestCase):
 
 
 class RecordingRunner:
-    """記錄 controller 傳了什麼給 runner。"""
+    """Records what the controller passed to the runner."""
 
     def __init__(self):
         self.calls: list[dict] = []
@@ -178,7 +185,7 @@ class ControllerWorkspaceTest(unittest.TestCase):
         self.assertEqual(runner.calls[0]["workspace"], self.workspace.resolve())
 
     def test_tasks_without_workspace_keep_the_old_call_shape(self):
-        """既有任務（沒有 worktree）不能被迫走新簽名——舊 runner 仍要能用。"""
+        """A task without a worktree must not be forced through the new call shape."""
 
         class LegacyRunner:
             def __init__(self):
@@ -203,7 +210,7 @@ class ControllerWorkspaceTest(unittest.TestCase):
         self.assertEqual(runner.calls, 1)
 
     def test_missing_workspace_never_runs_uncontained(self):
-        """worktree 不見時寧可讓 stage 失敗，也不能退回沒有 containment 的環境跑。"""
+        """A missing worktree fails the stage rather than falling back to running uncontained."""
         runner = RecordingRunner()
         controller = Controller(self.home, runner=runner)
         try:

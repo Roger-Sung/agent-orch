@@ -79,7 +79,8 @@ class Controller:
         self.conn = connect(self.home / "orchestrator.db", read_only=read_only)
         self.runner = runner or SubprocessRunner()
         self.event_callback = event_callback
-        # read_only：只查詢、不接管，跳過 orphan-block（讓 daemon 跑著時也能安全 status）。
+        # read_only: query without taking over, skipping the orphan block, so
+        # status is safe to run while the daemon owns the database.
         if read_only:
             return
         self.reconcile_startup()
@@ -274,7 +275,8 @@ class Controller:
             )
 
     def _invoke_runner(self, task: sqlite3.Row, stage: Any, prompt: str, log_path: Path) -> RunResult:
-        """有 workspace 才走 containment；沒有就維持原本的呼叫方式（既有 runner 不受影響）。
+        """Containment applies only when the task has a workspace; without one the
+        call shape stays as it was, so existing runners are unaffected.
 
         L1 (the sandbox) lives in the runner, because it has to wrap the child
         process. L2 (detection) lives here, because it has to bracket the run

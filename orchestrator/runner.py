@@ -34,11 +34,16 @@ SOCKET_SIGNATURES = (
 LOCALHOST_SIGNATURE = re.compile(r"\b(localhost|127\.0\.0\.1|::1)\b", re.IGNORECASE)
 DEFAULT_CODEX_SERVICE_TIERS = frozenset({"fast", "priority"})
 
-# Worktree + Git containment：把 stage 的工作目錄固定在 worktree，並拿掉所有推送憑證。
-# 這是強制力，不是 prompt 裡的約定——agent 就算想 push 也沒有憑證、hook 也會擋。
+# Worktree + git containment: pin the stage's working directory to a worktree and
+# strip every push credential. This is enforcement, not an instruction in a
+# prompt - an agent that decides to push has no credential and the hook rejects
+# it anyway.
 #
-# 明確不是 sandbox：agent 仍以同一個 UNIX user 執行，可以讀寫 worktree 以外的檔案、
-# 也可以對外連網。真正的隔離需要獨立 executor identity（見 docs/execution-containment.md）。
+# This layer is not a sandbox on its own. Writes outside the workspace are
+# prevented by L1 and detected by L2 (see containment.py); what remains
+# unaddressed is process isolation and network egress - the agent still runs as
+# the same UNIX user and can read whatever that user can read. See
+# docs/threat-model.md for the layer boundaries and the residual risk.
 CONTAINMENT_BLOCKED_ENV = frozenset(
     {
         "SSH_AUTH_SOCK",
@@ -62,17 +67,21 @@ exit 1
 
 
 def prepare_containment(workspace: Path, log_path: Path) -> dict[str, str]:
-    """替一次 stage run 準備 worktree + Git containment，回傳要給子行程的 env。
+    """Prepare worktree + git containment for one stage run; return the child env.
 
-    這不是 process sandbox：同一個 UNIX user、同一個檔案系統、同樣可以連外網。
-    它只保證「工作發生在 worktree 裡」與「結果不能經由 Git 離開」。
+    This function covers the git dimension only: work happens in the worktree,
+    and a result cannot leave through git. Write confinement is L1 and L2 in
+    containment.py; process and network isolation are not implemented at all.
 
-    三層阻斷 push，任何一層失效另外兩層仍在：
-      1. 環境沒有 SSH agent / token（HTTPS 與 SSH 都拿不到憑證）
-      2. GIT_SSH_COMMAND / GIT_ASKPASS 指向 /usr/bin/false，不會有互動式補救
-      3. 專用 core.hooksPath 裡的 pre-push 一律 reject
+    Push is blocked three ways, so that any one of them failing leaves two:
+      1. no SSH agent or token in the environment (neither HTTPS nor SSH can
+         find a credential)
+      2. GIT_SSH_COMMAND / GIT_ASKPASS point at /usr/bin/false, so there is no
+         interactive rescue
+      3. a dedicated core.hooksPath whose pre-push rejects unconditionally
 
-    commit 仍然可以——containment 限制的是「讓結果經由 Git 離開 worktree」，不是「不准做事」。
+    Committing still works. The constraint is on letting a result leave the
+    worktree through git, not on doing the job.
     """
     containment_root = log_path.parent / "containment"
     hooks_dir = containment_root / "hooks"
@@ -267,7 +276,8 @@ def classify_result(
     if not matches:
         return RunResult(exit_code, output, None, "blocked", "missing_outcome", False, **telemetry)
     if len(distinct) > 1:
-        # 真的吐出互相矛盾的 outcome 才算模糊；重複同一個值（agent 常見）取最後一個。
+        # Only genuinely conflicting outcomes are ambiguous; a repeated identical
+        # value is common from agents, so take the last one.
         return RunResult(exit_code, output, None, "blocked", "ambiguous_outcome", False, **telemetry)
     outcome = matches[-1]
     if outcome not in allowed_outcomes:
@@ -417,7 +427,7 @@ class SubprocessRunner:
         try:
             process = subprocess.Popen(
                 command,
-                stdin=subprocess.DEVNULL,  # 否則 claude -p 等 stdin EOF → 卡死直到 timeout
+                stdin=subprocess.DEVNULL,  # without this, claude -p waits on stdin EOF until the timeout
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,

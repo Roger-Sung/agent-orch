@@ -14,11 +14,16 @@ from .profile import ProfileError
 
 
 def run_daemon(home: Path, poll_interval: float = 3.0) -> None:
-    """常駐服務：watch home/inbox/*.json，逐一接手跑，結果寫 processed/。
+    """The long-running service: watch home/inbox/*.json, run each request, write
+    results to processed/.
 
-    呼叫者（手機、終端機、cron）只要把請求單丟進 inbox（純寫檔，沙盒也能做），
-    工作一律在這個服務的乾淨環境裡跑——跟呼叫者在哪、有沒有網路無關。
-    本服務是唯一的 Controller（單一 writer），請勿同時另跑 CLI submit。
+    A caller - phone, terminal, cron - only drops a request file into the inbox,
+    which is a plain file write and therefore possible from a sandbox. The work
+    itself always runs in this service's clean environment, independent of where
+    the caller was or whether it had network access.
+
+    This service is the only Controller and the single writer. Do not run a CLI
+    submit against the same home at the same time.
     """
     if poll_interval <= 0:
         raise ValueError("poll interval must be positive")
@@ -32,7 +37,8 @@ def run_daemon(home: Path, poll_interval: float = 3.0) -> None:
     pid_path = home / "daemon.pid"
     with hold_daemon_lock(home):
         atomic_write_text(pid_path, f"{os.getpid()}\n")
-        controller = Controller(home, event_callback=_print_controller_event)  # init 會把殘留 running 任務 orphan-block 掉
+        # Controller init orphan-blocks any task left marked running by a crash.
+        controller = Controller(home, event_callback=_print_controller_event)
         reconciliation = _reconcile_startup_requests(controller, inbox, processing, processed)
         stop_requested = threading.Event()
 

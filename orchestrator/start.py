@@ -49,7 +49,7 @@ TASK_TYPE_KEYWORDS: dict[str, set[str]] = {
 # Built-in defaults only. A deployment's own high-risk vocabulary — the names of
 # its private files, stores, and subsystems — does not belong in this package;
 # it is supplied through `risk-rules.yaml` (contract draft at the repository
-# root, loader implementation pending). Keep this tuple generic: anything added
+# root; the loader lives in risk_rules.py). Keep this tuple generic: anything added
 # here ships to every user of the engine.
 HIGH_RISK_KEYWORDS = (
     "orchestrator/",
@@ -1512,7 +1512,8 @@ def _enqueue_for_routing(
         "profile": str(Path(tracked["profile"]).resolve()),
         "input": str(input_path.resolve()),
     }
-    # worktree 有給就一路帶到 controller：executor 會被關在裡面跑，且拿不到推送憑證。
+    # When a worktree is given it travels to the controller: the executor runs
+    # confined to it and without push credentials.
     worktree = (task_record.get("flags") or {}).get("worktree")
     if worktree:
         request["workspace"] = str(Path(worktree).expanduser().resolve())

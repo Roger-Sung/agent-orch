@@ -77,14 +77,16 @@ def build_parser() -> argparse.ArgumentParser:
     gate_block.add_argument("task_id")
     gate_block.add_argument("--reason")
 
-    # 投遞：只寫請求單到 inbox，不執行（沙盒安全，不建 Controller）。常駐 daemon 會接手。
+    # Enqueue: write a request into the inbox and nothing else - no Controller is
+    # constructed, so this is safe from a sandbox. The daemon picks it up.
     enqueue = subparsers.add_parser("enqueue", help="drop a task request into the inbox for the daemon")
     enqueue.add_argument("--type", dest="task_type")
     enqueue.add_argument("--profile", type=Path)
     enqueue.add_argument("--input", type=Path)
     enqueue.add_argument("--resume", dest="resume_id", help="enqueue a resume request for an existing task id")
 
-    # 常駐服務：watch inbox 接手跑（唯一 Controller / 單一 writer）。
+    # The long-running service: watch the inbox and execute (the only Controller,
+    # and the single writer).
     subparsers.add_parser("daemon", help="run the always-on service that watches the inbox")
 
     submit = subparsers.add_parser("submit", help="submit through the daemon and wait for its result")
@@ -124,7 +126,7 @@ def _enqueue(home: Path, args: argparse.Namespace) -> dict:
         profile = getattr(args, "profile", None)
         input_path = getattr(args, "input", None)
         if not (task_type and profile and input_path):
-            raise ControllerError("enqueue 需要 --type --profile --input（或 --resume <id>）")
+            raise ControllerError("enqueue requires --type --profile --input (or --resume <id>)")
         req = {
             "request_id": request_id,
             "action": "run",
@@ -250,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         print("orchestrator: --in-process refused while daemon owns the service lock", file=sys.stderr)
         return 2
 
-    # status 唯讀（不 orphan-block，daemon 跑著時也安全）。
+    # status is read-only: no orphan block, so it is safe while the daemon runs.
     controller = Controller(home, read_only=(args.command == "status"))
     try:
         if args.command == "submit":
