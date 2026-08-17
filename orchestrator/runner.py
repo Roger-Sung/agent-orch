@@ -130,6 +130,67 @@ def prepare_containment(workspace: Path, log_path: Path) -> dict[str, str]:
 
 
 ALLOW_UNSANDBOXED_ENV = "ORCH_ALLOW_UNSANDBOXED"
+ALLOW_UNATTENDED_ENV = "ORCH_ALLOW_UNATTENDED"
+
+#: Provider CLI flags that disable the approval prompt, i.e. that hand a stage
+#: the operator's authority with nobody watching. Known names only — see
+#: `unattended_flags_in_use` for why this is a detector and not a guarantee.
+UNATTENDED_FLAGS = (
+    "--dangerously-skip-permissions",
+    "--approve-for-me",
+)
+PROVIDER_COMMAND_ENV = ("ORCH_CLAUDE_COMMAND", "ORCH_CODEX_COMMAND")
+
+UNATTENDED_CONSENT_MESSAGE = """refusing to start.
+
+The configured provider commands disable their approval prompts, so stages act
+unattended with the full authority of this UNIX user: they can read anything
+this account can read, and nothing isolates them at the process level.
+
+Set ORCH_ALLOW_UNATTENDED=1 to confirm you intend that, then start again."""
+
+
+class UnattendedConsentError(ValueError):
+    """Unattended-capable provider commands without the operator's acknowledgement."""
+
+
+def unattended_flags_in_use(env: dict[str, str] | None = None) -> list[tuple[str, str]]:
+    """Which provider commands carry a known approval-disabling flag.
+
+    Best-effort by construction: it recognises the flags of the CLIs this
+    project actually drives, by name. A different CLI, a renamed flag, a wrapper
+    script that adds one, or a config file that sets the same behaviour will not
+    be seen — so a clean result means "no known flag was spelled out here", not
+    "this deployment is attended". The launcher gate stays the first line
+    precisely because it does not depend on recognising anything.
+    """
+    source = env if env is not None else os.environ
+    found: list[tuple[str, str]] = []
+    for variable in PROVIDER_COMMAND_ENV:
+        command = source.get(variable, "")
+        if not command:
+            continue
+        tokens = set(shlex.split(command)) if command.strip() else set()
+        for flag in UNATTENDED_FLAGS:
+            if flag in tokens or flag in command:
+                found.append((variable, flag))
+    return found
+
+
+def require_unattended_consent(env: dict[str, str] | None = None) -> None:
+    """Refuse to proceed when unattended execution was configured but not stated.
+
+    The launcher performs the same check before exec, and this repeats it in the
+    engine so that a deployment with its own launcher cannot skip it by accident.
+    """
+    source = env if env is not None else os.environ
+    hits = unattended_flags_in_use(source)
+    if not hits:
+        return
+    if source.get(ALLOW_UNATTENDED_ENV, "").strip() == "1":
+        return
+    detail = ", ".join(f"{variable} contains {flag}" for variable, flag in hits)
+    raise UnattendedConsentError(f"{UNATTENDED_CONSENT_MESSAGE}\n\nDetected: {detail}")
 
 
 def allow_unsandboxed_requested(env: dict[str, str] | None = None) -> bool:

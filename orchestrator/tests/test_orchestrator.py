@@ -214,12 +214,48 @@ class ClassificationTests(unittest.TestCase):
         self.assertIn("owner=claude\n", text)
         self.assertIn("model=unspecified\n", text)
 
-    def test_daemon_defaults_pin_provider_models(self):
+    def test_daemon_launcher_requires_explicit_models_and_consent(self):
+        """The launcher must not supply defaults for either.
+
+        A default model keeps working after a provider changes what its own
+        default resolves to, and the run records would then name one model while
+        another did the work. Unattended operation disables the provider CLIs'
+        approval prompts, which is a decision an operator states rather than
+        inherits from a script nobody re-read.
+        """
         script = (ROOT / "packaging" / "run-daemon.sh").read_text(encoding="utf-8")
-        self.assertIn("ORCH_CLAUDE_MODEL=\"${ORCH_CLAUDE_MODEL:-claude-opus-5}\"", script)
-        self.assertIn("ORCH_CODEX_MODEL=\"${ORCH_CODEX_MODEL:-gpt-5.5}\"", script)
+        self.assertIn('${ORCH_CLAUDE_MODEL:?', script)
+        self.assertIn('${ORCH_CODEX_MODEL:?', script)
+        self.assertNotIn("ORCH_CLAUDE_MODEL:-", script)
+        self.assertNotIn("ORCH_CODEX_MODEL:-", script)
+        self.assertIn('"${ORCH_ALLOW_UNATTENDED:-}" != "1"', script)
         self.assertIn("--model $ORCH_CLAUDE_MODEL", script)
         self.assertIn("--model $ORCH_CODEX_MODEL", script)
+
+    def test_daemon_launcher_refuses_to_start_without_consent(self):
+        script = ROOT / "packaging" / "run-daemon.sh"
+        result = subprocess.run(
+            ["bash", str(script)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            env={k: v for k, v in os.environ.items() if k != "ORCH_ALLOW_UNATTENDED"},
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 78, result.stdout + result.stderr)
+        self.assertIn("refusing to start", result.stderr)
+
+    def test_daemon_launcher_refuses_without_explicit_models(self):
+        script = ROOT / "packaging" / "run-daemon.sh"
+        env = {k: v for k, v in os.environ.items() if not k.startswith("ORCH_")}
+        env["ORCH_ALLOW_UNATTENDED"] = "1"
+        result = subprocess.run(
+            ["bash", str(script)], cwd=ROOT, capture_output=True, text=True,
+            env=env, timeout=30, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ORCH_CLAUDE_MODEL", result.stderr)
 
 
 class StartPhaseTests(unittest.TestCase):

@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import unittest.mock
@@ -43,6 +44,8 @@ from orchestrator.containment import (
 from orchestrator.controller import Controller, _protected_roots_support
 from orchestrator.runner import (
     ALLOW_UNSANDBOXED_ENV,
+    UnattendedConsentError,
+    require_unattended_consent,
     GIT_IDENTITY_ENV,
     RunResult,
     SubprocessRunner,
@@ -836,3 +839,66 @@ class ContainmentArtifactFailureTest(SandboxFixture):
         classified = classify_result(result.exit_code, result.output, {"pass"}, source=result)
         self.assertEqual(classified.reason, "sandbox_setup_failed")
         self.assertNotEqual(classified.reason, "containment_identity_invalid")
+
+
+class UnattendedConsentTest(unittest.TestCase):
+    """Unattended execution must be stated, not inherited.
+
+    The launcher checks this before exec; the engine repeats it so a deployment
+    with its own launcher cannot skip the acknowledgement by accident. Both are
+    best-effort detection of *known* flags — a wrapper script or a renamed flag
+    is invisible to them, which is why the launcher gate stays the first line.
+    """
+
+    def test_a_known_flag_without_consent_refuses(self) -> None:
+        for command in (
+            {"ORCH_CLAUDE_COMMAND": "claude -p --dangerously-skip-permissions"},
+            {"ORCH_CODEX_COMMAND": "codex exec --approve-for-me"},
+        ):
+            with self.subTest(command=command):
+                with self.assertRaises(UnattendedConsentError) as caught:
+                    require_unattended_consent(command)
+                self.assertIn("refusing to start", str(caught.exception))
+                self.assertIn("ORCH_ALLOW_UNATTENDED=1", str(caught.exception))
+
+    def test_consent_permits_it(self) -> None:
+        require_unattended_consent(
+            {
+                "ORCH_CLAUDE_COMMAND": "claude -p --dangerously-skip-permissions",
+                "ORCH_ALLOW_UNATTENDED": "1",
+            }
+        )
+
+    def test_commands_without_a_known_flag_are_unaffected(self) -> None:
+        require_unattended_consent(
+            {"ORCH_CLAUDE_COMMAND": "claude -p --model m", "ORCH_CODEX_COMMAND": "codex exec"}
+        )
+        require_unattended_consent({})
+
+    def test_the_error_names_which_command_carried_which_flag(self) -> None:
+        with self.assertRaises(UnattendedConsentError) as caught:
+            require_unattended_consent({"ORCH_CODEX_COMMAND": "codex exec --approve-for-me"})
+        self.assertIn("ORCH_CODEX_COMMAND contains --approve-for-me", str(caught.exception))
+
+    def test_consent_must_be_exactly_one(self) -> None:
+        for value in ("", "0", "true", "yes", " "):
+            with self.subTest(value=value):
+                with self.assertRaises(UnattendedConsentError):
+                    require_unattended_consent(
+                        {
+                            "ORCH_CODEX_COMMAND": "codex exec --approve-for-me",
+                            "ORCH_ALLOW_UNATTENDED": value,
+                        }
+                    )
+
+    def test_the_daemon_refuses_at_startup_with_the_launcher_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = {k: v for k, v in os.environ.items() if not k.startswith("ORCH_")}
+            env["ORCH_HOME"] = directory
+            env["ORCH_CODEX_COMMAND"] = "codex exec --approve-for-me"
+            result = subprocess.run(
+                [sys.executable, "-m", "orchestrator", "daemon"],
+                cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=60, check=False,
+            )
+        self.assertEqual(result.returncode, 78, result.stdout + result.stderr)
+        self.assertIn("refusing to start", result.stderr)

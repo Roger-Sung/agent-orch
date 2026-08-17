@@ -11,6 +11,7 @@ from typing import Any
 from .controller import Controller, ControllerError
 from .ipc import IPCError, atomic_write_json, atomic_write_text, hold_daemon_lock
 from .profile import ProfileError
+from .runner import require_unattended_consent
 
 
 def run_daemon(home: Path, poll_interval: float = 3.0) -> None:
@@ -27,6 +28,9 @@ def run_daemon(home: Path, poll_interval: float = 3.0) -> None:
     """
     if poll_interval <= 0:
         raise ValueError("poll interval must be positive")
+    # Checked here rather than only in the launcher: a deployment with its own
+    # launcher would otherwise skip the acknowledgement without noticing.
+    require_unattended_consent()
     home = home.resolve()
     inbox = home / "inbox"
     processing = home / "processing"

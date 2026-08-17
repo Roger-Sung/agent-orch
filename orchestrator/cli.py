@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .controller import Controller, ControllerError
 from .daemon import run_daemon
-from .runner import ALLOW_UNSANDBOXED_ENV
+from .runner import ALLOW_UNSANDBOXED_ENV, UnattendedConsentError
 from .ipc import IPCError, daemon_is_running, enqueue_request, wait_for_result
 from .profile import ProfileError
 from .start import (
@@ -227,6 +227,11 @@ def main(argv: list[str] | None = None) -> int:
             poll_interval = float(os.environ.get("ORCH_POLL_INTERVAL", "3"))
             run_daemon(home, poll_interval=poll_interval)
             return 0
+        except UnattendedConsentError as exc:
+            # Same wording and same exit code as the launcher check, so the two
+            # gates are indistinguishable to whoever is reading the failure.
+            print(f"orchestrator daemon: {exc}", file=sys.stderr)
+            return 78  # EX_CONFIG
         except (ControllerError, IPCError, OSError, ValueError) as exc:
             print(f"orchestrator: {exc}", file=sys.stderr)
             return 2
