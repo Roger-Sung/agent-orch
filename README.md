@@ -1,14 +1,16 @@
 # agent-orch
 
+[![CI](https://github.com/Roger-Sung/agent-orch/actions/workflows/ci.yml/badge.svg)](https://github.com/Roger-Sung/agent-orch/actions/workflows/ci.yml)
+
 A stateful dispatcher for agent tasks. SQLite-backed state machine, a
 single-writer daemon, caps on every loop, cross-provider stop gates, and a
 sealed evidence trail for every stage that ran.
 
-Pure standard library. Nothing to install, no service to stand up.
+Built for operators running long-lived Claude/Codex workflows where retries and
+side effects must be auditable.
 
-```sh
-python3 -m orchestrator.demo    # synthetic task, fake agent, no credentials needed
-```
+The engine has no third-party Python dependencies, and the demo needs no setup.
+Production use runs a daemon and provider CLIs.
 
 ---
 
@@ -47,6 +49,155 @@ exit code, classification, outcome, model, duration, token usage, and the run
 and lease tokens. Reconstructing what happened does not depend on anyone
 having kept a terminal open.
 
+## Quickstart
+
+### 30-second demo — no credentials, no network
+
+```sh
+python3 -m orchestrator.demo                        # synthetic end-to-end run
+python3 -m unittest discover -s orchestrator/tests  # engine suite
+python3 -m unittest discover -s tools/tests         # sanitization scanner suite
+```
+
+The demo runs a synthetic task against a fake agent that disagrees with itself
+on purpose, so the review edge reaches its cap. No provider CLI is called and
+nothing leaves the machine. Abridged output:
+
+```
+status waiting_user | stop_reason edge_cap | stage draft | transitions 4 / 10
+
+edges:  draft.submit  2/4
+        review.allow  0/1
+        review.block  1/1      <- cap reached
+
+runs:   draft  attempt 1 -> submit  committed  sealed
+        review attempt 1 -> block   committed  sealed
+        draft  attempt 1 -> submit  committed  sealed
+        review attempt 1 -> block   committed  sealed
+
+notifications: edge_cap
+```
+
+That is the intended behaviour, not a failure: two agents disagreed, the loop
+was bounded, every run was sealed, and the task is parked for a human with the
+history intact.
+
+### Real Claude + Codex setup
+
+**Requirements**
+
+- **Python 3.11 or newer.** The engine imports `tomllib`; there are no
+  third-party dependencies. CI exercises 3.12 on Linux and macOS.
+- **Both provider CLIs installed and already authenticated.** `claude` and
+  `codex` must be on the `PATH` *of the daemon process*, which is usually not
+  the same PATH as your shell — a service manager starts with a minimal one, so
+  the bundled launcher sets it explicitly. Log in with each CLI first: the
+  daemon runs unattended and cannot complete an interactive sign-in, and a
+  stage whose CLI is unauthenticated fails as a provider error.
+- **macOS for L1.** The write sandbox uses `sandbox-exec`. On other platforms a
+  mutating stage refuses to run unless `--allow-unsandboxed` is passed; L2
+  detection and the overlap guard work everywhere.
+
+**Configure and start**
+
+```sh
+export ORCH_HOME=~/.local/state/agent-orch     # where state and evidence live
+export ORCH_ALLOW_UNATTENDED=1                 # see below before setting this
+export ORCH_CLAUDE_MODEL=claude-opus-5         # required, no default
+export ORCH_CODEX_MODEL=gpt-5.5                # required, no default
+export ORCH_PROTECTED_ROOTS="$HOME/important-repo"   # L2 watches these
+./packaging/run-daemon.sh
+```
+
+`ORCH_ALLOW_UNATTENDED=1` is a deliberate acknowledgement, and both the
+launcher and the daemon refuse to start without it — the daemon repeats the
+check so a deployment with its own launcher cannot skip it by accident. The
+engine's version is **best-effort detection of known flags**
+(`--dangerously-skip-permissions`, `--approve-for-me`): a wrapper script, a
+renamed flag, or a CLI config file that disables approvals another way is
+invisible to it, so a clean result means "no known flag was spelled out here",
+not "this deployment is attended". The launcher gate stays the first line
+because it does not depend on recognising anything. The provider CLIs are invoked with their approval
+prompts disabled — that is what makes unattended operation possible — so a
+stage acts with the full authority of the daemon's UNIX user: it can read
+anything that account can read, and nothing isolates it at the process level.
+Run it as an account whose reach you are comfortable handing to an agent, and
+read the [threat model](docs/threat-model.md) first.
+
+**Smoke test it end to end**
+
+```sh
+python3 -m orchestrator enqueue \
+    --type provider-smoke \
+    --profile orchestrator/profiles/provider_smoke.yaml \
+    --input /path/to/one-line-brief.md
+
+python3 -m orchestrator status <task_id>       # expect: done
+```
+
+The smoke profile runs one stage per provider with a trivial prompt, which is
+the cheapest way to confirm that both CLIs, the model pins, and the daemon are
+actually wired together.
+
+**Verification note.** CI runs both suites on both platforms plus a **partial**
+sanitization scan — partial because the scanner's site-local rules need literals
+(an operator's name, a home directory, an employer domain) that deliberately
+never reach this repository or a CI runner. So a green badge means the tests
+passed and the repository-side rules found nothing, and nothing more.
+
+The strict scan is an operator requirement rather than something CI can attest:
+whoever publishes a change is expected to run `tools/sanitize-lint.py` with a
+local secrets file (the pre-commit hook refuses to run without one) and to scan
+the history commit by commit before pushing. An outside reader cannot verify
+that a process was followed, only that the tool exists and that the tests pass.
+
+## Providers
+
+agent-orch does not host models and does not call model APIs. It orchestrates
+locally installed, authenticated agent CLIs — the process it spawns for a stage
+is the same CLI you would run by hand. Two are supported today: **Claude Code
+CLI** and **Codex CLI**. Both must be installed and authenticated before the
+daemon starts; authentication, accounts, and model costs stay with your own
+CLIs, and no API key is held here.
+
+The engine reads one variable per owner, `ORCH_CLAUDE_COMMAND` and
+`ORCH_CODEX_COMMAND`, and runs exactly what they contain. Model selection is
+therefore whatever flag the CLI takes — the orchestrator has no model registry,
+it only records the model it can read back from the command it ran.
+
+```sh
+# Using the bundled launcher, which composes the commands for you:
+export ORCH_CLAUDE_MODEL=claude-opus-5
+export ORCH_CODEX_MODEL=gpt-5.5
+./packaging/run-daemon.sh
+
+# Or drive the daemon directly, in which case the full command is yours to set:
+export ORCH_CLAUDE_COMMAND='claude -p --model claude-opus-5'
+export ORCH_CODEX_COMMAND='codex exec --model gpt-5.5'
+python3 -m orchestrator daemon
+```
+
+`ORCH_*_MODEL` is a convenience of the launcher, not something the engine
+consults; if you set the command variables yourself, the model belongs inside
+them.
+
+**What "cross-provider" requires.** Two executable CLIs from *different provider
+families* — not two model names from one vendor. The stop gate's claim is that a
+reviewer does not share the executor's blind spots, and two models from one
+family largely do. Pointing both owners at the same family leaves the machinery
+working and the safety argument gone.
+
+### Planned, not implemented
+
+- A generic CLI adapter contract, so any agent CLI can be an owner. The wrapper
+  requirements are already implied by the runner: non-interactive, prompt passed
+  as an argument, and exactly one valid `ORCHESTRATOR_OUTCOME` line on stdout.
+- Additional provider families.
+- Provider capability discovery, instead of today's fixed `claude` / `codex`
+  owner names.
+- Enforced cross-family reviewer selection, so a same-family pairing is refused
+  rather than merely discouraged.
+
 ## Architecture
 
 ```mermaid
@@ -83,14 +234,14 @@ the result, and commits the transition and its sealed manifest together.
 stateDiagram-v2
     [*] --> queued
     queued --> running: claim lease
-    running --> queued: outcome accepted,<br/>next stage
-    running --> waiting_user: attempt cap · edge cap ·<br/>max_transitions ⛔
+    running --> queued: next stage
+    running --> waiting_user: cap reached ⛔
     running --> paused: rate limited 🔁
-    running --> blocked: missing/ambiguous/unknown outcome ·<br/>timeout · sandbox unavailable ·<br/>workspace escape ⛔
-    running --> done: terminal stage reached
-    running --> failed: terminal failure stage
+    running --> blocked: guard stop ⛔
+    running --> done: terminal stage
+    running --> failed: terminal failure
     waiting_user --> queued: human decision 👤
-    paused --> queued: retry after backoff 🔁
+    paused --> queued: backoff retry 🔁
     blocked --> queued: human decision 👤
     done --> [*]
     failed --> [*]
@@ -98,6 +249,24 @@ stateDiagram-v2
 
 ⛔ a cap or a guard stopped the machine · 👤 only a human decision moves it on,
 and it waits indefinitely · 🔁 resumable without a decision.
+
+Which stop reason lands where, and who can move it on:
+
+| Stop reason | State | Moved on by |
+|---|---|---|
+| `attempt_cap` | `waiting_user` | human 👤 |
+| `edge_cap` | `waiting_user` | human 👤 |
+| `max_transitions` | `waiting_user` | human 👤 |
+| `rate_limited` | `paused` | automatic backoff 🔁 |
+| `missing_outcome` | `blocked` | human 👤 |
+| `ambiguous_outcome` | `blocked` | human 👤 |
+| `unknown_outcome` | `blocked` | human 👤 |
+| `timeout` | `blocked` | human 👤 |
+| `sandbox_unavailable` | `blocked` | human 👤 |
+| `sandbox_setup_failed` | `blocked` | human 👤 |
+| `containment_config_conflict` | `blocked` | human 👤 |
+| `runner_cannot_enforce_guard` | `blocked` | human 👤 |
+| `workspace_escape` | `blocked` | human 👤 |
 
 `waiting_user` and `blocked` differ by cause, not severity. The first means a
 bound was reached — the loop was working, it just ran out of rope. The second
@@ -111,8 +280,14 @@ provider family than the executor. A model reviewing its own output shares its
 own blind spots, so a same-family review mostly confirms what the executor
 already believed.
 
-- The gate profile is chosen by *who executed*: Codex work is reviewed by
-  Claude, Claude work by Codex.
+- The gate is always run by a *different provider* than the one that executed
+  the work — cross-provider by construction, so no model can clear its own
+  output. The gate profile is selected from who executed, not configured
+  per task, which is what makes that property hold rather than depend on
+  someone remembering it.
+- Which provider plays which role is a default, not the mechanism. Out of the
+  box Claude implements and Codex reviews and gates; swapping the profiles
+  reverses it without touching the engine.
 - Only `allow` reaches `done`. There is no path from a gate to terminal
   success without one.
 - `block` is capped too. A gate cannot loop forever; at the cap the task stops
@@ -123,7 +298,12 @@ already believed.
 
 ## Containment, honestly
 
-Three layers, and the boundaries are the interesting part.
+Three layers, plus a git egress guard — and the boundaries are the interesting
+part.
+
+A mutating stage works inside a git worktree of the target repository and
+commits its changes: git is both the working medium and an escape channel,
+which is why it gets a row of its own before the layers proper.
 
 | Layer | Mechanism | Stops |
 |---|---|---|
@@ -151,49 +331,6 @@ layer that watches it.
 
 What is still open is written down rather than left to be discovered:
 [`docs/threat-model.md`](docs/threat-model.md).
-
-## Quickstart
-
-```sh
-python3 -m orchestrator.demo                        # synthetic end-to-end run
-python3 -m unittest discover -s orchestrator/tests  # engine suite
-python3 -m unittest discover -s tools/tests         # sanitization scanner suite
-```
-
-Both suites run on Linux and macOS. L1 uses macOS `sandbox-exec`, so its
-enforcement tests skip themselves elsewhere and a mutating stage on a host
-without it refuses to run unless `--allow-unsandboxed` is passed — the L2
-detection layer and the overlap guard are platform-independent.
-
-CI runs both suites on both platforms plus a **partial** sanitization scan.
-Partial because the scanner's site-local rules need literals (an operator's
-name, a home directory, an employer domain) that deliberately never reach this
-repository or a CI runner. The full strict scan is a local gate: the
-pre-commit hook refuses to run without that file, and the whole history is
-scanned commit by commit before anything is published.
-
-The demo needs no credentials and makes no network calls. It runs a synthetic
-task against a fake agent that disagrees with itself on purpose, so the review
-edge reaches its cap. Abridged output:
-
-```
-status waiting_user | stop_reason edge_cap | stage draft | transitions 4 / 10
-
-edges:  draft.submit  2/4
-        review.allow  0/1
-        review.block  1/1      <- cap reached
-
-runs:   draft  attempt 1 -> submit  committed  sealed
-        review attempt 1 -> block   committed  sealed
-        draft  attempt 1 -> submit  committed  sealed
-        review attempt 1 -> block   committed  sealed
-
-notifications: edge_cap
-```
-
-That is the intended behaviour, not a failure: two agents disagreed, the loop
-was bounded, every run was sealed, and the task is parked for a human with the
-history intact.
 
 ## Profiles
 
@@ -235,6 +372,7 @@ orchestrator/tests/      engine suite, including the containment acceptance test
 tools/                   sanitization scanner and the pre-commit hook wrapping it
 packaging/               service templates (placeholders, not machine paths)
 docs/                    threat model, decisions, extraction inventory
+SECURITY.md              scope, reporting, and what this is not
 ```
 
 ## Provenance
@@ -243,6 +381,22 @@ This was extracted from a private system it was built for and ran in.
 [`docs/extraction-inventory.md`](docs/extraction-inventory.md) records every
 file as taken, rewritten, or left behind, and why — including what is
 deliberately not here.
+
+## Project status
+
+A portfolio and reference release. It is published to be read, not adopted:
+
+- Not a package. There is no release on any index, no versioning promise, and
+  no stable API.
+- Not a supported product. Issues and pull requests are not being accepted, and
+  no maintenance is promised.
+- Built for one deployment. It runs in the private system it was extracted
+  from; anything else is unsupported by construction.
+- **Not a sandbox for untrusted code.** The containment layers stop a capable
+  but non-malicious agent from acting outside its scope; they are not an
+  adversarial boundary. See [SECURITY.md](SECURITY.md) for the reporting
+  process and the scope, and [`docs/threat-model.md`](docs/threat-model.md) for
+  what each layer does and does not cover.
 
 ## License
 

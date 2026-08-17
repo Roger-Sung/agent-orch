@@ -152,6 +152,23 @@ failure, but a failure. L2 is deliberately independent so that detection
 survives prevention. `--allow-unsandboxed` exists for hosts without it, and it
 has to be passed explicitly and out loud.
 
+### Unattended execution is gated by acknowledgement, not by enforcement
+
+The daemon exists to run work while nobody is watching, which means the provider
+CLIs are invoked with their approval prompts disabled and a stage acts with the
+full authority of the daemon's UNIX user. Both the bundled launcher and the
+daemon itself refuse to start unless `ORCH_ALLOW_UNATTENDED=1` states that this
+is intended.
+
+Two limits worth being precise about. The check is **detection of known flags by
+name** — `--dangerously-skip-permissions` and `--approve-for-me`, the flags of
+the CLIs this project drives. A wrapper script that adds one, a renamed flag, or
+a CLI configuration file that disables approvals through another mechanism will
+not be seen. And it is an **acknowledgement gate, not a control**: setting the
+variable changes nothing about what a stage can do. It exists so that the
+decision is recorded by whoever made it, rather than inherited from a launcher
+nobody re-read.
+
 ### L2: off until a deployment declares roots
 
 `ORCH_PROTECTED_ROOTS` is empty by default; the engine has no business
@@ -209,10 +226,14 @@ Ranked by what an operator should worry about first.
    stage reads are untrusted content. Caps and gates bound the damage; nothing
    prevents a stage from being talked into a bad-but-permitted action inside
    its workspace.
-4. **Same-family gate degradation.** The cross-provider property holds only if
-   both provider families are actually available. When one is not, a gate run
-   with the same family is worth much less, and the routing does not currently
-   refuse it.
+4. **Same-family gate degradation.** The property being claimed needs two
+   executable CLIs from *different provider families*, not two model names from
+   one vendor: two models from one family largely share their blind spots, so a
+   same-family review mostly confirms what the executor already believed. Point
+   both owners at one family — deliberately, or because only one is installed
+   and authenticated — and the machinery still runs while the safety argument is
+   gone. Enforced cross-family selection is planned, not implemented; today
+   nothing refuses the degraded pairing.
 5. **Evidence is tamper-evident, not tamper-proof.** Manifests seal a hash of
    the log at commit time. A stage that corrupts its own log *before* the seal
    produces a faithful hash of corrupted content.
