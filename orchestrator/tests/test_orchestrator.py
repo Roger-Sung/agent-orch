@@ -324,7 +324,7 @@ class StartPhaseTests(unittest.TestCase):
 
     def _enqueued_stop_gate_apply_start(self, home: Path, worktree: Path) -> dict:
         spec = worktree / "approved-spec.md"
-        spec.write_text("approved\n", encoding="utf-8")
+        spec.write_text("Status: approved\n", encoding="utf-8")
         return run_start(
             home,
             "apply deploy metadata implementation to B17 worktree",
@@ -388,7 +388,7 @@ class StartPhaseTests(unittest.TestCase):
 
     def _synced_claude_gate_pending_task(self, home: Path, worktree: Path) -> dict:
         spec = worktree / "approved-spec.md"
-        spec.write_text("approved\n", encoding="utf-8")
+        spec.write_text("Status: approved\n", encoding="utf-8")
         started = run_start(
             home,
             "apply changes to orchestrator/router/daemon/memory flow with executor=claude",
@@ -468,7 +468,7 @@ class StartPhaseTests(unittest.TestCase):
     def test_route_for_apply_defaults_to_claude_apply_codex_review(self):
         with tempfile.TemporaryDirectory() as directory:
             spec = Path(directory) / "approved-spec.md"
-            spec.write_text("ready for apply\n", encoding="utf-8")
+            spec.write_text("Status: ready\n", encoding="utf-8")
             result = run_start(
                 Path(directory) / "runtime",
                 "apply implementation to B17 worktree",
@@ -518,7 +518,7 @@ class StartPhaseTests(unittest.TestCase):
     def test_high_risk_paths_set_high_risk_stop_gate_and_no_auto_start(self):
         with tempfile.TemporaryDirectory() as directory:
             spec = Path(directory) / "approved-spec.md"
-            spec.write_text("approved\n", encoding="utf-8")
+            spec.write_text("Status: approved\n", encoding="utf-8")
             result = run_start(
                 Path(directory) / "runtime",
                 "apply changes to orchestrator/router/daemon/memory flow",
@@ -638,7 +638,7 @@ class StartPhaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "runtime"
             spec = Path(directory) / "approved-spec.md"
-            spec.write_text("approved\n", encoding="utf-8")
+            spec.write_text("Status: approved\n", encoding="utf-8")
             result = run_start(
                 home,
                 "apply deploy metadata implementation to B17 worktree",
@@ -661,7 +661,7 @@ class StartPhaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "runtime"
             spec = Path(directory) / "approved-spec.md"
-            spec.write_text("approved\n", encoding="utf-8")
+            spec.write_text("Status: approved\n", encoding="utf-8")
             result = run_start(
                 home,
                 "apply changes to orchestrator/router/daemon/memory flow",
@@ -703,7 +703,7 @@ class StartPhaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "runtime"
             spec = Path(directory) / "approved-spec.md"
-            spec.write_text("approved\n", encoding="utf-8")
+            spec.write_text("Status: approved\n", encoding="utf-8")
             waiting = run_start(
                 home,
                 "apply changes to orchestrator/router/daemon/memory flow",
@@ -732,7 +732,7 @@ class StartPhaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "runtime"
             spec = Path(directory) / "approved-spec.md"
-            spec.write_text("approved\n", encoding="utf-8")
+            spec.write_text("Status: approved\n", encoding="utf-8")
             waiting = run_start(
                 home,
                 "apply changes to orchestrator/router/daemon/memory flow with executor=codex",
@@ -2012,7 +2012,7 @@ class BrokerIntegrationTests(unittest.TestCase):
             daemon, _env = self._start_fake_daemon(home, route_success=True)
             try:
                 spec = Path(directory) / "approved-spec.md"
-                spec.write_text("approved\n", encoding="utf-8")
+                spec.write_text("Status: approved\n", encoding="utf-8")
                 waiting = run_start(
                     home,
                     "apply changes to orchestrator/router/daemon/memory flow",

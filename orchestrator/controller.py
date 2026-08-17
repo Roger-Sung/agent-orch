@@ -32,11 +32,15 @@ def _protected_roots_support(run: Any) -> str:
     into a silent fallback. The three answers get different treatment because
     they carry different guarantees — see the caller.
     """
+    return _keyword_support(run, "protected_roots")
+
+
+def _keyword_support(run: Any, name: str) -> str:
     try:
         parameters = inspect.signature(run).parameters
     except (TypeError, ValueError):  # builtins and C callables
         return "none"
-    candidate = parameters.get("protected_roots")
+    candidate = parameters.get(name)
     if candidate is not None:
         # A positional-only parameter carries the right name but cannot be
         # passed by keyword; treating it as support would raise TypeError at the
@@ -242,9 +246,21 @@ class Controller:
                 },
             )
             input_text = self._read_verified_input(task_id)
-            prompt = self._build_prompt(task_id, stage, input_text)
+            reports_dir, reports_location = self._reports_target_for(task)
+            if reports_dir is not None:
+                try:
+                    reports_dir.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    # Must not escape: the stage is already claimed, and an
+                    # exception here would leave it recorded as running until
+                    # orphan reconciliation. The runner re-attempts creation
+                    # for contained runs and classifies the failure properly;
+                    # elsewhere the provider CLI can create the directory or
+                    # fail visibly in its own output.
+                    pass
+            prompt = self._build_prompt(task_id, stage, input_text, reports_location)
             try:
-                raw_result = self._invoke_runner(task, stage, prompt, log_path)
+                raw_result = self._invoke_runner(task, stage, prompt, log_path, reports_dir)
             except BaseException as exc:
                 message = f"controller observed runner interruption: {type(exc).__name__}: {exc}\n"
                 log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -274,7 +290,39 @@ class Controller:
                 },
             )
 
-    def _invoke_runner(self, task: sqlite3.Row, stage: Any, prompt: str, log_path: Path) -> RunResult:
+    def _reports_target_for(self, task: sqlite3.Row) -> tuple[Path | None, str]:
+        """(path the runner should allowlist or None, location line for the prompt).
+
+        Reports used to land at relative paths inside the workspace, which put
+        orchestration artifacts into the target repository's diff — every
+        deployment then re-invented an exclusion for them. The artifact
+        directory is where run evidence already lives, so reports join it.
+
+        For a contained (workspace) task the external path is only offered
+        when the runner can accept it, because L1 must allowlist it; promising
+        a path the sandbox denies would turn every report write into a
+        violation. A runner that cannot take the path falls back to the old
+        in-workspace location — and the prompt SAYS so, because the shipped
+        profiles refer to "the reports directory named at the top of this
+        prompt" and a dangling reference would leave the stage guessing.
+        """
+        reports = Path(task["artifact_dir"]) / "reports"
+        try:
+            raw = task["workspace_dir"]
+        except (IndexError, KeyError):
+            raw = None
+        if not raw:
+            return reports, str(reports)
+        if _keyword_support(self.runner.run, "reports_dir") == "none":
+            return None, (
+                "reports/ relative to your working directory "
+                "(this deployment's runner cannot expose an external reports directory)"
+            )
+        return reports, str(reports)
+
+    def _invoke_runner(
+        self, task: sqlite3.Row, stage: Any, prompt: str, log_path: Path, reports_dir: Path | None = None
+    ) -> RunResult:
         """Containment applies only when the task has a workspace; without one the
         call shape stays as it was, so existing runners are unaffected.
 
@@ -289,7 +337,7 @@ class Controller:
 
         sentinel = self._sentinel_for(workspace)
         before = sentinel.snapshot() if sentinel is not None else None
-        result = self._runner_run_contained(stage, prompt, log_path, workspace)
+        result = self._runner_run_contained(stage, prompt, log_path, workspace, reports_dir)
         if sentinel is None or before is None:
             return result
         violations = sentinel.compare(before)
@@ -297,18 +345,25 @@ class Controller:
             return result
         return self._record_workspace_escape(task, log_path, result, violations)
 
-    def _runner_run_contained(self, stage: Any, prompt: str, log_path: Path, workspace: Path) -> RunResult:
+    def _runner_run_contained(
+        self, stage: Any, prompt: str, log_path: Path, workspace: Path, reports_dir: Path | None = None
+    ) -> RunResult:
         """Hand the runner this controller's protected roots.
 
         L1 needs them to reject a declared write root that overlaps something
         L2 is watching. Passing them explicitly keeps a controller constructed
         with roots in code consistent with one configured from the environment.
         """
+        # reports_dir is optional for the runner the same way it is for the
+        # prompt: passed only when the runner can accept it, never guessed.
+        reports_kw: dict[str, Path] = {}
+        if reports_dir is not None and _keyword_support(self.runner.run, "reports_dir") != "none":
+            reports_kw = {"reports_dir": reports_dir}
         support = _protected_roots_support(self.runner.run)
         if support == "explicit":
             return self.runner.run(
                 stage.owner, prompt, stage.timeout, log_path,
-                workspace=workspace, protected_roots=self.protected_roots,
+                workspace=workspace, protected_roots=self.protected_roots, **reports_kw,
             )
         if support == "var_keyword":
             # The roots do reach the runner, but whether a **kwargs wrapper
@@ -320,7 +375,7 @@ class Controller:
             )
             return self.runner.run(
                 stage.owner, prompt, stage.timeout, log_path,
-                workspace=workspace, protected_roots=self.protected_roots,
+                workspace=workspace, protected_roots=self.protected_roots, **reports_kw,
             )
         # No support at all. The roots would simply be dropped, turning a
         # fail-closed guard into a fail-open one, so only proceed when nothing
@@ -340,7 +395,7 @@ class Controller:
                 "raw",
                 containment_stop="runner_cannot_enforce_guard",
             )
-        return self.runner.run(stage.owner, prompt, stage.timeout, log_path, workspace=workspace)
+        return self.runner.run(stage.owner, prompt, stage.timeout, log_path, workspace=workspace, **reports_kw)
 
     def _warn_once(self, key: str, message: str) -> None:
         if key in self._warned:
@@ -981,10 +1036,16 @@ class Controller:
         return moved_path or artifact_path or destination_dir
 
     @staticmethod
-    def _build_prompt(task_id: str, stage: Any, input_text: str) -> str:
+    def _build_prompt(task_id: str, stage: Any, input_text: str, reports_location: str | None = None) -> str:
         outcomes = ", ".join(stage.outcomes)
+        reports_line = (
+            f"Reports directory (write stage reports here): {reports_location}\n"
+            if reports_location
+            else ""
+        )
         return (
             f"You are executing agent-orch task {task_id}, stage {stage.name}.\n"
+            f"{reports_line}"
             f"Stage instructions: {stage.prompt}\n\n"
             f"Task input:\n---\n{input_text}\n---\n\n"
             f"Allowed typed outcomes: {outcomes}.\n"

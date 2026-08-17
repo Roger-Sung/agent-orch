@@ -109,20 +109,59 @@ export ORCH_PROTECTED_ROOTS="$HOME/important-repo"   # L2 watches these
 ./packaging/run-daemon.sh
 ```
 
-`ORCH_ALLOW_UNATTENDED=1` is a deliberate acknowledgement, and both the
-launcher and the daemon refuse to start without it — the daemon repeats the
-check so a deployment with its own launcher cannot skip it by accident. The
-engine's version is **best-effort detection of known flags**
-(`--dangerously-skip-permissions`, `--approve-for-me`): a wrapper script, a
-renamed flag, or a CLI config file that disables approvals another way is
-invisible to it, so a clean result means "no known flag was spelled out here",
-not "this deployment is attended". The launcher gate stays the first line
-because it does not depend on recognising anything. The provider CLIs are invoked with their approval
+`ORCH_ALLOW_UNATTENDED=1` is a deliberate acknowledgement, enforced twice with
+different precision. The bundled launcher requires it **unconditionally**,
+because it composes commands that disable the approval prompts. The daemon
+independently scans the configured commands for **known approval-disabling
+flags** (`--dangerously-skip-permissions`, `--approve-for-me`) and requires the
+same acknowledgement when it detects one — so a deployment with its own
+launcher still hits the gate, but only if a known flag is spelled out: a
+wrapper script, a renamed flag, or a CLI config file that disables approvals
+another way is invisible to it. A clean scan means "no known flag was spelled
+out here", not "this deployment is attended". The launcher gate stays the
+first line because it does not depend on recognising anything. The provider CLIs are invoked with their approval
 prompts disabled — that is what makes unattended operation possible — so a
 stage acts with the full authority of the daemon's UNIX user: it can read
 anything that account can read, and nothing isolates it at the process level.
 Run it as an account whose reach you are comfortable handing to an agent, and
 read the [threat model](docs/threat-model.md) first.
+
+**One place for the variables, instead of eight exports**
+
+The variables above can live in a config instead of a shell history, and the
+worst intake trap — a CLI and a daemon silently resolving different
+`ORCH_HOME`s — has two purpose-built answers:
+
+- `~/.config/agent-orch/orch.toml` (or `ORCH_CONFIG`): a flat TOML table of
+  `ORCH_*` keys the CLI loads at startup. Variables already set in the
+  environment always win, and the two acknowledgement gates
+  (`ORCH_ALLOW_UNATTENDED`, `ORCH_ALLOW_UNSANDBOXED`) are refused in the file
+  on purpose — they record a decision, and decisions do not belong in a file
+  nobody re-reads.
+- `packaging/orch`, a PATH shim that sources the *same* env file as
+  `run-daemon.sh` (`~/.config/agent-orch/env.sh`, template in
+  `packaging/env.sh.template`) before invoking the CLI — so the CLI and the
+  daemon cannot each pick their own state directory.
+
+```toml
+# ~/.config/agent-orch/orch.toml
+ORCH_HOME = "~/.local/state/agent-orch"
+ORCH_PROTECTED_ROOTS = ["~/important-repo"]        # lists join with the path separator
+ORCH_CLAUDE_COMMAND = "claude -p --model claude-opus-5"
+```
+
+**Check the wiring before a task discovers it**
+
+```sh
+python3 -m orchestrator doctor
+```
+
+Read-only. Reports whether `ORCH_HOME` is set or silently defaulted, whether
+both provider CLIs resolve and answer from *this* environment, whether L1 is
+available, whether L2 is actually on (`ORCH_PROTECTED_ROOTS` empty means it is
+OFF), and whether a declared write root contradicts a protected root. Exit
+code 1 when anything would make a stage refuse, so it can gate a provisioning
+script.
 
 **Smoke test it end to end**
 
@@ -158,7 +197,13 @@ locally installed, authenticated agent CLIs — the process it spawns for a stag
 is the same CLI you would run by hand. Two are supported today: **Claude Code
 CLI** and **Codex CLI**. Both must be installed and authenticated before the
 daemon starts; authentication, accounts, and model costs stay with your own
-CLIs, and no API key is held here.
+CLIs, and no API key is held here. Note that the bundled launcher deliberately
+clears the Anthropic API overrides (`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`)
+so the Claude CLI cannot silently inherit pay-per-token billing or a custom
+endpoint from the parent environment. That is the extent of it: the Codex
+CLI's own endpoint and billing configuration live in its config files, which
+the launcher does not police. A deployment that authenticates by API key on
+purpose edits its own copy of the launcher.
 
 The engine reads one variable per owner, `ORCH_CLAUDE_COMMAND` and
 `ORCH_CODEX_COMMAND`, and runs exactly what they contain. Model selection is
@@ -171,9 +216,12 @@ export ORCH_CLAUDE_MODEL=claude-opus-5
 export ORCH_CODEX_MODEL=gpt-5.5
 ./packaging/run-daemon.sh
 
-# Or drive the daemon directly, in which case the full command is yours to set:
-export ORCH_CLAUDE_COMMAND='claude -p --model claude-opus-5'
-export ORCH_CODEX_COMMAND='codex exec --model gpt-5.5'
+# Or drive the daemon directly, in which case the full command is yours to
+# set — including the non-interactive flags the launcher would have added, and
+# the acknowledgement the daemon demands once it sees them:
+export ORCH_CLAUDE_COMMAND='claude -p --dangerously-skip-permissions --model claude-opus-5'
+export ORCH_CODEX_COMMAND='codex exec --approve-for-me --model gpt-5.5'
+export ORCH_ALLOW_UNATTENDED=1
 python3 -m orchestrator daemon
 ```
 
@@ -280,11 +328,12 @@ provider family than the executor. A model reviewing its own output shares its
 own blind spots, so a same-family review mostly confirms what the executor
 already believed.
 
-- The gate is always run by a *different provider* than the one that executed
-  the work — cross-provider by construction, so no model can clear its own
-  output. The gate profile is selected from who executed, not configured
-  per task, which is what makes that property hold rather than depend on
-  someone remembering it.
+- The gate profile is selected from who executed, not configured per task, so
+  the reviewer is always the *other* owner slot — no model clears its own
+  output. One honest caveat: the engine trusts that the `claude` and `codex`
+  slots really are different provider families. It does not verify the commands
+  behind them, so an operator who points both at one family keeps the machinery
+  and loses the property (enforcement is planned, not implemented).
 - Which provider plays which role is a default, not the mechanism. Out of the
   box Claude implements and Codex reviews and gates; swapping the profiles
   reverses it without touching the engine.
@@ -348,14 +397,27 @@ from typed outcomes to next stages, plus per-edge caps.
 | `artifact_validation.yaml` | validate → review → revise harness |
 
 The file names encode which provider plays which role — convenient when the
-pairing matters, irrelevant otherwise. Nothing in the engine depends on the
-names; a deployment is expected to write its own.
+pairing matters, irrelevant otherwise. To be precise about what is fixed and
+what is free: the *filenames* are descriptive only, but the owner IDs inside
+them (`claude`, `codex`) are part of the current implementation — the engine
+accepts exactly those two. A deployment is expected to write its own profiles.
+
+Stage reports (the executor's report, the reviewer's verdict) are directed to
+a `reports/` directory inside the task's artifact directory, not into the
+workspace, so the workspace diff stays the actual change. Directed, not
+enforced: the prompts name the path and the sandbox allows it, but the
+workspace itself remains writable, so a stage that ignores the instruction can
+still create files there — that shows up in review as diff noise, not as a
+containment stop. One exception is stated in the prompt itself: a deployment
+whose custom runner cannot accept the external path falls back to `reports/`
+inside the workspace, and the prompt header says so.
 
 For `apply` work the default is Claude implementing and Codex reviewing.
 Review is a short-output, high-leverage position: a reviewer that finds one
 more real problem is worth more there than at the keyboard, and in practice
-Codex has been the stricter of the two. A brief that says `executor=codex`,
-`codex implement`, or `let codex` selects the opposite pairing.
+Codex has been the stricter of the two. `orch start --executor codex` selects
+the opposite pairing explicitly; the older keyword forms in the brief
+(`executor=codex`, `codex implement`, `let codex`) still work as a fallback.
 
 Intake's risk vocabulary works the same way: generic defaults ship here, and a
 deployment supplies its own keywords through `ORCH_RISK_RULES`. A malformed
@@ -365,7 +427,7 @@ risk. See [`risk-rules.yaml`](risk-rules.yaml) for the format.
 ## Layout
 
 ```
-orchestrator/            engine: controller, daemon, db, ipc, profile, runner, containment, start, cli
+orchestrator/            engine: controller, daemon, db, ipc, profile, runner, containment, start, cli, config, doctor
 orchestrator/profiles/   stage machines
 orchestrator/examples/   fake agent and the demo profile
 orchestrator/tests/      engine suite, including the containment acceptance tests

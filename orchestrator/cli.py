@@ -7,8 +7,10 @@ import sys
 import uuid
 from pathlib import Path
 
+from .config import ConfigFileError, load_config_into_env
 from .controller import Controller, ControllerError
 from .daemon import run_daemon
+from .doctor import run_doctor
 from .runner import ALLOW_UNSANDBOXED_ENV, UnattendedConsentError
 from .ipc import IPCError, daemon_is_running, enqueue_request, wait_for_result
 from .profile import ProfileError
@@ -51,8 +53,21 @@ def build_parser() -> argparse.ArgumentParser:
     scope_group.add_argument("--scope-file", type=Path)
     start.add_argument("--worktree", type=Path)
     start.add_argument("--approved-spec", type=Path)
-    start.add_argument("--effort", choices=["low", "medium", "high"])
-    start.add_argument("--dry-run", action="store_true")
+    start.add_argument(
+        "--executor",
+        choices=["claude", "codex"],
+        help=(
+            "which provider implements an apply task. Without it, intake falls back to "
+            "sniffing the brief for 'executor=codex' / 'codex implement' / 'let codex', "
+            "which is easy to miss; the flag is explicit and wins over the keywords."
+        ),
+    )
+    start.add_argument(
+        "--effort",
+        choices=["low", "medium", "high"],
+        help="recorded in the task record for the operator's own use; routing does not consult it yet",
+    )
+    start.add_argument("--dry-run", action="store_true", help="route and print the execution plan without enqueuing anything")
 
     start_go = subparsers.add_parser("start-go", help="approve a post-route orch start task and enqueue it")
     start_go.add_argument("task_id")
@@ -88,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
     # The long-running service: watch the inbox and execute (the only Controller,
     # and the single writer).
     subparsers.add_parser("daemon", help="run the always-on service that watches the inbox")
+
+    subparsers.add_parser(
+        "doctor",
+        help="check the deployment wiring: config, ORCH_HOME, provider CLIs, L1/L2, overlaps (read-only)",
+    )
 
     submit = subparsers.add_parser("submit", help="submit through the daemon and wait for its result")
     submit.add_argument("--type", required=True, dest="task_type")
@@ -150,6 +170,16 @@ def _broker_and_wait(home: Path, args: argparse.Namespace) -> tuple[dict, bool]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        # Fill unset ORCH_* variables from the optional config file — BEFORE
+        # the parser is built, because defaults like the submit/resume wait
+        # timeout are read from the environment at parser-construction time.
+        # The environment always wins; the acknowledgement gates are refused
+        # in the file.
+        load_config_into_env()
+    except ConfigFileError as exc:
+        print(f"orchestrator: {exc}", file=sys.stderr)
+        return 2
     args = build_parser().parse_args(argv)
     if getattr(args, "allow_unsandboxed", False):
         # Passed to stage subprocesses through the environment, so a daemon
@@ -157,6 +187,19 @@ def main(argv: list[str] | None = None) -> int:
         # guess. It is deliberately noisy to set.
         os.environ[ALLOW_UNSANDBOXED_ENV] = "1"
     home = default_home()
+    if not os.environ.get("ORCH_HOME"):
+        # Defaulting is legal but has burned an operator before: a CLI without
+        # ORCH_HOME creates tasks in a state directory the daemon never reads.
+        print(
+            f"orchestrator: warning: ORCH_HOME is not set; using {home}. "
+            "A daemon configured with a different ORCH_HOME will never see this state.",
+            file=sys.stderr,
+        )
+
+    if args.command == "doctor":
+        report = run_doctor(home)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1 if report["summary"]["fail"] else 0
 
     if args.command == "start":
         try:
@@ -258,8 +301,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # status is read-only: no orphan block, so it is safe while the daemon runs.
-    controller = Controller(home, read_only=(args.command == "status"))
+    controller = None
     try:
+        controller = Controller(home, read_only=(args.command == "status"))
         if args.command == "submit":
             task_id = controller.submit(args.task_type, args.profile, args.input)
             result = controller.run_until_stop(task_id)
@@ -273,7 +317,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"orchestrator: {exc}", file=sys.stderr)
         return 2
     finally:
-        controller.close()
+        if controller is not None:
+            controller.close()
 
 
 def _default_wait_timeout() -> float:

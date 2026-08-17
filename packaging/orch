@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# CLI shim: run `orch ...` from anywhere, with the same environment the daemon
+# uses. Symlink it onto your PATH:
+#
+#     ln -s "<REPO_ROOT>/packaging/orch" ~/bin/orch
+#
+# Why this exists: the CLI and the daemon each resolve ORCH_HOME (and the rest
+# of the ORCH_* variables) independently, and a CLI invoked without them does
+# not fail — it silently operates on a different state directory than the one
+# the daemon watches. Sourcing one shared definition makes that split
+# impossible: this shim and run-daemon.sh read the same file.
+#
+# The shared definitions live in the env file below (default
+# ~/.config/agent-orch/env.sh, override with AGENT_ORCH_ENV), or in the TOML
+# config file the CLI loads itself (ORCH_CONFIG / ~/.config/agent-orch/orch.toml).
+# Variables already present in the environment always win.
+set -euo pipefail
+
+SHIM_DIR="$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")")" >/dev/null 2>&1 && pwd)"
+REPO_ROOT="$(cd "$SHIM_DIR/.." && pwd)"
+
+ENV_FILE="${AGENT_ORCH_ENV:-$HOME/.config/agent-orch/env.sh}"
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+fi
+
+# PYTHONPATH instead of cd: relative --input/--profile paths must keep meaning
+# what they mean in the caller's directory.
+PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m orchestrator "$@"

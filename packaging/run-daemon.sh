@@ -15,11 +15,25 @@ cd "$(dirname "$0")/.."   # repository root
 # findable too.
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-# Headless credentials, if any. Keep this file outside version control.
-# [ -f "<YOUR_ENV_FILE>" ] && { set -a; . "<YOUR_ENV_FILE>"; set +a; }
+# Shared ORCH_* definitions — the same file packaging/orch sources, so the CLI
+# and the daemon cannot resolve different homes. Copy env.sh.template there
+# and keep it outside version control.
+ENV_FILE="${AGENT_ORCH_ENV:-$HOME/.config/agent-orch/env.sh}"
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+fi
 
-# Force the official endpoints and drop inherited overrides, which otherwise
-# conflict with a long-lived token.
+# POLICY, stated rather than silent: clear the Anthropic API overrides, so the
+# Claude CLI runs on its own login state — an inherited override conflicts
+# with a long-lived login token, and a daemon silently inheriting an API key
+# runs unattended work on pay-per-token billing nobody decided on. Scope is
+# exactly these two variables: the Codex CLI's endpoint and billing live in
+# its own config files, which this launcher does not police. If your
+# deployment authenticates with an API key or a custom endpoint on purpose,
+# delete the next line and own that choice in your copy of this launcher.
 unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY
 
 # Unattended operation is opt-in, and deliberately noisy to enable.

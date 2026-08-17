@@ -44,9 +44,10 @@ If you find a security problem — in the containment layers, the sanitization
 scanner, or anything else — please report it privately rather than opening a
 public issue:
 
-- **Preferred:** [GitHub Security Advisories](https://github.com/Roger-Sung/agent-orch/security/advisories/new)
-  ("Report a vulnerability" on the Security tab).
-- **Alternative:** message the repository owner through GitHub.
+- [GitHub Security Advisories](https://github.com/Roger-Sung/agent-orch/security/advisories/new)
+  ("Report a vulnerability" on the Security tab). If the form is unavailable,
+  open a plain issue that says only "security report, please open an advisory"
+  — no details — and the owner will start a private advisory thread from it.
 
 Please include what you were doing, what happened, and what you expected. A
 proof of concept helps but is not required.

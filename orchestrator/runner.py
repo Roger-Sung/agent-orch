@@ -431,6 +431,7 @@ class SubprocessRunner:
         *,
         workspace: Path | None = None,
         protected_roots: tuple[Path, ...] | None = None,
+        reports_dir: Path | None = None,
     ) -> RunResult:
         command = self._command(owner) + [prompt]
         model_command = command
@@ -438,6 +439,13 @@ class SubprocessRunner:
         if workspace is not None:
             try:
                 containment_env = prepare_containment(workspace, log_path)
+                if reports_dir is not None:
+                    # Reports live in the task's artifact area, not the
+                    # workspace: the sandbox must allow the directory (an
+                    # allowlist entry only exists for paths that exist), and
+                    # the stage gets its location in the environment too.
+                    reports_dir.mkdir(parents=True, exist_ok=True)
+                    containment_env["ORCH_REPORTS_DIR"] = str(reports_dir)
             except SandboxSetupError as exc:
                 return self._containment_stop(
                     log_path, owner, command, "sandbox_setup_failed", str(exc)
@@ -446,11 +454,16 @@ class SubprocessRunner:
                 return self._containment_stop(
                     log_path, owner, command, "containment_identity_invalid", str(exc)
                 )
+            except OSError as exc:
+                return self._containment_stop(
+                    log_path, owner, command, "sandbox_setup_failed", f"cannot create reports directory: {exc}"
+                )
             try:
                 decision = prepare_sandbox(
                     workspace,
                     log_path.parent / "containment",
                     allow_unsandboxed=allow_unsandboxed_requested(),
+                    extra_allow=(reports_dir,) if reports_dir is not None else (),
                     protected_roots=protected_roots,
                 )
             except ContainmentConfigError as exc:

@@ -10,8 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .containment import extra_write_roots_from_env, protected_roots_from_env, sandbox_available
 from .ipc import atomic_write_text, daemon_is_running, enqueue_request
+from .profile import ProfileError, load_profile
 from .risk_rules import load_risk_rules
+from .runner import SubprocessRunner, allow_unsandboxed_requested
 
 
 PROFILES_DIR_ENV = "ORCH_PROFILES_DIR"
@@ -158,6 +161,11 @@ class StartFlags:
     approved_spec: Path | None
     effort: str | None
     dry_run: bool
+    #: Explicit executor choice for apply tasks. The keyword forms in the brief
+    #: ("executor=codex", "codex implement", "let codex") remain a fallback, but
+    #: a convention hidden inside free text is exactly what a second operator
+    #: misses; the flag states it, and it wins over the keywords.
+    executor: str | None = None
 
 
 def start_from_args(home: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -171,6 +179,7 @@ def start_from_args(home: Path, args: argparse.Namespace) -> dict[str, Any]:
         approved_spec=args.approved_spec,
         effort=args.effort,
         dry_run=args.dry_run,
+        executor=getattr(args, "executor", None),
     )
     return run_start(home, args.description, flags)
 
@@ -256,7 +265,12 @@ def run_start(home: Path, description: str, flags: StartFlags) -> dict[str, Any]
             task_record["stage"] = "route"
         _write_yaml(task_path, task_record)
         _write_yaml(routing_path, routing)
-        return _result(task_id, task_path, routing_path, task_record, routing)
+        outcome = _result(task_id, task_path, routing_path, task_record, routing)
+        # Everything an operator would otherwise reverse-engineer from source
+        # before daring to start: stages and owners, the commands and models
+        # that would actually run, the workspace, and the containment inputs.
+        outcome["plan"] = _execution_plan(task_record, routing)
+        return outcome
 
     if not routing["auto_start"]:
         task_record["stage"] = "waiting_user"
@@ -1168,6 +1182,7 @@ def _build_task_record(task_id: str, now: str, description: str, flags: StartFla
             "dry_run": flags.dry_run,
             "approved_spec": approved_spec,
             "worktree": worktree,
+            "executor": flags.executor,
         },
         "signals": signals,
         "stage": "intake",
@@ -1262,7 +1277,13 @@ def _preflight(task_record: dict[str, Any], flags: StartFlags) -> dict[str, str 
             "reason": "formal change detected but no OpenSpec context found - provide spec file or task_id",
         }
     if task_type == "apply" and signal_map["openspec_required"] and flags.approved_spec and not _spec_is_approved(flags.approved_spec):
-        return {"status": "waiting_user", "reason": f"apply requires approved OpenSpec: {flags.approved_spec} not yet marked approved"}
+        return {
+            "status": "waiting_user",
+            "reason": (
+                f"apply requires approved OpenSpec: {flags.approved_spec} carries no explicit approval "
+                "marker line (e.g. 'Status: approved'); a marker word in prose does not count"
+            ),
+        }
     return {"status": "pass", "reason": None}
 
 
@@ -1270,7 +1291,7 @@ def _route(task_id: str, description: str, task_record: dict[str, Any], prefligh
     task_type = task_record["task_type_hint"]
     text = _combined_text(description, task_record.get("scope"))
     route_source = _route_source(text, task_type)
-    pattern, executor, reviewer = _pattern(task_type, text)
+    pattern, executor, reviewer = _pattern(task_type, text, task_record["flags"].get("executor"))
     risk = _risk_from_signals(task_record)
     stop_gate = _stop_gate(text, risk)
     complexity = _complexity(task_type, risk, route_source)
@@ -1293,7 +1314,14 @@ def _route(task_id: str, description: str, task_record: dict[str, Any], prefligh
     return routing
 
 
-def _pattern(task_type: str, text: str) -> tuple[str | None, str | None, str | None]:
+def _pattern(
+    task_type: str, text: str, executor_flag: str | None = None
+) -> tuple[str | None, str | None, str | None]:
+    if executor_flag is not None and task_type != "apply":
+        # Only apply has profiles for both pairings; every other type has a
+        # fixed executor. Silently ignoring the flag would let an operator
+        # believe they chose something.
+        raise ValueError(f"--executor applies to apply tasks only; task type here is {task_type!r}")
     if task_type == "propose":
         return "propose_spec", "claude", "codex"
     if task_type == "review":
@@ -1302,9 +1330,13 @@ def _pattern(task_type: str, text: str) -> tuple[str | None, str | None, str | N
         # Default pairing: implement with Claude, review with Codex. Review is a
         # short-output, high-leverage position, and Codex has been the stricter
         # reviewer of the two in practice — so the pairing puts it where finding
-        # a real problem pays most. The escape hatch selects the opposite
-        # pairing when a brief names it explicitly.
+        # a real problem pays most. The explicit --executor flag wins; the
+        # keyword forms in the brief remain a fallback for older callers.
         lowered = text.lower()
+        if executor_flag == "codex":
+            return "codex_implement_claude_review", "codex", "claude"
+        if executor_flag == "claude":
+            return "claude_apply_codex_review", "claude", "codex"
         if "codex implement" in lowered or "executor=codex" in lowered or "let codex" in lowered:
             return "codex_implement_claude_review", "codex", "claude"
         return "claude_apply_codex_review", "claude", "codex"
@@ -1571,6 +1603,77 @@ def _write_execution_input(
     return input_path
 
 
+def _execution_plan(task_record: dict[str, Any], routing: dict[str, Any]) -> dict[str, Any]:
+    """What would run, computed before anything does.
+
+    All of this is knowable at intake time, and all of it has been looked up
+    by reading source when it should have been printed: the stage machine and
+    its owners, the actual provider commands and models, the workspace, the
+    containment inputs, and why the approved spec counted as approved.
+    """
+    flags = task_record.get("flags", {})
+    pattern = routing.get("pattern")
+    profile_entry = _tracked_execution_patterns().get(pattern) if pattern else None
+    profile_path = profile_entry["profile"] if profile_entry else None
+
+    stages: list[dict[str, Any]] | str
+    if profile_path is None:
+        stages = "no profile selected"
+    else:
+        try:
+            profile = load_profile(Path(profile_path))
+            stages = [
+                {
+                    "stage": name,
+                    "owner": stage.owner,
+                    "attempt_cap": stage.attempt_cap,
+                    "timeout": stage.timeout,
+                    "outcomes": dict(stage.outcomes or {}),
+                }
+                if not stage.terminal
+                else {"stage": name, "terminal": stage.terminal}
+                for name, stage in profile.stages.items()
+            ]
+        except (ProfileError, OSError) as exc:
+            stages = f"profile failed to load: {exc}"
+
+    commands: dict[str, dict[str, str | None]] = {}
+    for owner in ("claude", "codex"):
+        try:
+            command = SubprocessRunner._command(owner)
+        except ValueError as exc:
+            commands[owner] = {"command": None, "model": None, "error": str(exc)}
+            continue
+        commands[owner] = {
+            "command": " ".join(command),
+            "model": SubprocessRunner._model_from_command(command) or "unspecified",
+        }
+
+    approved_spec = flags.get("approved_spec")
+    return {
+        "pattern": pattern,
+        "profile": str(profile_path) if profile_path else None,
+        "stages": stages,
+        "provider_commands": commands,
+        "workspace": flags.get("worktree"),
+        "containment": {
+            "sandbox_available": sandbox_available(),
+            "allow_unsandboxed": allow_unsandboxed_requested(),
+            "protected_roots": [str(root) for root in protected_roots_from_env()],
+            "extra_write_roots": [str(root) for root in extra_write_roots_from_env()],
+            "l2_detection": "on" if protected_roots_from_env() else "OFF — no protected roots declared",
+        },
+        "approved_spec": {
+            "path": approved_spec,
+            "approved": _spec_is_approved(Path(approved_spec)) if approved_spec else None,
+            "rule": "an explicit marker line such as 'Status: approved' (status/approval/decision × approved/ready/accepted/final)",
+        },
+        "risk": routing.get("risk"),
+        "stop_gate": routing.get("stop_gate"),
+        "auto_start": routing.get("auto_start"),
+    }
+
+
 def _result(
     task_id: str,
     task_path: Path,
@@ -1587,12 +1690,28 @@ def _result(
     }
 
 
+#: An explicit marker line, not a word found anywhere. The previous check
+#: matched `approved|ready|accepted|final` in prose, which failed both ways: a
+#: spec discussing "when this is ready" counted as approved, and a spec whose
+#: real approval was written in another language did not. The field form is a
+#: contract the approver states on purpose:  `Status: ready`, `approval:
+#: approved`, `Decision = accepted`.
+#:
+#: Anchored at BOTH ends of the value: a qualified marker is not an approval.
+#: `Status: approved pending review` and `Status: final draft` state exactly
+#: the opposite of what an end-anchorless pattern would have read into them.
+_SPEC_APPROVAL_RE = re.compile(
+    r"^\s*(?:status|approval|decision)\s*[:=]\s*(?:approved|ready|accepted|final)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 def _spec_is_approved(path: Path) -> bool:
     try:
-        text = path.read_text(encoding="utf-8").lower()
+        text = path.read_text(encoding="utf-8")
     except OSError:
         return False
-    return bool(re.search(r"\b(approved|ready|accepted|final)\b", text))
+    return bool(_SPEC_APPROVAL_RE.search(text))
 
 
 def _signal_map(task_record: dict[str, Any]) -> dict[str, Any]:

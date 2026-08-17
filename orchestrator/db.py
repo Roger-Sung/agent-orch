@@ -105,6 +105,13 @@ CREATE TABLE IF NOT EXISTS quarantine(
 
 def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     if read_only:
+        if not path.is_file():
+            # A read-only open of a missing database is sqlite's least helpful
+            # error; the actual answer is almost always a wrong ORCH_HOME.
+            raise FileNotFoundError(
+                f"no orchestrator state at {path} — nothing has run against this ORCH_HOME, "
+                "or the CLI and the daemon resolve different homes"
+            )
         uri = path.resolve().as_uri() + "?mode=ro"
         conn = sqlite3.connect(uri, timeout=30, isolation_level=None, uri=True)
         conn.row_factory = sqlite3.Row
