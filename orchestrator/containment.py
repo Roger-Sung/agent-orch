@@ -36,6 +36,7 @@ from typing import Iterable
 
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+PROTECTED_ROOTS_ENV = "ORCH_PROTECTED_ROOTS"
 
 #: Directories a provider CLI legitimately writes to while running a stage.
 #: Sourced from an observed write-path probe, not from guesswork; missing one
@@ -177,6 +178,7 @@ def prepare_sandbox(
     *,
     allow_unsandboxed: bool = False,
     extra_allow: Iterable[str | os.PathLike[str]] = (),
+    protected_roots: Iterable[str | os.PathLike[str]] | None = None,
 ) -> SandboxDecision:
     """Set up L1, or refuse to run.
 
@@ -185,6 +187,12 @@ def prepare_sandbox(
     silent downgrade to the previous unconfined behaviour is exactly the bug
     this layer exists to prevent.
     """
+    declared_extra = tuple(extra_allow) + extra_write_roots_from_env()
+    watched = protected_roots if protected_roots is not None else protected_roots_from_env()
+    # Validate before the availability check: a contradictory configuration is
+    # worth reporting even on a host that could not enforce L1 anyway.
+    validate_extra_write_roots(declared_extra, watched)
+
     if not sandbox_available():
         if allow_unsandboxed:
             return SandboxDecision("unsandboxed", "sandbox_explicitly_disabled")
@@ -195,7 +203,7 @@ def prepare_sandbox(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     profile_path = artifact_dir / "sandbox.sb"
     try:
-        profile_path.write_text(build_sandbox_profile(workspace, artifact_dir, extra_allow), encoding="utf-8")
+        profile_path.write_text(build_sandbox_profile(workspace, artifact_dir, declared_extra), encoding="utf-8")
     except OSError as exc:  # pragma: no cover - depends on a broken filesystem
         raise ContainmentError(f"cannot write sandbox profile: {exc}") from exc
     return SandboxDecision("sandboxed", "sandbox_active", profile_path)
@@ -323,6 +331,71 @@ class Sentinel:
         return violations
 
 
+EXTRA_WRITE_ROOTS_ENV = "ORCH_EXTRA_WRITE_ROOTS"
+
+
+def extra_write_roots_from_env(value: str | None = None) -> tuple[Path, ...]:
+    """Additional write roots a deployment declares (`os.pathsep` separated).
+
+    Real work needs to write outside the workspace: a JVM build wants its
+    dependency cache and daemon directory, a package manager wants its store.
+    Without a way to say so, the only escape was `--allow-unsandboxed`, which
+    turns the whole layer off for every path at once. This is the narrow
+    version of that escape — the deployment names the directories, and
+    everything else stays denied.
+
+    Empty by default; unset means the previous behaviour exactly.
+    """
+    raw = os.environ.get(EXTRA_WRITE_ROOTS_ENV, "") if value is None else value
+    roots = []
+    for part in raw.split(os.pathsep):
+        part = part.strip()
+        if part:
+            roots.append(Path(os.path.expanduser(part)))
+    return tuple(roots)
+
+
+def _contains(outer: str, inner: str) -> bool:
+    """Path containment on resolved paths, component-aware.
+
+    Not a string prefix test: `/a/b` must not be treated as containing
+    `/a/bc`. An over-broad answer here would let a declared write root
+    swallow a protected root, which is the whole thing this check prevents.
+    """
+    return inner == outer or inner.startswith(outer + os.sep)
+
+
+def validate_extra_write_roots(
+    extra: Iterable[str | os.PathLike[str]], protected: Iterable[str | os.PathLike[str]]
+) -> None:
+    """Refuse a declared write root that overlaps a protected root.
+
+    Allowing both would be incoherent: L1 would permit writes to a tree L2 is
+    watching, so a stage could damage a protected root and the run would look
+    clean because the write was "allowed". Overlap in either direction is a
+    configuration error, and it fails closed rather than silently letting the
+    allowlist punch a hole in the detection layer.
+    """
+    resolved_protected = [(str(item), os.path.realpath(os.path.expanduser(str(item)))) for item in protected]
+    if not resolved_protected:
+        return
+    conflicts: list[str] = []
+    for item in extra:
+        declared = str(item)
+        real_extra = os.path.realpath(os.path.expanduser(declared))
+        for original, real_protected in resolved_protected:
+            if _contains(real_protected, real_extra):
+                conflicts.append(f"{declared} is inside protected root {original}")
+            elif _contains(real_extra, real_protected):
+                conflicts.append(f"{declared} contains protected root {original}")
+    if conflicts:
+        raise ContainmentError(
+            f"{EXTRA_WRITE_ROOTS_ENV} overlaps {PROTECTED_ROOTS_ENV}: "
+            + "; ".join(conflicts)
+            + ". A write root that covers a protected root would let L1 permit exactly what L2 watches for."
+        )
+
+
 def protected_roots_from_env(value: str | None = None) -> tuple[Path, ...]:
     """Read declared protected roots from `ORCH_PROTECTED_ROOTS` (os.pathsep separated).
 
@@ -330,7 +403,7 @@ def protected_roots_from_env(value: str | None = None) -> tuple[Path, ...]:
     ships with no opinion about which directories on someone else's machine
     deserve protection.
     """
-    raw = os.environ.get("ORCH_PROTECTED_ROOTS", "") if value is None else value
+    raw = os.environ.get(PROTECTED_ROOTS_ENV, "") if value is None else value
     roots = []
     for part in raw.split(os.pathsep):
         part = part.strip()
