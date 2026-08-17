@@ -239,3 +239,49 @@ class ProfilesDirTest(unittest.TestCase):
         with unittest.mock.patch.dict("os.environ", {"ORCH_PROFILES_DIR": "/nonexistent/profiles"}):
             with self.assertRaises(ValueError):
                 profiles_dir()
+
+
+class ApplyRoutingDefaultTest(unittest.TestCase):
+    """The apply pairing: Claude implements, Codex reviews, unless asked otherwise.
+
+    Review is a short-output, high-leverage position, so the stricter reviewer
+    belongs there rather than at the keyboard. These assertions exist so the
+    default cannot drift back silently.
+    """
+
+    def pattern(self, text: str) -> tuple:
+        from orchestrator.start import _pattern
+
+        return _pattern("apply", text)
+
+    def test_default_is_claude_implements_codex_reviews(self) -> None:
+        self.assertEqual(
+            self.pattern("apply the change to the intake module"),
+            ("claude_apply_codex_review", "claude", "codex"),
+        )
+
+    def test_naming_claude_does_not_change_the_default(self) -> None:
+        self.assertEqual(
+            self.pattern("let claude implement this with executor=claude"),
+            ("claude_apply_codex_review", "claude", "codex"),
+        )
+
+    def test_escape_hatch_selects_the_opposite_pairing(self) -> None:
+        for hint in ("codex implement the loader", "executor=codex", "let codex take this one"):
+            with self.subTest(hint=hint):
+                self.assertEqual(
+                    self.pattern(f"apply the change; {hint}"),
+                    ("codex_implement_claude_review", "codex", "claude"),
+                )
+
+    def test_the_hint_is_case_insensitive(self) -> None:
+        self.assertEqual(
+            self.pattern("APPLY the change with EXECUTOR=CODEX"),
+            ("codex_implement_claude_review", "codex", "claude"),
+        )
+
+    def test_other_task_types_are_untouched(self) -> None:
+        from orchestrator.start import _pattern
+
+        self.assertEqual(_pattern("propose", "draft a spec"), ("propose_spec", "claude", "codex"))
+        self.assertEqual(_pattern("review", "review the spec"), ("spec_review", "codex", "claude"))

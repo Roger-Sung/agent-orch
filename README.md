@@ -185,7 +185,7 @@ from typed outcomes to next stages, plus per-edge caps.
 |---|---|
 | `propose.yaml` | draft → review, review can send it back |
 | `spec_review.yaml` | two reviewers from different provider families |
-| `claude_apply_codex_review.yaml` | apply → review → repair → delta review |
+| `claude_apply_codex_review.yaml` | apply → review → repair → delta review (**the default apply pairing**) |
 | `codex_implement_claude_review.yaml` | the same, executor and reviewer swapped |
 | `stop_gate_claude.yaml` / `stop_gate_codex.yaml` | one gate stage, `allow` or `block` |
 | `provider_smoke.yaml` / `provider_smoke_gated.yaml` | minimal end-to-end provider check |
@@ -194,6 +194,12 @@ from typed outcomes to next stages, plus per-edge caps.
 The file names encode which provider plays which role — convenient when the
 pairing matters, irrelevant otherwise. Nothing in the engine depends on the
 names; a deployment is expected to write its own.
+
+For `apply` work the default is Claude implementing and Codex reviewing.
+Review is a short-output, high-leverage position: a reviewer that finds one
+more real problem is worth more there than at the keyboard, and in practice
+Codex has been the stricter of the two. A brief that says `executor=codex`,
+`codex implement`, or `let codex` selects the opposite pairing.
 
 Intake's risk vocabulary works the same way: generic defaults ship here, and a
 deployment supplies its own keywords through `ORCH_RISK_RULES`. A malformed

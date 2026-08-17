@@ -1299,10 +1299,15 @@ def _pattern(task_type: str, text: str) -> tuple[str | None, str | None, str | N
     if task_type == "review":
         return "spec_review", "codex", "claude"
     if task_type == "apply":
+        # Default pairing: implement with Claude, review with Codex. Review is a
+        # short-output, high-leverage position, and Codex has been the stricter
+        # reviewer of the two in practice — so the pairing puts it where finding
+        # a real problem pays most. The escape hatch selects the opposite
+        # pairing when a brief names it explicitly.
         lowered = text.lower()
-        if "claude implement" in lowered or "executor=claude" in lowered or "let claude" in lowered:
-            return "claude_apply_codex_review", "claude", "codex"
-        return "codex_implement_claude_review", "codex", "claude"
+        if "codex implement" in lowered or "executor=codex" in lowered or "let codex" in lowered:
+            return "codex_implement_claude_review", "codex", "claude"
+        return "claude_apply_codex_review", "claude", "codex"
     if task_type == "provider-smoke":
         lowered = text.lower()
         if "gated" in lowered or "stop-gate" in lowered or "stop gate" in lowered:

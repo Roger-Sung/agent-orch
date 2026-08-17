@@ -429,7 +429,7 @@ class StartPhaseTests(unittest.TestCase):
         self.assertEqual((routing["pattern"], routing["executor"], routing["reviewer"]), ("propose_spec", "claude", "codex"))
         self.assertEqual(routing["route_source"], "rule")
 
-    def test_route_for_apply_defaults_to_codex_implement_claude_review(self):
+    def test_route_for_apply_defaults_to_claude_apply_codex_review(self):
         with tempfile.TemporaryDirectory() as directory:
             spec = Path(directory) / "approved-spec.md"
             spec.write_text("ready for apply\n", encoding="utf-8")
@@ -441,7 +441,7 @@ class StartPhaseTests(unittest.TestCase):
         routing = result["routing"]
         self.assertEqual(
             (routing["pattern"], routing["executor"], routing["reviewer"]),
-            ("codex_implement_claude_review", "codex", "claude"),
+            ("claude_apply_codex_review", "claude", "codex"),
         )
 
     def test_provider_smoke_routes_to_stateful_smoke_profile(self):
@@ -501,7 +501,7 @@ class StartPhaseTests(unittest.TestCase):
         self.assertFalse(routing["auto_start"])
         self.assertEqual(
             (routing["pattern"], routing["executor"], routing["reviewer"]),
-            ("codex_implement_claude_review", "codex", "claude"),
+            ("claude_apply_codex_review", "claude", "codex"),
         )
         self.assertEqual(result["status"], "waiting_user")
 
@@ -598,7 +598,7 @@ class StartPhaseTests(unittest.TestCase):
             self.assertIn("- Reviewer: claude", input_text)
             self.assertIn("- Route source: rule", input_text)
 
-    def test_non_dry_run_medium_risk_apply_auto_start_enqueues_codex_profile(self):
+    def test_non_dry_run_medium_risk_apply_auto_start_enqueues_claude_apply_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "runtime"
             spec = Path(directory) / "approved-spec.md"
@@ -615,11 +615,11 @@ class StartPhaseTests(unittest.TestCase):
             self.assertTrue(routing["auto_start"])
             self.assertEqual(
                 (routing["pattern"], routing["executor"], routing["reviewer"]),
-                ("codex_implement_claude_review", "codex", "claude"),
+                ("claude_apply_codex_review", "claude", "codex"),
             )
             request = json.loads(Path(execution["request_path"]).read_text(encoding="utf-8"))
             self.assertEqual(request["type"], "apply")
-            self.assertTrue(request["profile"].endswith("orchestrator/profiles/codex_implement_claude_review.yaml"))
+            self.assertTrue(request["profile"].endswith("orchestrator/profiles/claude_apply_codex_review.yaml"))
 
     def test_non_dry_run_high_risk_waits_without_enqueue_and_preserves_route(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -636,7 +636,7 @@ class StartPhaseTests(unittest.TestCase):
             self.assertFalse(list((home / "inbox").glob("*.json")))
             self.assertEqual(
                 (routing["pattern"], routing["executor"], routing["reviewer"]),
-                ("codex_implement_claude_review", "codex", "claude"),
+                ("claude_apply_codex_review", "claude", "codex"),
             )
             self.assertIn("start-go", routing["go"]["command"])
 
@@ -663,7 +663,7 @@ class StartPhaseTests(unittest.TestCase):
             self.assertEqual(request["action"], "run")
             self.assertEqual(request["type"], "propose")
 
-    def test_start_go_for_high_risk_apply_enqueues_codex_profile_and_preserves_route(self):
+    def test_start_go_for_high_risk_apply_enqueues_claude_apply_profile_and_preserves_route(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "runtime"
             spec = Path(directory) / "approved-spec.md"
@@ -682,35 +682,8 @@ class StartPhaseTests(unittest.TestCase):
             self.assertEqual(routing["risk"]["implementation"], "high")
             self.assertEqual(
                 (routing["pattern"], routing["executor"], routing["reviewer"]),
-                ("codex_implement_claude_review", "codex", "claude"),
-            )
-            request = json.loads(Path(routing["execution"]["request_path"]).read_text(encoding="utf-8"))
-            self.assertEqual(request["type"], "apply")
-            self.assertTrue(request["profile"].endswith("orchestrator/profiles/codex_implement_claude_review.yaml"))
-            input_text = Path(request["input"]).read_text(encoding="utf-8")
-            self.assertIn("- Pattern: codex_implement_claude_review", input_text)
-            self.assertIn("- Executor: codex", input_text)
-            self.assertIn("- Reviewer: claude", input_text)
-
-    def test_start_go_for_claude_executor_hint_enqueues_claude_apply_profile(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory) / "runtime"
-            spec = Path(directory) / "approved-spec.md"
-            spec.write_text("approved\n", encoding="utf-8")
-            waiting = run_start(
-                home,
-                "apply changes to orchestrator/router/daemon/memory flow with executor=claude",
-                StartFlags("apply", "orchestrator/router/daemon/memory executor=claude", Path(directory), spec, "high", False),
-            )
-            self.assertEqual(waiting["status"], "waiting_user")
-            self.assertEqual(
-                (waiting["routing"]["pattern"], waiting["routing"]["executor"], waiting["routing"]["reviewer"]),
                 ("claude_apply_codex_review", "claude", "codex"),
             )
-
-            approved = run_start_go(home, waiting["task_id"])
-            routing = approved["routing"]
-            self.assertEqual(approved["status"], "execute")
             request = json.loads(Path(routing["execution"]["request_path"]).read_text(encoding="utf-8"))
             self.assertEqual(request["type"], "apply")
             self.assertTrue(request["profile"].endswith("orchestrator/profiles/claude_apply_codex_review.yaml"))
@@ -718,6 +691,33 @@ class StartPhaseTests(unittest.TestCase):
             self.assertIn("- Pattern: claude_apply_codex_review", input_text)
             self.assertIn("- Executor: claude", input_text)
             self.assertIn("- Reviewer: codex", input_text)
+
+    def test_start_go_for_codex_executor_hint_enqueues_codex_implement_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "runtime"
+            spec = Path(directory) / "approved-spec.md"
+            spec.write_text("approved\n", encoding="utf-8")
+            waiting = run_start(
+                home,
+                "apply changes to orchestrator/router/daemon/memory flow with executor=codex",
+                StartFlags("apply", "orchestrator/router/daemon/memory executor=codex", Path(directory), spec, "high", False),
+            )
+            self.assertEqual(waiting["status"], "waiting_user")
+            self.assertEqual(
+                (waiting["routing"]["pattern"], waiting["routing"]["executor"], waiting["routing"]["reviewer"]),
+                ("codex_implement_claude_review", "codex", "claude"),
+            )
+
+            approved = run_start_go(home, waiting["task_id"])
+            routing = approved["routing"]
+            self.assertEqual(approved["status"], "execute")
+            request = json.loads(Path(routing["execution"]["request_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(request["type"], "apply")
+            self.assertTrue(request["profile"].endswith("orchestrator/profiles/codex_implement_claude_review.yaml"))
+            input_text = Path(request["input"]).read_text(encoding="utf-8")
+            self.assertIn("- Pattern: codex_implement_claude_review", input_text)
+            self.assertIn("- Executor: codex", input_text)
+            self.assertIn("- Reviewer: claude", input_text)
 
     def test_start_go_for_preflight_waiting_user_or_blocked_fails_clearly(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -854,7 +854,7 @@ class StartPhaseTests(unittest.TestCase):
             self.assertEqual(gate["controller_status"], "done")
             self.assertEqual(
                 (gate["pattern"], gate["executor"], gate["reviewer"]),
-                ("codex_implement_claude_review", "codex", "claude"),
+                ("claude_apply_codex_review", "claude", "codex"),
             )
             inbox_text = (home / "inbox.md").read_text(encoding="utf-8")
             self.assertIn("stop-gate approval required", inbox_text)
@@ -907,9 +907,9 @@ class StartPhaseTests(unittest.TestCase):
             self.assertEqual(decision["final_stage"], "done")
             self.assertEqual(decision["controller_task_id"], "controller-task-gate")
             self.assertEqual(decision["controller_status"], "done")
-            self.assertEqual(decision["pattern"], "codex_implement_claude_review")
-            self.assertEqual((decision["executor"], decision["reviewer"]), ("codex", "claude"))
-            self.assertTrue(str(decision["profile"]).endswith("orchestrator/profiles/codex_implement_claude_review.yaml"))
+            self.assertEqual(decision["pattern"], "claude_apply_codex_review")
+            self.assertEqual((decision["executor"], decision["reviewer"]), ("claude", "codex"))
+            self.assertTrue(str(decision["profile"]).endswith("orchestrator/profiles/claude_apply_codex_review.yaml"))
             self.assertTrue(Path(decision["decision_artifact_path"]).is_file())
             self.assertEqual(allowed["routing"]["gate"]["status"], "decided")
             self.assertEqual(allowed["routing"]["gate"]["decision"], "ALLOW")
@@ -1085,7 +1085,7 @@ class StartPhaseTests(unittest.TestCase):
             self.assertEqual(task_record["stage"], "execute")
             self.assertNotIn("execution_result", task_record)
 
-    def test_gate_run_pending_codex_gate_enqueues_claude_stop_gate_profile(self):
+    def test_gate_run_for_default_apply_route_enqueues_codex_stop_gate_profile(self):
         with tempfile.TemporaryDirectory() as directory, patch("orchestrator.start.daemon_is_running", return_value=True):
             home = Path(directory) / "runtime"
             synced = self._synced_gate_pending_task(home, Path(directory))
@@ -1096,10 +1096,10 @@ class StartPhaseTests(unittest.TestCase):
             self.assertEqual(result["status"], "waiting_user")
             gate_review = result["routing"]["gate_review_execution"]
             self.assertEqual(gate_review["status"], "enqueued")
-            self.assertEqual(gate_review["owner"], "claude")
-            self.assertTrue(gate_review["profile"].endswith("orchestrator/profiles/stop_gate_claude.yaml"))
-            self.assertEqual(gate_review["executor"], "codex")
-            self.assertEqual(gate_review["reviewer"], "claude")
+            self.assertEqual(gate_review["owner"], "codex")
+            self.assertTrue(gate_review["profile"].endswith("orchestrator/profiles/stop_gate_codex.yaml"))
+            self.assertEqual(gate_review["executor"], "claude")
+            self.assertEqual(gate_review["reviewer"], "codex")
             self.assertEqual(gate_review["original_request_id"], synced["routing"]["execution_result"]["request_id"])
             self.assertTrue(Path(gate_review["input_path"]).is_file())
             self.assertTrue(Path(gate_review["request_path"]).is_file())
@@ -1115,9 +1115,9 @@ class StartPhaseTests(unittest.TestCase):
             self.assertIn(f"- Task record: {result['task_record']}", input_text)
             self.assertIn(f"- Routing decision: {result['routing_decision']}", input_text)
             self.assertIn(f"- Processed execution result: {synced['routing']['execution_result']['processed_result_path']}", input_text)
-            self.assertIn("- Original pattern: codex_implement_claude_review", input_text)
-            self.assertIn("- Original executor: codex", input_text)
-            self.assertIn("- Original reviewer: claude", input_text)
+            self.assertIn("- Original pattern: claude_apply_codex_review", input_text)
+            self.assertIn("- Original executor: claude", input_text)
+            self.assertIn("- Original reviewer: codex", input_text)
             self.assertIn(f"- Expected review output path: {gate_review['expected_output_path']}", input_text)
             self.assertIn("# Stop-Gate Review", input_text)
             self.assertIn("## Recommendation", input_text)
