@@ -69,6 +69,24 @@ prefix named a private system and would have been meaningless here.
 >    reaches `done`. A detection layer that blocks everything is as useless as
 >    one that blocks nothing.
 >
+> **Migration note — the launcher must now state two things explicitly.**
+> Upstream refuses to start the daemon unless both are set, because both were
+> previously silent assumptions:
+>
+> - `ORCH_ALLOW_UNATTENDED=1` — acknowledges that stages run with the provider
+>   CLIs' approval prompts disabled, and therefore with the full authority of
+>   the daemon's UNIX user. A deployment whose whole purpose is unattended work
+>   should set this; it exists so that the choice is recorded rather than
+>   inherited from a script nobody re-read.
+> - `ORCH_CLAUDE_MODEL` / `ORCH_CODEX_MODEL` — no defaults. A default keeps
+>   working after a provider changes what its own default resolves to, and the
+>   run records would then name one model while another did the work.
+>
+> Both are set in the same launcher that exports the provider commands. Without
+> them the next daemon restart exits 78 with the reason on stderr — noisy by
+> design, but it means a deployment that upgrades without reading this note
+> stops rather than silently changing behaviour.
+
 > Keep the roots away from directories holding large, legitimately changing
 > files (build outputs, caches); see `docs/containment-notes.md` for why that
 > costs more than it sounds.
@@ -175,14 +193,43 @@ Two rewrites deserve calling out because they changed meaning, not just words:
 | `docs/decisions/0001-git-identity.md` | commit identity inside containment |
 | `docs/extraction-inventory.md` | this file |
 
-## Not yet done
+## Done since the extraction
 
-Tracked so that the gap is visible rather than discovered later:
+The list below used to be the outstanding work. Keeping it as a record of what
+landed, because "the gap is visible" only means something if the closing of it
+is visible too:
 
-- `docs/threat-model.md`, including the scanner's line-by-line matching limit
-  and the residual gaps L3 would close (separate UNIX identity, network egress
-  allowlist).
-- A recorded end-to-end run under L1 to confirm the provider CLI write
-  allowlist is complete in practice; today it comes from an observed-write
-  probe, not from a full task under the sandbox.
-- README, architecture and lifecycle diagrams, recorded demo.
+- **Containment L1 and L2** — the write allowlist and out-of-workspace write
+  detection, with the acceptance tests in
+  `orchestrator/tests/test_containment_layers.py`. This was the reason the
+  extraction happened at all.
+- **`docs/threat-model.md`** — adversary model, per-layer boundaries, the
+  scanner's line-by-line limit, the residual gaps L3 would close, and an
+  assurance table separating what is tested from what is assumed.
+- **Real provider verification** — both CLIs run end-to-end inside the
+  generated sandbox profile; see `docs/l1-provider-verification.md`. The
+  allowlist needed no changes, which is the useful result.
+- **`risk-rules.yaml` loader** — `ORCH_RISK_RULES`, with the failure behaviour
+  specified and tested (unset is silent, missing warns, malformed refuses).
+- **`ORCH_PROFILES_DIR`** — a deployment supplies its own prompts instead of
+  silently running the example profiles.
+- **`ORCH_EXTRA_WRITE_ROOTS`** — narrow, declared write roots instead of
+  turning L1 off wholesale, with a guard that refuses any overlap with a
+  protected root.
+- **README, architecture and lifecycle diagrams, demo output** — the
+  portfolio-facing material.
+- **CI** — both suites on Linux and macOS, plus the scanner in partial mode.
+
+## Still open
+
+- **L3 isolation** — a separate UNIX identity for the executor and a network
+  egress allowlist. Documented as a known gap rather than implied; see the
+  threat model's residual-risk section.
+- **Token-refresh write paths** — neither provider verification run triggered a
+  credential refresh, so what a CLI writes on that path is inferred from the
+  profile's shape rather than observed.
+- **A recorded demo** (asciinema or similar) and a static architecture image
+  for contexts that do not render Mermaid.
+- **Retiring the old copy** in the deployment this was extracted from: the
+  engine now runs from here, but the superseded directory still exists there
+  and is a trap for anyone reading the wrong one.
