@@ -402,6 +402,39 @@ def _same_object(first: str, second: str) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
+def _ancestors(path: str) -> list[str]:
+    """`path` itself plus every parent up to the filesystem root."""
+    current = path.rstrip(os.sep) or os.sep
+    chain = [current]
+    while True:
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            break
+        chain.append(parent)
+        current = parent
+    return chain
+
+
+def _contains_by_identity(outer: str, inner: str) -> bool:
+    """Whether `outer` is the same filesystem object as any ancestor of `inner`.
+
+    String comparison cannot see aliasing, and aliasing is not hypothetical on
+    macOS: firmlinks make `/Users/<name>` and
+    `/System/Volumes/Data/Users/<name>` the same directory — same device and
+    inode — while `realpath` reports each spelling unchanged. Declaring the
+    aliased spelling of an ancestor of a protected root therefore looked like an
+    unrelated tree while granting write access straight through it.
+
+    Walking ancestors and comparing identity closes that without needing to know
+    which mechanism produced the alias: firmlink, bind mount, or a second mount
+    of the same volume all answer the same way.
+    """
+    for ancestor in _ancestors(inner):
+        if _same_object(outer, ancestor):
+            return True
+    return False
+
+
 def _contains(outer: str, inner: str) -> bool:
     """Whether `outer` contains `inner`, component-aware.
 
@@ -461,9 +494,13 @@ def validate_extra_write_roots(
             if any(_same_object(e, p) for e in extra_forms for p in protected_forms):
                 conflicts.append(f"{declared} is the same directory as protected root {original}")
                 continue
-            if any(_contains(p, e) for e in extra_forms for p in protected_forms):
+            if any(_contains(p, e) for e in extra_forms for p in protected_forms) or any(
+                _contains_by_identity(p, e) for e in extra_forms for p in protected_forms
+            ):
                 conflicts.append(f"{declared} is inside protected root {original}")
-            elif any(_contains(e, p) for e in extra_forms for p in protected_forms):
+            elif any(_contains(e, p) for e in extra_forms for p in protected_forms) or any(
+                _contains_by_identity(e, p) for e in extra_forms for p in protected_forms
+            ):
                 conflicts.append(f"{declared} contains protected root {original}")
     if conflicts:
         raise ContainmentConfigError(
