@@ -142,6 +142,13 @@ reported success*, which is the case that actually matters.
 Commits inside containment use a synthetic identity by default; using a real
 one is explicit and per-run ([ADR 0001](docs/decisions/0001-git-identity.md)).
 
+Two environment variables shape the layers: `ORCH_PROTECTED_ROOTS` declares
+what L2 watches (empty means detection is off), and `ORCH_EXTRA_WRITE_ROOTS`
+declares additional directories a stage may write to — a build cache, for
+instance — instead of turning L1 off wholesale. A write root that overlaps a
+protected root refuses the stage rather than quietly punching a hole in the
+layer that watches it.
+
 What is still open is written down rather than left to be discovered:
 [`docs/threat-model.md`](docs/threat-model.md).
 

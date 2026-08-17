@@ -90,6 +90,36 @@ and a refresh writing into the CLI's own state directory lands inside the
 allowlist. A missing path here would surface as a stage failure, not as silent
 damage, and L2 watches independently.
 
+### L1: declared extra write roots are a trust expansion, owned by the deployment
+
+`ORCH_EXTRA_WRITE_ROOTS` lets a deployment name additional directories a stage
+may write to. It exists because real work needs it — a JVM build writes to its
+dependency cache, a package manager to its store — and because the alternative
+was worse: without it the only escape is `--allow-unsandboxed`, which drops the
+write allowlist entirely for every path at once. One legitimate cache directory
+should not cost the whole layer.
+
+It is still an expansion of what a stage may damage, and the deployment owns
+that decision. Three properties bound it:
+
+- **Narrow by construction.** Only the named roots are added; everything else
+  stays denied. Declaring one directory does not widen the rest.
+- **Resolved before use.** Paths go through realpath, so a symlinked root
+  becomes the real target in the profile rather than a rule that never fires.
+- **It cannot overlap a protected root.** A write root that contains, or sits
+  inside, anything named in `ORCH_PROTECTED_ROOTS` is a configuration
+  contradiction: L1 would permit writes to precisely the tree L2 watches, so a
+  stage could damage a protected root and the run would look clean because the
+  write was allowed. Overlap in either direction refuses the stage before it
+  starts, with the stop reason `containment_config_conflict`. Comparison is on
+  resolved paths and whole path components, so a symlink cannot smuggle a
+  protected root past the check and an adjacent name (`/x/cache-notes` beside
+  `/x/cache`) is not mistaken for containment.
+
+What remains the deployment's responsibility: a declared root is not watched by
+L2 unless it is also a protected root — and it cannot be both. Anything
+genuinely precious does not belong on this list.
+
 ### L1 depends on a deprecated tool
 
 `sandbox-exec` is deprecated by Apple and may be removed. If it disappears,
@@ -173,6 +203,8 @@ Ranked by what an operator should worry about first.
 | Token-refresh write paths | **inferred** — no verification run triggered a refresh |
 | L1 permits a real provider CLI to work (Claude) | real end-to-end run under the sandbox |
 | L1 fails closed without `sandbox-exec` | automated test, with a distinct stop reason |
+| Declared write roots widen only the named paths | automated tests |
+| A write root overlapping a protected root refuses the stage | automated tests, both directions |
 | L2 detects modification, creation, deletion | automated tests |
 | L2 ignores unchanged touches and excluded subtrees | automated tests |
 | L2 still flags paths adjacent to an exclusion | automated test |

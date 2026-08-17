@@ -67,6 +67,16 @@ all. The run above did not itself trigger a refresh — the token was fresh — 
 that specific path remains inferred rather than observed, but it is inferred
 from the profile's shape rather than from a directory walk.
 
+## Scope of these runs
+
+Both runs used the default allowlist — workspace, artifact directory,
+temporary directories, provider state directories — with no
+`ORCH_EXTRA_WRITE_ROOTS` declared. A deployment that declares extra roots
+widens what its stages may write to beyond what was verified here; that is the
+deployment's call, and the reasoning is in
+[`threat-model.md`](threat-model.md). Neither run covers a task whose tooling
+needs such a root, e.g. a JVM build writing to its dependency cache.
+
 ## Reproducing
 
 ```sh
