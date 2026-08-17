@@ -71,24 +71,24 @@ assumed: allowing `/base/workspace` does not allow `/base/workspace-extra`. A
 test covers it, because an allowlist built from string prefixes would quietly
 reopen the hole.
 
-### L1: the Claude allowlist is inferred, not verified
+### L1: the provider allowlist is now verified for both CLIs
 
-The provider state directories in the allowlist come from an observed-write
-probe plus, for Codex, a real end-to-end run under the sandbox (see
-[`l1-provider-verification.md`](l1-provider-verification.md): task completed,
-18 state files written including SQLite `-wal` siblings, out-of-workspace
-write still refused).
+The provider state directories in the allowlist started as an observed-write
+probe — a directory walk, i.e. a guess. Both CLIs have since been run
+end-to-end inside the generated profile
+([`l1-provider-verification.md`](l1-provider-verification.md)): Codex and
+Claude each completed a real task, wrote their state files (Codex 18,
+including SQLite `-wal` siblings; Claude 4, including a cwd-slug session
+transcript), and were still refused a write outside the workspace under the
+same profile. No allowlist changes were needed for either.
 
-The equivalent Claude run could not be completed: the CLI fails to
-authenticate on the host, identically inside and outside the sandbox. So the
-sandbox demonstrably introduces no difference in behaviour, but the write
-paths of a *successful* session — particularly anything written while
-refreshing a token — remain unverified, and that is precisely what a
-directory-walking probe cannot predict.
-
-Bounded risk: a missing path shows up as a stage failure, not as silent
-damage, and L2 watches independently. Still, it is unverified, and it is
-tracked as such rather than counted as passing.
+One path remains inferred rather than observed: what a provider CLI writes
+while *refreshing* an expired token. Neither verification run triggered a
+refresh. The inference is now structural rather than empirical — the profile
+denies file writes only, so keychain access and network egress are untouched,
+and a refresh writing into the CLI's own state directory lands inside the
+allowlist. A missing path here would surface as a stage failure, not as silent
+damage, and L2 watches independently.
 
 ### L1 depends on a deprecated tool
 
@@ -170,7 +170,8 @@ Ranked by what an operator should worry about first.
 | L1 blocks out-of-workspace writes | automated tests, incl. an adjacent-name sibling case |
 | L1 permits legitimate workspace, artifact, and temp writes | automated tests |
 | L1 permits a real provider CLI to work (Codex) | real end-to-end run under the sandbox |
-| L1 permits a real provider CLI to work (Claude) | **not verified** — CLI cannot authenticate on the host |
+| Token-refresh write paths | **inferred** — no verification run triggered a refresh |
+| L1 permits a real provider CLI to work (Claude) | real end-to-end run under the sandbox |
 | L1 fails closed without `sandbox-exec` | automated test, with a distinct stop reason |
 | L2 detects modification, creation, deletion | automated tests |
 | L2 ignores unchanged touches and excluded subtrees | automated tests |

@@ -36,30 +36,36 @@ this CLI. Worth noting: Codex applies its own `workspace-write` sandbox on top
 (it reports `sandbox: workspace-write [workdir, /tmp, $TMPDIR]`), so the two
 layers nest without conflict.
 
-## Claude — inconclusive, for a reason unrelated to the sandbox
+## Claude — pass
 
-`claude -p` exits 1 with:
+First attempted while the CLI's OAuth token was revoked; it failed to
+authenticate *identically inside and outside* the sandbox, which established
+only that L1 introduced no delta. Re-run after the operator re-authenticated:
 
-```
-Failed to authenticate. API Error: 401 OAuth access token has been revoked.
-```
+| Check | Result |
+|---|---|
+| `claude -p` completes under the sandbox | yes, exit 0 (v2.1.226) |
+| Model work unaffected | task "write ok into result.txt" produced the file in the workspace with the right content |
+| Authentication under the sandbox | succeeded — credentials were read and the session authenticated normally |
+| Provider state writes succeed | 4 files: `~/.claude/policy-limits.json`, `~/.claude/remote-settings.json`, a session transcript under `~/.claude/projects/<cwd-slug>/`, and an MCP log under `~/Library/Caches/claude-cli-nodejs/<cwd-slug>/` |
+| Write outside the workspace, same profile | refused, exit 1, target file unchanged |
 
-The same command fails identically **outside** the sandbox, so this is a
-pre-existing authentication problem on the host, not something L1 caused. What
-the run does establish is that the CLI started, read its configuration, and
-reached the network — file reads and egress are unaffected by the profile —
-and that the sandbox introduced no observable difference in behaviour.
+**No allowlist changes were needed.** Two details worth recording:
 
-What it does **not** establish is the part that most needs establishing: the
-write paths a *successful* Claude session touches, in particular anything the
-CLI writes while refreshing a token. That is exactly the class of write an
-observed-write probe cannot predict, since it only happens on a live auth
-path.
+*The cwd-derived slug directories were the right call.* Both
+`~/.claude/projects/` and `~/Library/Caches/claude-cli-nodejs/` get a
+subdirectory named after the working directory of the run. Allowlisting
+specific subdirectories would have failed for every new workspace; allowing
+the parent wholesale is what makes this work at all.
 
-**Open item for M2:** re-run this check once the CLI is authenticated again.
-Until then, the Claude row of the allowlist remains probe-derived. The
-practical risk is bounded — a missing path shows up as a stage failure, not as
-silent damage, and L2 still watches independently — but it is not verified.
+*Credential handling is unaffected because L1 restricts writes only.* The
+profile is `(allow default)` with `file-write*` denied and re-allowed for the
+allowlist, so keychain access, mach services, and network egress are
+untouched. A token refresh writing into `~/.claude` lands inside the
+allowlist; a refresh going through the system keychain is not a file write at
+all. The run above did not itself trigger a refresh — the token was fresh — so
+that specific path remains inferred rather than observed, but it is inferred
+from the profile's shape rather than from a directory walk.
 
 ## Reproducing
 
