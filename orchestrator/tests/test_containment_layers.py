@@ -25,7 +25,10 @@ from pathlib import Path
 
 from orchestrator.containment import (
     DEFAULT_SENTINEL_EXCLUDES,
+    EXTRA_WRITE_ROOTS_ENV,
     SANDBOX_EXEC,
+    extra_write_roots_from_env,
+    validate_extra_write_roots,
     write_allowlist,
     ContainmentError,
     Sentinel,
@@ -425,3 +428,116 @@ class GitIdentityTest(SandboxFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExtraWriteRootsTest(SandboxFixture):
+    """ORCH_EXTRA_WRITE_ROOTS: a narrow escape instead of turning L1 off.
+
+    Real work writes outside the workspace — a JVM build wants its dependency
+    cache — and the only previous escape was --allow-unsandboxed, which drops
+    the layer for every path at once.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.tool_cache = self.base / "tool-cache"
+        self.tool_cache.mkdir()
+        (self.tool_cache / "cached.txt").write_text("original", encoding="utf-8")
+
+    def test_unset_changes_nothing(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(EXTRA_WRITE_ROOTS_ENV, None)
+            self.assertEqual(extra_write_roots_from_env(), ())
+            profile = build_sandbox_profile(self.workspace, self.artifacts)
+        self.assertNotIn(str(self.tool_cache), profile)
+
+    @unittest.skipUnless(sandbox_available(), "sandbox-exec is unavailable on this host")
+    def test_a_declared_root_becomes_writable(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {EXTRA_WRITE_ROOTS_ENV: str(self.tool_cache)}):
+            decision = prepare_sandbox(self.workspace, self.artifacts)
+            target = self.tool_cache / "cached.txt"
+            result = subprocess.run(
+                decision.wrap(["/bin/sh", "-c", f'echo built > "{target}"']),
+                capture_output=True, text=True, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_text(encoding="utf-8").strip(), "built")
+
+    @unittest.skipUnless(sandbox_available(), "sandbox-exec is unavailable on this host")
+    def test_everything_else_is_still_denied(self) -> None:
+        """Declaring one root must not widen the rest of the allowlist."""
+        with unittest.mock.patch.dict(os.environ, {EXTRA_WRITE_ROOTS_ENV: str(self.tool_cache)}):
+            decision = prepare_sandbox(self.workspace, self.artifacts)
+            result = subprocess.run(
+                decision.wrap(["/bin/sh", "-c", f'echo mutated > "{self.protected_file}"']),
+                capture_output=True, text=True, check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.protected_file.read_text(encoding="utf-8"), "original")
+
+    def test_multiple_roots_are_split_on_the_path_separator(self) -> None:
+        second = self.base / "second-cache"
+        second.mkdir()
+        raw = f"{self.tool_cache}{os.pathsep}{second}"
+        with unittest.mock.patch.dict(os.environ, {EXTRA_WRITE_ROOTS_ENV: raw}):
+            self.assertEqual(extra_write_roots_from_env(), (self.tool_cache, second))
+
+    def test_a_symlinked_root_is_resolved_into_the_profile(self) -> None:
+        """The realpath trap: a rule built from an unresolved path never matches."""
+        link = self.base / "cache-link"
+        link.symlink_to(self.tool_cache)
+        with unittest.mock.patch.dict(os.environ, {EXTRA_WRITE_ROOTS_ENV: str(link)}):
+            profile = build_sandbox_profile(self.workspace, self.artifacts, extra_write_roots_from_env())
+        self.assertIn(os.path.realpath(self.tool_cache), profile)
+        self.assertNotIn(f'"{link}"', profile)
+
+    def test_a_root_inside_a_protected_root_is_refused(self) -> None:
+        inside = self.protected / "cache"
+        inside.mkdir()
+        with self.assertRaises(ContainmentError) as caught:
+            validate_extra_write_roots([inside], [self.protected])
+        self.assertIn("inside protected root", str(caught.exception))
+
+    def test_a_root_containing_a_protected_root_is_refused(self) -> None:
+        with self.assertRaises(ContainmentError) as caught:
+            validate_extra_write_roots([self.base], [self.protected])
+        self.assertIn("contains protected root", str(caught.exception))
+
+    def test_an_adjacent_name_is_not_treated_as_an_overlap(self) -> None:
+        """`/base/protected-notes` is not inside `/base/protected`."""
+        neighbour = self.base / f"{self.protected.name}-notes"
+        neighbour.mkdir()
+        validate_extra_write_roots([neighbour], [self.protected])
+
+    def test_a_symlink_cannot_smuggle_a_protected_root_past_the_check(self) -> None:
+        link = self.base / "innocent-looking"
+        link.symlink_to(self.protected)
+        with self.assertRaises(ContainmentError):
+            validate_extra_write_roots([link], [self.protected])
+
+    def test_prepare_sandbox_refuses_a_conflicting_configuration(self) -> None:
+        inside = self.protected / "cache"
+        inside.mkdir()
+        with unittest.mock.patch.dict(
+            os.environ,
+            {EXTRA_WRITE_ROOTS_ENV: str(inside), "ORCH_PROTECTED_ROOTS": str(self.protected)},
+        ):
+            with self.assertRaises(ContainmentError):
+                prepare_sandbox(self.workspace, self.artifacts)
+
+    def test_a_conflicting_configuration_stops_the_stage_with_its_own_reason(self) -> None:
+        inside = self.protected / "cache"
+        inside.mkdir()
+        log_path = self.artifacts / "stage.log"
+        with unittest.mock.patch.dict(
+            os.environ, {EXTRA_WRITE_ROOTS_ENV: str(inside)}
+        ):
+            result = SubprocessRunner().run(
+                "claude", "prompt", 5, log_path,
+                workspace=self.workspace, protected_roots=(self.protected,),
+            )
+        self.assertEqual(result.containment_stop, "containment_config_conflict")
+        classified = classify_result(result.exit_code, result.output, {"pass"}, source=result)
+        self.assertEqual(classified.classification, "blocked")
+        self.assertEqual(classified.reason, "containment_config_conflict")
+        self.assertNotEqual(classified.reason, "runner_nonzero")
