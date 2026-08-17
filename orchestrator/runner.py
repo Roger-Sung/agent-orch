@@ -89,17 +89,20 @@ def prepare_containment(workspace: Path, log_path: Path) -> dict[str, str]:
 
     gitconfig = containment_root / "gitconfig"
     identity = _git_identity()
-    (containment_root / "identity-source").write_text(identity["source"] + "\n", encoding="utf-8")
-    gitconfig.write_text(
-        "[user]\n"
-        f"\tname = {identity['name']}\n"
-        f"\temail = {identity['email']}\n"
-        "[core]\n"
-        f"\thooksPath = {hooks_dir}\n"
-        "[credential]\n"
-        "\thelper =\n",
-        encoding="utf-8",
-    )
+    try:
+        (containment_root / "identity-source").write_text(identity["source"] + "\n", encoding="utf-8")
+        gitconfig.write_text(
+            "[user]\n"
+            f"\tname = {identity['name']}\n"
+            f"\temail = {identity['email']}\n"
+            "[core]\n"
+            f"\thooksPath = {hooks_dir}\n"
+            "[credential]\n"
+            "\thelper =\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise SandboxSetupError(f"cannot write containment gitconfig: {exc}") from exc
 
     env = {key: value for key, value in os.environ.items() if key not in CONTAINMENT_BLOCKED_ENV}
     env.update(
