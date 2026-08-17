@@ -510,6 +510,46 @@ def validate_extra_write_roots(
         )
 
 
+def validate_home_outside_protected(
+    home: str | os.PathLike[str], protected: Iterable[str | os.PathLike[str]]
+) -> None:
+    """Refuse an orchestrator home that overlaps a protected root.
+
+    Every stage run writes logs, manifests, and reports under
+    `ORCH_HOME/tasks/<id>/`. The sentinel excludes the task *workspace* but
+    not the orchestrator's own state directory, so a protected root that
+    covers ORCH_HOME turns the engine's ordinary bookkeeping into a
+    `workspace_escape` on every run — and deliberately excluding ORCH_HOME
+    from L2 would instead exempt the evidence trail from the layer that
+    guards it. Separation is the only configuration that keeps both
+    properties, so overlap refuses to start rather than degrading one of
+    them silently. Comparison mirrors the write-root guard: both lexical and
+    resolved forms, plus filesystem identity along the ancestor chain.
+    """
+    home_forms = _forms(home)
+    conflicts: list[str] = []
+    for root in protected:
+        root_forms = _forms(root)
+        if any(_same_object(h, p) for h in home_forms for p in root_forms):
+            conflicts.append(f"ORCH_HOME {home} is the same directory as protected root {root}")
+            continue
+        if any(_contains(p, h) for h in home_forms for p in root_forms) or any(
+            _contains_by_identity(p, h) for h in home_forms for p in root_forms
+        ):
+            conflicts.append(f"ORCH_HOME {home} is inside protected root {root}")
+        elif any(_contains(h, p) for h in home_forms for p in root_forms) or any(
+            _contains_by_identity(h, p) for h in home_forms for p in root_forms
+        ):
+            conflicts.append(f"ORCH_HOME {home} contains protected root {root}")
+    if conflicts:
+        raise ContainmentConfigError(
+            "the orchestrator home overlaps a protected root: "
+            + "; ".join(conflicts)
+            + ". Stage logs and reports are written under ORCH_HOME, so L2 would flag the "
+            "engine's own writes; keep state and protected roots in separate trees."
+        )
+
+
 def protected_roots_from_env(value: str | None = None) -> tuple[Path, ...]:
     """Read declared protected roots from `ORCH_PROTECTED_ROOTS` (os.pathsep separated).
 

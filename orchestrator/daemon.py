@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .containment import protected_roots_from_env, validate_home_outside_protected
 from .controller import Controller, ControllerError
 from .ipc import IPCError, atomic_write_json, atomic_write_text, hold_daemon_lock
 from .profile import ProfileError
@@ -32,6 +33,9 @@ def run_daemon(home: Path, poll_interval: float = 3.0) -> None:
     # launcher would otherwise skip the acknowledgement without noticing.
     require_unattended_consent()
     home = home.resolve()
+    # A protected root that covers this home would turn every stage's own
+    # bookkeeping into a workspace_escape; refuse before creating anything.
+    validate_home_outside_protected(home, protected_roots_from_env())
     inbox = home / "inbox"
     processing = home / "processing"
     processed = home / "processed"

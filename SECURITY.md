@@ -29,9 +29,11 @@ an adversarial boundary:
   the allowlist necessarily includes the temporary directories and the provider
   CLIs' own state directories.
 - The daemon invokes provider CLIs with their approval prompts disabled. That
-  is the point of a daemon, and it is why both the launcher and the daemon
-  refuse to start until `ORCH_ALLOW_UNATTENDED=1` says so out loud. That gate
-  detects *known* flags by name and is an acknowledgement rather than a
+  is the point of a daemon, and it is why `ORCH_ALLOW_UNATTENDED=1` has to say
+  so out loud: the bundled launcher requires it unconditionally, and the
+  daemon requires it when it detects a *known* approval-disabling flag by name
+  in the configured commands — a renamed flag or a config-file mechanism is
+  invisible to that check. Either way it is an acknowledgement rather than a
   control: it records a decision, it does not restrain a stage.
 
 [`docs/threat-model.md`](docs/threat-model.md) states the adversary model, what
@@ -45,9 +47,9 @@ scanner, or anything else — please report it privately rather than opening a
 public issue:
 
 - [GitHub Security Advisories](https://github.com/Roger-Sung/agent-orch/security/advisories/new)
-  ("Report a vulnerability" on the Security tab). If the form is unavailable,
-  open a plain issue that says only "security report, please open an advisory"
-  — no details — and the owner will start a private advisory thread from it.
+  ("Report a vulnerability" on the Security tab) is the only reporting
+  channel — issues are closed on this repository, consistent with its
+  project status.
 
 Please include what you were doing, what happened, and what you expected. A
 proof of concept helps but is not required.

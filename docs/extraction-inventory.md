@@ -58,6 +58,18 @@ prefix named a private system and would have been meaningless here.
 > export ORCH_PROTECTED_ROOTS="$HOME/<deployment-home>"
 > ```
 >
+> One prerequisite that protection creates: `ORCH_HOME` must NOT live inside
+> the protected tree. Stage logs and reports are written under
+> `ORCH_HOME/tasks/`, so a protected root covering it would make L2 flag the
+> engine's own writes — the daemon refuses that configuration at startup, and
+> `orch doctor` reports it. A deployment that previously kept state under its
+> own home (e.g. `<deployment-home>/output/orchestrator`) moves the state
+> directory out first:
+>
+> ```sh
+> export ORCH_HOME="$HOME/.local/state/agent-orch"   # outside the protected tree
+> ```
+>
 > Verify it took effect, rather than assuming:
 > 1. `python3 -c "from orchestrator.containment import protected_roots_from_env as r; print(r())"`
 >    inside the daemon's environment — it must print your roots, not `()`.

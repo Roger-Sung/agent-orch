@@ -94,9 +94,11 @@ history intact.
   the bundled launcher sets it explicitly. Log in with each CLI first: the
   daemon runs unattended and cannot complete an interactive sign-in, and a
   stage whose CLI is unauthenticated fails as a provider error.
-- **macOS for L1.** The write sandbox uses `sandbox-exec`. On other platforms a
-  mutating stage refuses to run unless `--allow-unsandboxed` is passed; L2
-  detection and the overlap guard work everywhere.
+- **macOS or Linux.** Windows is not supported — the IPC layer uses `fcntl`
+  file locks. L1 is macOS-only on top of that: the write sandbox uses
+  `sandbox-exec`, and on other platforms a mutating stage refuses to run
+  unless `--allow-unsandboxed` is passed; L2 detection and the overlap guard
+  work on both supported systems.
 
 **Configure and start**
 
@@ -376,7 +378,10 @@ what L2 watches (empty means detection is off), and `ORCH_EXTRA_WRITE_ROOTS`
 declares additional directories a stage may write to — a build cache, for
 instance — instead of turning L1 off wholesale. A write root that overlaps a
 protected root refuses the stage rather than quietly punching a hole in the
-layer that watches it.
+layer that watches it. `ORCH_HOME` must itself sit outside every protected
+root: stage logs and reports are written under it, so a protected root
+covering it would make L2 flag the engine's own bookkeeping — the daemon
+refuses to start on that configuration, and `orch doctor` reports it.
 
 What is still open is written down rather than left to be discovered:
 [`docs/threat-model.md`](docs/threat-model.md).

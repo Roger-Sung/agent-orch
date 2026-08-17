@@ -26,6 +26,7 @@ from .containment import (
     protected_roots_from_env,
     sandbox_available,
     validate_extra_write_roots,
+    validate_home_outside_protected,
 )
 from .risk_rules import load_risk_rules
 from .runner import (
@@ -142,10 +143,34 @@ def run_doctor(home: Path) -> dict[str, Any]:
     else:
         checks.append(_check("l1_sandbox", "fail", "sandbox-exec unavailable; mutating stages will refuse to run"))
 
-    # L2: off is legal, but it should never be off by accident.
+    # L2: off is legal, but it should never be off by accident — and a declared
+    # root that does not exist is worse than none, because the sentinel skips
+    # missing roots silently while the operator believes they are watched.
     protected = protected_roots_from_env()
     if protected:
-        checks.append(_check("l2_protected_roots", "ok", f"{len(protected)} root(s) declared"))
+        unusable: list[str] = []
+        for root in protected:
+            if not root.exists():
+                unusable.append(f"{root} does not exist")
+            elif not root.is_dir():
+                unusable.append(f"{root} is not a directory")
+            elif not os.access(root, os.R_OK | os.X_OK):
+                unusable.append(f"{root} is not readable")
+        if unusable:
+            checks.append(
+                _check(
+                    "l2_protected_roots",
+                    "fail",
+                    "declared but unwatchable — the sentinel silently skips these: " + "; ".join(unusable),
+                )
+            )
+        else:
+            checks.append(_check("l2_protected_roots", "ok", f"{len(protected)} root(s) declared and readable"))
+        try:
+            validate_home_outside_protected(home, protected)
+            checks.append(_check("home_outside_protected", "ok", "ORCH_HOME does not overlap a protected root"))
+        except ContainmentConfigError as exc:
+            checks.append(_check("home_outside_protected", "fail", str(exc)))
     else:
         checks.append(
             _check(

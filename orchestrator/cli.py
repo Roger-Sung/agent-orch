@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 
 from .config import ConfigFileError, load_config_into_env
+from .containment import ContainmentError
 from .controller import Controller, ControllerError
 from .daemon import run_daemon
 from .doctor import run_doctor
@@ -275,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
             # gates are indistinguishable to whoever is reading the failure.
             print(f"orchestrator daemon: {exc}", file=sys.stderr)
             return 78  # EX_CONFIG
-        except (ControllerError, IPCError, OSError, ValueError) as exc:
+        except (ControllerError, ContainmentError, IPCError, OSError, ValueError) as exc:
             print(f"orchestrator: {exc}", file=sys.stderr)
             return 2
 

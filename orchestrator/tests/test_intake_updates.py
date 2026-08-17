@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from orchestrator.config import ConfigFileError, load_config_into_env
+from orchestrator.containment import ContainmentConfigError, validate_home_outside_protected
 from orchestrator.controller import Controller
 from orchestrator.doctor import run_doctor
 from orchestrator.runner import RunResult
@@ -241,6 +242,63 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(by_name["provider_claude"]["status"], "fail")
         self.assertIn("malformed", by_name["provider_claude"]["detail"])
         self.assertEqual(by_name["daemon"]["status"], "warn")
+
+
+class HomeOutsideProtectedTests(unittest.TestCase):
+    def test_home_inside_a_protected_root_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            protected = Path(directory) / "deployment"
+            home = protected / "output" / "orchestrator"
+            home.mkdir(parents=True)
+            with self.assertRaises(ContainmentConfigError):
+                validate_home_outside_protected(home, (protected,))
+
+    def test_home_containing_a_protected_root_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            protected = home / "precious"
+            protected.mkdir(parents=True)
+            with self.assertRaises(ContainmentConfigError):
+                validate_home_outside_protected(home, (protected,))
+
+    def test_disjoint_home_and_protected_root_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "state"
+            protected = Path(directory) / "repo"
+            home.mkdir()
+            protected.mkdir()
+            validate_home_outside_protected(home, (protected,))  # must not raise
+
+    def test_daemon_startup_refuses_the_overlap(self):
+        from orchestrator.daemon import run_daemon
+
+        with tempfile.TemporaryDirectory() as directory:
+            protected = Path(directory) / "deployment"
+            home = protected / "orch-home"
+            home.mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"ORCH_PROTECTED_ROOTS": str(protected)}, clear=False):
+                with self.assertRaises(ContainmentConfigError):
+                    run_daemon(home, poll_interval=0.1)
+
+    def test_doctor_reports_the_overlap_and_a_missing_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            protected = Path(directory) / "deployment"
+            home = protected / "orch-home"
+            home.mkdir(parents=True)
+            missing = Path(directory) / "nonexistent-root"
+            overrides = {
+                "ORCH_CLAUDE_COMMAND": str(Path(directory) / "missing-claude"),
+                "ORCH_CODEX_COMMAND": str(Path(directory) / "missing-codex"),
+                "ORCH_PROTECTED_ROOTS": os.pathsep.join([str(protected), str(missing)]),
+                "ORCH_EXTRA_WRITE_ROOTS": "",
+                "ORCH_CONFIG": "",
+            }
+            with mock.patch.dict(os.environ, overrides, clear=False):
+                report = run_doctor(home)
+        by_name = {item["check"]: item for item in report["checks"]}
+        self.assertEqual(by_name["home_outside_protected"]["status"], "fail")
+        self.assertEqual(by_name["l2_protected_roots"]["status"], "fail")
+        self.assertIn("does not exist", by_name["l2_protected_roots"]["detail"])
 
 
 REPORTS_PROFILE = """\

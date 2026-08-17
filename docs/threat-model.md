@@ -192,6 +192,17 @@ legitimately change: build outputs, media, package caches. The exclusion list
 is the right escape hatch for those; raising the threshold makes every stage
 slower for every file.
 
+### L2: the orchestrator home must sit outside the protected roots
+
+Stage logs, manifests, and reports are written under `ORCH_HOME/tasks/`, and
+the sentinel excludes only the task workspace — not the engine's own state.
+A protected root covering `ORCH_HOME` would therefore report the engine's
+ordinary bookkeeping as a `workspace_escape` on every run; excluding
+`ORCH_HOME` from L2 instead would exempt the evidence trail from the layer
+that guards it. Neither degradation is acceptable, so the daemon refuses to
+start when the two overlap (either direction, same alias-aware comparison as
+the write-root guard), and `orch doctor` reports the conflict.
+
 ### L2: a snapshot is not a monitor
 
 Detection brackets the stage. A file written *and restored* during a stage is
