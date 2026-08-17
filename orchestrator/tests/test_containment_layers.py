@@ -615,6 +615,7 @@ class WriteRootGuardEdgeCaseTest(SandboxFixture):
 class SandboxSetupFailureTest(SandboxFixture):
     """A broken environment is not a broken configuration (finding 5)."""
 
+    @unittest.skipUnless(sandbox_available(), "profile writing is only reached where L1 exists")
     def test_an_unwritable_artifact_directory_reports_a_setup_failure(self) -> None:
         blocked = self.base / "read-only"
         blocked.mkdir()

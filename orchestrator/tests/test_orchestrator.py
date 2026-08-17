@@ -1846,6 +1846,13 @@ class BrokerIntegrationTests(unittest.TestCase):
                 "ORCH_CODEX_COMMAND": (
                     f"{sys.executable} {ROOT / 'orchestrator/examples/fake_agent.py'} codex"
                 ),
+                # L1 is a macOS mechanism, and a contained stage refuses to run
+                # where it is unavailable. This test is about the broker loop,
+                # not about containment: the fake agent writes nothing outside
+                # the temporary workspace, and L1 has its own dedicated tests.
+                # Set unconditionally so the behaviour is identical on every
+                # host rather than depending on where the suite happens to run.
+                "ORCH_ALLOW_UNSANDBOXED": "1",
             }
         )
         if route_success:
