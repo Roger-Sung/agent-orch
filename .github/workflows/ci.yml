@@ -1,0 +1,79 @@
+# CI runs the tests on both platforms and the sanitization scanner in its
+# partial mode.
+#
+# Why partial: the scanner's `requires_secrets` rules match site-local literals
+# — an operator's name, a home directory, an employer domain — which are
+# supplied from a file that deliberately never reaches this repository or this
+# runner. Without that file the scanner would exit 2 rather than report a tree
+# it did not fully check, so CI passes --no-strict-secrets and checks the
+# repository-side rules only.
+#
+# The full strict scan is a local gate: the pre-commit hook refuses to run at
+# all without the secrets file, and the whole history is scanned commit by
+# commit before publishing. CI is a second pair of eyes, not the gate.
+#
+# Platform note: L1 containment uses macOS `sandbox-exec`. On Linux the tests
+# that need it skip themselves through `sandbox_available()`; everything else,
+# including the whole L2 detection layer and the overlap guard, runs on both.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Confirm there is nothing to install
+        run: |
+          python3 -c "import sys; print(sys.version)"
+          test ! -f requirements.txt
+          test ! -f pyproject.toml
+
+      - name: Engine suite
+        run: python3 -m unittest discover -s orchestrator/tests -v
+
+      - name: Sanitization scanner suite
+        run: python3 -m unittest discover -s tools/tests -v
+
+      - name: Report which containment tests were skipped
+        if: always()
+        run: |
+          python3 - <<'PY'
+          from orchestrator.containment import sandbox_available
+          print("sandbox-exec available:", sandbox_available())
+          print("L1 enforcement tests run only where it is available;")
+          print("L2 detection and the overlap guard run everywhere.")
+          PY
+
+  lint:
+    name: sanitization scan (partial)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # No secrets file on the runner by design; see the header comment.
+      - name: Forbidden-pattern scan (repository-side rules)
+        run: python3 tools/sanitize-lint.py . --no-strict-secrets

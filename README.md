@@ -160,6 +160,18 @@ python3 -m unittest discover -s orchestrator/tests  # engine suite
 python3 -m unittest discover -s tools/tests         # sanitization scanner suite
 ```
 
+Both suites run on Linux and macOS. L1 uses macOS `sandbox-exec`, so its
+enforcement tests skip themselves elsewhere and a mutating stage on a host
+without it refuses to run unless `--allow-unsandboxed` is passed — the L2
+detection layer and the overlap guard are platform-independent.
+
+CI runs both suites on both platforms plus a **partial** sanitization scan.
+Partial because the scanner's site-local rules need literals (an operator's
+name, a home directory, an employer domain) that deliberately never reach this
+repository or a CI runner. The full strict scan is a local gate: the
+pre-commit hook refuses to run without that file, and the whole history is
+scanned commit by commit before anything is published.
+
 The demo needs no credentials and makes no network calls. It runs a synthetic
 task against a fake agent that disagrees with itself on purpose, so the review
 edge reaches its cap. Abridged output:
