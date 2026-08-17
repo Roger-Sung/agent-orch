@@ -27,6 +27,9 @@ from orchestrator.containment import (
     DEFAULT_SENTINEL_EXCLUDES,
     EXTRA_WRITE_ROOTS_ENV,
     SANDBOX_EXEC,
+    ContainmentConfigError,
+    SandboxSetupError,
+    _contains,
     extra_write_roots_from_env,
     validate_extra_write_roots,
     write_allowlist,
@@ -37,7 +40,7 @@ from orchestrator.containment import (
     protected_roots_from_env,
     sandbox_available,
 )
-from orchestrator.controller import Controller
+from orchestrator.controller import Controller, _accepts_protected_roots
 from orchestrator.runner import (
     ALLOW_UNSANDBOXED_ENV,
     GIT_IDENTITY_ENV,
@@ -541,3 +544,167 @@ class ExtraWriteRootsTest(SandboxFixture):
         self.assertEqual(classified.classification, "blocked")
         self.assertEqual(classified.reason, "containment_config_conflict")
         self.assertNotEqual(classified.reason, "runner_nonzero")
+
+
+class WriteRootGuardEdgeCaseTest(SandboxFixture):
+    """Ways a naive overlap check gets it wrong. Each of these was a real hole.
+
+    All five were found by review rather than by the original tests, which is
+    the argument for keeping them named after the mistake they prevent.
+    """
+
+    def test_the_filesystem_root_cannot_be_declared_as_a_write_root(self) -> None:
+        """`outer + os.sep` for "/" builds "//", which matches nothing.
+
+        Left unhandled, declaring "/" passes the guard and allowlists the entire
+        filesystem — the widest possible hole, through the narrowest-looking
+        setting.
+        """
+        with self.assertRaises(ContainmentConfigError):
+            validate_extra_write_roots(["/"], [self.protected])
+        self.assertTrue(_contains("/", str(self.protected)))
+
+    def test_a_trailing_separator_does_not_hide_an_overlap(self) -> None:
+        inside = self.protected / "cache"
+        inside.mkdir()
+        with self.assertRaises(ContainmentConfigError):
+            validate_extra_write_roots([f"{inside}{os.sep}"], [f"{self.protected}{os.sep}"])
+
+    def test_a_case_variant_is_treated_as_the_same_tree(self) -> None:
+        """macOS is case-insensitive by default and realpath does not fold case."""
+        variant = Path(str(self.protected).upper() if str(self.protected).islower()
+                       else str(self.protected).lower())
+        with self.assertRaises(ContainmentConfigError):
+            validate_extra_write_roots([variant], [self.protected])
+
+    def test_a_protected_root_symlinked_inside_a_write_root_is_refused(self) -> None:
+        """Resolving alone hides this: the target is outside, the link is not.
+
+        With the link inside writable space, a stage can re-point the sentinel
+        anchor at a decoy tree of identical content and L2 would compare the
+        wrong thing.
+        """
+        outside = self.base / "real-store"
+        outside.mkdir()
+        tools = self.base / "tools"
+        tools.mkdir()
+        anchor = tools / "store"
+        anchor.symlink_to(outside)
+        with self.assertRaises(ContainmentConfigError) as caught:
+            validate_extra_write_roots([tools], [anchor])
+        self.assertIn("contains protected root", str(caught.exception))
+
+    def test_a_write_root_symlinked_to_a_protected_root_is_refused(self) -> None:
+        link = self.base / "looks-harmless"
+        link.symlink_to(self.protected)
+        with self.assertRaises(ContainmentConfigError):
+            validate_extra_write_roots([link], [self.protected])
+
+    def test_the_same_directory_reached_two_ways_is_refused(self) -> None:
+        with self.assertRaises(ContainmentConfigError) as caught:
+            validate_extra_write_roots([self.protected / "." ], [self.protected])
+        self.assertIn("protected root", str(caught.exception))
+
+    def test_genuinely_separate_trees_are_still_allowed(self) -> None:
+        """The guard must not become a blanket refusal."""
+        sibling = self.base / f"{self.protected.name}-notes"
+        sibling.mkdir()
+        validate_extra_write_roots([sibling, self.base / "tool-cache"], [self.protected])
+
+
+class SandboxSetupFailureTest(SandboxFixture):
+    """A broken environment is not a broken configuration (finding 5)."""
+
+    def test_an_unwritable_artifact_directory_reports_a_setup_failure(self) -> None:
+        blocked = self.base / "read-only"
+        blocked.mkdir()
+        blocked.chmod(0o500)
+        try:
+            with self.assertRaises(SandboxSetupError):
+                prepare_sandbox(self.workspace, blocked / "artifacts")
+        finally:
+            blocked.chmod(0o700)
+
+    def test_a_setup_failure_is_not_reported_as_a_config_conflict(self) -> None:
+        blocked = self.base / "read-only-2"
+        blocked.mkdir()
+        blocked.chmod(0o500)
+        log_path = blocked / "artifacts" / "stage.log"
+        try:
+            result = SubprocessRunner().run(
+                "claude", "prompt", 5, log_path, workspace=self.workspace, protected_roots=()
+            )
+        finally:
+            blocked.chmod(0o700)
+        self.assertEqual(result.containment_stop, "sandbox_setup_failed")
+        classified = classify_result(result.exit_code, result.output, {"pass"}, source=result)
+        self.assertEqual(classified.reason, "sandbox_setup_failed")
+        self.assertNotEqual(classified.reason, "containment_config_conflict")
+
+
+class LegacyRunnerInterfaceTest(SandboxFixture):
+    """A runner predating protected_roots must keep working (finding 4)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.profile_path = self.base / "profile.yaml"
+        self.profile_path.write_text(PROFILE_YAML, encoding="utf-8")
+        self.input_path = self.base / "input.md"
+        self.input_path.write_text("do the thing\n", encoding="utf-8")
+
+    def _run(self, runner, protected):
+        controller = Controller(self.home, runner=runner, protected_roots=protected)
+        try:
+            task_id = controller.submit(
+                "containment-test", self.profile_path, self.input_path,
+                task_id=str(uuid.uuid4()), workspace=self.workspace,
+            )
+            controller.run_until_stop(task_id)
+            return controller.status(task_id)["task"]["status"]
+        finally:
+            controller.close()
+
+    def test_a_legacy_runner_still_completes_the_task(self) -> None:
+        class LegacyRunner:
+            def preflight(self, owner, timeout=5):
+                from orchestrator.runner import ProviderPreflightResult
+
+                return ProviderPreflightResult("pass", "provider_preflight_pass", "", 0, ["fake"], None, 0, 0)
+
+            def run(self, owner, prompt, timeout, log_path, *, workspace=None):
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text("ORCHESTRATOR_OUTCOME: pass\n", encoding="utf-8")
+                return RunResult(0, "ORCHESTRATOR_OUTCOME: pass\n", None, "raw", "raw")
+
+        self.assertEqual(self._run(LegacyRunner(), (self.protected,)), "done")
+
+    def test_the_capability_check_reads_the_signature(self) -> None:
+        def legacy(owner, prompt, timeout, log_path, *, workspace=None):
+            ...
+
+        def current(owner, prompt, timeout, log_path, *, workspace=None, protected_roots=None):
+            ...
+
+        def wildcard(owner, prompt, timeout, log_path, **kwargs):
+            ...
+
+        self.assertFalse(_accepts_protected_roots(legacy))
+        self.assertTrue(_accepts_protected_roots(current))
+        self.assertTrue(_accepts_protected_roots(wildcard))
+
+    def test_a_typeerror_from_inside_the_runner_is_not_swallowed(self) -> None:
+        """The reason the check is by signature and not by catching TypeError."""
+
+        class BuggyRunner:
+            def preflight(self, owner, timeout=5):
+                from orchestrator.runner import ProviderPreflightResult
+
+                return ProviderPreflightResult("pass", "provider_preflight_pass", "", 0, ["fake"], None, 0, 0)
+
+            def run(self, owner, prompt, timeout, log_path, *, workspace=None, protected_roots=None):
+                raise TypeError("a real bug inside the runner")
+
+        status = self._run(BuggyRunner(), (self.protected,))
+        self.assertEqual(status, "blocked")
