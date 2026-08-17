@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import shutil
 import sqlite3
+import sys
 import shlex
 import time
 import uuid
@@ -20,6 +22,22 @@ from .runner import ProviderPreflightResult, RunResult, SubprocessRunner, classi
 
 ACTIVE_STATUSES = {"queued", "running"}
 RESUMABLE_STATUSES = {"waiting_user", "paused", "blocked"}
+
+
+def _accepts_protected_roots(run: Any) -> bool:
+    """Whether a runner's run() takes the protected_roots keyword.
+
+    Checked by signature rather than by catching TypeError: catching would also
+    swallow a genuine TypeError raised *inside* the runner, turning a real bug
+    into a silent fallback. A runner accepting **kwargs is assumed to cope.
+    """
+    try:
+        parameters = inspect.signature(run).parameters
+    except (TypeError, ValueError):  # builtins and C callables
+        return False
+    if "protected_roots" in parameters:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
 
 
 class ControllerError(RuntimeError):
@@ -38,6 +56,7 @@ class Controller:
         protected_roots: tuple[Path, ...] | None = None,
     ):
         self.home = home.resolve()
+        self._warned: set[str] = set()
         # L2 watches these; empty means detection is off. The engine ships with
         # no opinion about which directories on someone else's machine matter,
         # so a deployment declares them (ORCH_PROTECTED_ROOTS) or passes them in.
@@ -271,14 +290,27 @@ class Controller:
         L2 is watching. Passing them explicitly keeps a controller constructed
         with roots in code consistent with one configured from the environment.
         """
-        return self.runner.run(
-            stage.owner,
-            prompt,
-            stage.timeout,
-            log_path,
-            workspace=workspace,
-            protected_roots=self.protected_roots,
-        )
+        kwargs: dict[str, Any] = {"workspace": workspace}
+        if _accepts_protected_roots(self.runner.run):
+            kwargs["protected_roots"] = self.protected_roots
+        elif self.protected_roots:
+            # A runner predating this argument cannot be told which roots are
+            # watched, so its L1 guard falls back to the environment. Say so
+            # once rather than either crashing the stage or pretending the
+            # controller-level configuration reached it.
+            self._warn_once(
+                "runner_missing_protected_roots",
+                f"{type(self.runner).__name__}.run() does not accept protected_roots; "
+                "the write-root overlap guard will use ORCH_PROTECTED_ROOTS instead of "
+                "the roots configured on this controller",
+            )
+        return self.runner.run(stage.owner, prompt, stage.timeout, log_path, **kwargs)
+
+    def _warn_once(self, key: str, message: str) -> None:
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        print(f"[orchestrator] warning: {message}", file=sys.stderr)
 
     def _sentinel_for(self, workspace: Path) -> Sentinel | None:
         roots = self.protected_roots
