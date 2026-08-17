@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .containment import ContainmentError, prepare_sandbox
+from .containment import ContainmentConfigError, ContainmentError, SandboxSetupError, prepare_sandbox
 
 
 OUTCOME_RE = re.compile(r"^ORCHESTRATOR_OUTCOME:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE)
@@ -76,11 +76,16 @@ def prepare_containment(workspace: Path, log_path: Path) -> dict[str, str]:
     """
     containment_root = log_path.parent / "containment"
     hooks_dir = containment_root / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
-
-    pre_push = hooks_dir / "pre-push"
-    pre_push.write_text(CONTAINMENT_PRE_PUSH_HOOK, encoding="utf-8")
-    pre_push.chmod(0o755)
+    try:
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        pre_push = hooks_dir / "pre-push"
+        pre_push.write_text(CONTAINMENT_PRE_PUSH_HOOK, encoding="utf-8")
+        pre_push.chmod(0o755)
+    except OSError as exc:
+        # Same class as a failed sandbox profile write: the environment is
+        # broken, not the policy. Raising the environment-specific error keeps
+        # the stop reason pointing at the disk rather than at the settings.
+        raise SandboxSetupError(f"cannot prepare containment artifacts: {exc}") from exc
 
     gitconfig = containment_root / "gitconfig"
     identity = _git_identity()
@@ -359,6 +364,10 @@ class SubprocessRunner:
         if workspace is not None:
             try:
                 containment_env = prepare_containment(workspace, log_path)
+            except SandboxSetupError as exc:
+                return self._containment_stop(
+                    log_path, owner, command, "sandbox_setup_failed", str(exc)
+                )
             except ContainmentError as exc:
                 return self._containment_stop(
                     log_path, owner, command, "containment_identity_invalid", str(exc)
@@ -370,11 +379,18 @@ class SubprocessRunner:
                     allow_unsandboxed=allow_unsandboxed_requested(),
                     protected_roots=protected_roots,
                 )
-            except ContainmentError as exc:
+            except ContainmentConfigError as exc:
                 # A declared write root that overlaps a protected root is a
                 # contradiction, not a preference. Refuse the stage and say so.
                 return self._containment_stop(
                     log_path, owner, command, "containment_config_conflict", str(exc)
+                )
+            except SandboxSetupError as exc:
+                # A full disk or an unwritable artifact directory is an
+                # environment problem. Reporting it as a config conflict would
+                # send the operator to edit settings that are already correct.
+                return self._containment_stop(
+                    log_path, owner, command, "sandbox_setup_failed", str(exc)
                 )
             if decision.blocks_run:
                 return self._containment_stop(
@@ -457,7 +473,13 @@ class SubprocessRunner:
         """
         now = time.time()
         text = f"{reason}: {message}\n"
-        self._write_log(log_path, owner, command, now, now, None, False, text, message, None)
+        try:
+            self._write_log(log_path, owner, command, now, now, None, False, text, message, None)
+        except OSError:
+            # The reason this stage stopped may *be* that the directory is
+            # unwritable. Reporting must not depend on the thing that failed;
+            # the stop reason travels in the result either way.
+            pass
         return RunResult(
             None,
             text,
