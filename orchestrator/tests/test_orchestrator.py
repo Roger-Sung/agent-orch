@@ -588,6 +588,31 @@ class StartPhaseTests(unittest.TestCase):
             self.assertFalse(list((Path(directory) / "inbox").glob("*.json")))
             self.assertFalse((Path(directory) / "orchestrator.db").exists())
 
+    def test_cli_status_accepts_start_lifecycle_task_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            started = run_start(
+                home,
+                "propose a spec for orch start status",
+                StartFlags("propose", "orch start status", None, None, None, True),
+            )
+            env = os.environ.copy()
+            env["ORCH_HOME"] = str(home)
+            result = subprocess.run(
+                [sys.executable, "-m", "orchestrator", "status", started["task_id"]],
+                cwd=Path(__file__).resolve().parents[2],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["task_id"], started["task_id"])
+            self.assertEqual(payload["status"], started["status"])
+            self.assertFalse((home / "orchestrator.db").exists())
+
     def test_non_dry_run_propose_auto_start_enqueues_daemon_request(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

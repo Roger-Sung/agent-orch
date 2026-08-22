@@ -21,6 +21,7 @@ from .start import (
     gate_run_from_args,
     gate_status_from_args,
     gate_sync_from_args,
+    read_start_status,
     start_from_args,
     start_go_from_args,
     start_sync_from_args,
@@ -285,6 +286,14 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(_enqueue(home, args), ensure_ascii=False, indent=2))
             return 0
         except (ControllerError, IPCError, OSError) as exc:
+            print(f"orchestrator: {exc}", file=sys.stderr)
+            return 2
+
+    if args.command == "status" and (home / "tasks" / f"{args.id}.yaml").is_file():
+        try:
+            print(json.dumps(read_start_status(home, args.id), ensure_ascii=False, indent=2))
+            return 0
+        except (OSError, ValueError) as exc:
             print(f"orchestrator: {exc}", file=sys.stderr)
             return 2
 

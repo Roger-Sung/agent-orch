@@ -192,6 +192,22 @@ def start_sync_from_args(home: Path, args: argparse.Namespace) -> dict[str, Any]
     return run_start_sync(home, args.task_id)
 
 
+def read_start_status(home: Path, task_id: str) -> dict[str, Any]:
+    """Read an ``orch start`` lifecycle task without mutating or syncing it."""
+    task_path = home / "tasks" / f"{task_id}.yaml"
+    routing_path = home / "tasks" / f"{task_id}-routing.yaml"
+    if not task_path.is_file():
+        raise ValueError(f"orch start task not found: {task_id}")
+    if not routing_path.is_file():
+        raise ValueError(f"routing decision not found for orch start task: {task_id}")
+
+    task_record = _read_yaml(task_path)
+    routing = _read_yaml(routing_path)
+    if not isinstance(task_record, dict) or not isinstance(routing, dict):
+        raise ValueError(f"invalid orch start state for task: {task_id}")
+    return _result(task_id, task_path, routing_path, task_record, routing)
+
+
 def gate_status_from_args(home: Path, args: argparse.Namespace) -> dict[str, Any]:
     return gate_status(home, args.task_id)
 
