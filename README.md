@@ -373,8 +373,10 @@ reported success*, which is the case that actually matters.
 Commits inside containment use a synthetic identity by default; using a real
 one is explicit and per-run ([ADR 0001](docs/decisions/0001-git-identity.md)).
 
-Two environment variables shape the layers: `ORCH_PROTECTED_ROOTS` declares
-what L2 watches (empty means detection is off), and `ORCH_EXTRA_WRITE_ROOTS`
+Three environment variables shape the layers: `ORCH_PROTECTED_ROOTS` declares
+what L2 watches (empty means detection is off), `ORCH_SENTINEL_EXCLUDES`
+adds deployment-specific whole components or component-relative subtrees that
+L2 ignores, and `ORCH_EXTRA_WRITE_ROOTS`
 declares additional directories a stage may write to — a build cache, for
 instance — instead of turning L1 off wholesale. A write root that overlaps a
 protected root refuses the stage rather than quietly punching a hole in the
@@ -382,6 +384,9 @@ layer that watches it. `ORCH_HOME` must itself sit outside every protected
 root: stage logs and reports are written under it, so a protected root
 covering it would make L2 flag the engine's own bookkeeping — the daemon
 refuses to start on that configuration, and `orch doctor` reports it.
+Exclusions are separated by the platform path separator (`:` on macOS) and
+each one reduces L2 coverage, so deployments should keep them as narrow as
+possible.
 
 What is still open is written down rather than left to be discovered:
 [`docs/threat-model.md`](docs/threat-model.md).

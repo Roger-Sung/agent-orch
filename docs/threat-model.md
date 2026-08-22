@@ -192,6 +192,12 @@ legitimately change: build outputs, media, package caches. The exclusion list
 is the right escape hatch for those; raising the threshold makes every stage
 slower for every file.
 
+Deployments can extend that list through `ORCH_SENTINEL_EXCLUDES`, separated
+by the platform path separator (`:` on macOS). Entries match whole path
+components or component-relative subtrees, not arbitrary prefixes. This is a
+deliberate detection escape hatch: every added entry reduces L2 coverage, so it
+must remain narrow and deployment-specific.
+
 ### L2: the orchestrator home must sit outside the protected roots
 
 Stage logs, manifests, and reports are written under `ORCH_HOME/tasks/`, and

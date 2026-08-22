@@ -28,6 +28,7 @@ from orchestrator.containment import (
     DEFAULT_SENTINEL_EXCLUDES,
     EXTRA_WRITE_ROOTS_ENV,
     SANDBOX_EXEC,
+    SENTINEL_EXCLUDES_ENV,
     ContainmentConfigError,
     SandboxSetupError,
     _contains,
@@ -40,6 +41,7 @@ from orchestrator.containment import (
     prepare_sandbox,
     protected_roots_from_env,
     sandbox_available,
+    sentinel_excludes_from_env,
 )
 from orchestrator.controller import Controller, _protected_roots_support
 from orchestrator.runner import (
@@ -302,6 +304,27 @@ class SentinelTest(SandboxFixture):
         self.assertEqual(protected_roots_from_env(""), ())
         roots = protected_roots_from_env(f"{self.base}{os.pathsep}{self.protected}")
         self.assertEqual(roots, (self.base, self.protected))
+
+    def test_extra_excludes_are_split_trimmed_and_deduplicated(self) -> None:
+        raw = os.pathsep.join((" /provider-state/ ", ".idea", "provider-state", ""))
+        self.assertEqual(sentinel_excludes_from_env(raw), ("provider-state", ".idea"))
+
+    def test_unset_extra_excludes_change_nothing(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(SENTINEL_EXCLUDES_ENV, None)
+            self.assertEqual(sentinel_excludes_from_env(), ())
+
+    def test_controller_adds_deployment_excludes_to_the_sentinel(self) -> None:
+        home = self.base / "sentinel-home"
+        home.mkdir()
+        with unittest.mock.patch.dict(os.environ, {SENTINEL_EXCLUDES_ENV: "provider-state"}):
+            controller = Controller(home, protected_roots=(self.base,))
+            try:
+                sentinel = controller._sentinel_for(self.workspace)
+            finally:
+                controller.close()
+        self.assertIsNotNone(sentinel)
+        self.assertEqual(sentinel.excludes, DEFAULT_SENTINEL_EXCLUDES + ("provider-state",))
 
 
 class EscapingRunner:

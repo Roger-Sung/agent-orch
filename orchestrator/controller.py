@@ -14,7 +14,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .containment import Sentinel, Violation, protected_roots_from_env
+from .containment import (
+    DEFAULT_SENTINEL_EXCLUDES,
+    Sentinel,
+    Violation,
+    protected_roots_from_env,
+    sentinel_excludes_from_env,
+)
 from .db import connect
 from .profile import Profile, ProfileError, canonical_json, load_profile, profile_from_snapshot, sha256_bytes
 from .runner import ProviderPreflightResult, RunResult, SubprocessRunner, classify_result
@@ -407,7 +413,11 @@ class Controller:
         roots = self.protected_roots
         if not roots:
             return None
-        return Sentinel(roots=tuple(roots), workspace=workspace)
+        return Sentinel(
+            roots=tuple(roots),
+            workspace=workspace,
+            excludes=DEFAULT_SENTINEL_EXCLUDES + sentinel_excludes_from_env(),
+        )
 
     def _record_workspace_escape(
         self, task: sqlite3.Row, log_path: Path, result: RunResult, violations: list[Violation]

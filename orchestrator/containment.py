@@ -37,6 +37,7 @@ from typing import Iterable
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 PROTECTED_ROOTS_ENV = "ORCH_PROTECTED_ROOTS"
+SENTINEL_EXCLUDES_ENV = "ORCH_SENTINEL_EXCLUDES"
 
 #: Directories a provider CLI legitimately writes to while running a stage.
 #: Sourced from an observed write-path probe, not from guesswork; missing one
@@ -373,6 +374,28 @@ def extra_write_roots_from_env(value: str | None = None) -> tuple[Path, ...]:
         if part:
             roots.append(Path(os.path.expanduser(part)))
     return tuple(roots)
+
+
+def sentinel_excludes_from_env(value: str | None = None) -> tuple[str, ...]:
+    """Read extra sentinel excludes from `ORCH_SENTINEL_EXCLUDES` (os.pathsep separated).
+
+    `DEFAULT_SENTINEL_EXCLUDES` covers only what is universal: git object and
+    log stores, bytecode caches, OS metadata. Everything else is
+    deployment-specific — which provider CLI writes bookkeeping into a watched
+    repository, which editor rewrites its own project state, which toolchain
+    scribbles into the tree. The engine has no business hard-coding any
+    provider's or editor's private paths; the deployment names them, exactly as
+    it already names protected roots and extra write roots.
+
+    Empty by default; unset means `DEFAULT_SENTINEL_EXCLUDES` exactly.
+    """
+    raw = os.environ.get(SENTINEL_EXCLUDES_ENV, "") if value is None else value
+    tokens: list[str] = []
+    for part in raw.split(os.pathsep):
+        part = part.strip().strip("/")
+        if part and part not in tokens:
+            tokens.append(part)
+    return tuple(tokens)
 
 
 def _fold(path: str) -> str:
