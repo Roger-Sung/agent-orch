@@ -1,0 +1,5 @@
+{
+  "outcome": "needs_correction",
+  "route_target": "draft",
+  "must_preserve": ["pre/post sha256 and per-table row-count comparison"]
+}

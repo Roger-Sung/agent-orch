@@ -1,0 +1,9 @@
+{
+  "outcome": "needs_simplification",
+  "route_target": "simplify",
+  "must_preserve": [
+    "in-flight live readability",
+    "deadline-sensitive drain behavior",
+    "provider lifecycle parity"
+  ]
+}

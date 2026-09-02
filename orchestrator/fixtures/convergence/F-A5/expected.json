@@ -1,0 +1,5 @@
+{
+  "outcome": "ready",
+  "route_target": "done",
+  "must_preserve": ["daemon restart deferred row with named owner/gate"]
+}

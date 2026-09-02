@@ -29,6 +29,15 @@ from .runner import ProviderPreflightResult, RunResult, SubprocessRunner, classi
 ACTIVE_STATUSES = {"queued", "running"}
 RESUMABLE_STATUSES = {"waiting_user", "paused", "blocked"}
 
+# Engine-reserved outcome name. A stage outcome spelled exactly HOLD_OUTCOME stops
+# the task at waiting_user instead of continuing, so a spec can hand a genuinely
+# irreducible decision back to the operator. The semantics live in the engine, not
+# in the task's profile snapshot, which is why the name is reserved: see
+# docs/decisions/propose-convergence-policy.md, "Engine reserved outcome names".
+# A profile that does not declare this outcome is unaffected bit-for-bit.
+HOLD_OUTCOME = "needs_user_decision"
+HOLD_STOP_REASON = "user_decision_required"
+
 
 def _protected_roots_support(run: Any) -> str:
     """How a runner's run() can receive protected_roots: explicit, var_keyword, or none.
@@ -611,6 +620,11 @@ class Controller:
             if edge_cap_hit:
                 next_status = "waiting_user"
                 stop_reason = "edge_cap"
+            elif outcome == HOLD_OUTCOME:
+                # An edge cap that has already fired wins: elif keeps today's
+                # behaviour for a held outcome that is also over its cap.
+                next_status = "waiting_user"
+                stop_reason = HOLD_STOP_REASON
             next_owner = None if target.terminal else target.owner
             if not edge_cap_hit:
                 self.conn.execute(
@@ -664,6 +678,14 @@ class Controller:
                     seq,
                     "edge_cap",
                     f"task {task_id} waiting_user: {edge} cap={edge_row['cap']} exceeded",
+                )
+                self._write_evidence_index(task_id)
+            elif stop_reason == HOLD_STOP_REASON:
+                self._notify(
+                    task_id,
+                    seq,
+                    HOLD_STOP_REASON,
+                    f"task {task_id} waiting_user: user decision required",
                 )
                 self._write_evidence_index(task_id)
             elif next_status in {"done", "failed"}:

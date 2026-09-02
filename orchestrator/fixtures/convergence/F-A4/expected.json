@@ -1,0 +1,5 @@
+{
+  "outcome": "needs_user_decision",
+  "route_target": "draft",
+  "must_preserve": ["canonical durable-state root question"]
+}

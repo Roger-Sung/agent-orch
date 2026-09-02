@@ -2098,5 +2098,158 @@ class BrokerIntegrationTests(unittest.TestCase):
             self.assertFalse(list((Path(directory) / "inbox").glob("*.json")))
 
 
+class ConvergenceHoldTests(unittest.TestCase):
+    """The propose convergence routing and the engine-reserved hold outcome.
+
+    Every runner here is a fake, so no provider is contacted and nothing in this
+    class can flake on model wording. See
+    docs/decisions/propose-convergence-policy.md.
+    """
+
+    PROPOSE_PROFILE = ROOT / "orchestrator" / "profiles" / "propose.yaml"
+    SPEC_REVIEW_PROFILE = ROOT / "orchestrator" / "profiles" / "spec_review.yaml"
+
+    def _submit(self, outcomes, profile=None, task_type="propose"):
+        """Submit a task with a fake runner and return (controller, task_id).
+
+        The controller stays open so a test can resume and inspect further; cleanup
+        is registered here. Note that Controller.resume ends by driving
+        run_until_stop, so a test that resumes must supply outcomes for the stages
+        the resumed run will execute.
+        """
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        controller = Controller(Path(directory.name) / "runtime", runner=SequenceRunner(outcomes))
+        self.addCleanup(controller.close)
+        task_id = controller.submit(task_type, profile or self.PROPOSE_PROFILE, DEMO_INPUT)
+        return controller, task_id
+
+    def _run(self, outcomes, profile=None, task_type="propose"):
+        controller, task_id = self._submit(outcomes, profile, task_type)
+        return controller, task_id, controller.run_until_stop(task_id)
+
+    @staticmethod
+    def _edge(status, edge):
+        return next(row for row in status["edge_counts"] if row["edge"] == edge)
+
+    @staticmethod
+    def _stage_sequence(status):
+        return [row["stage"] for row in status["transitions"] if row["outcome"]]
+
+    def test_hold_outcome_stops_at_waiting_user_with_stage_already_advanced(self):
+        controller, task_id, status = self._run(["drafted", "needs_user_decision"])
+        task = status["task"]
+
+        self.assertEqual(task["status"], "waiting_user")
+        self.assertEqual(task["stop_reason"], "user_decision_required")
+        # The CAS in the success branch is untouched by the hold, so the task is
+        # already pointed at the stage a resume will run.
+        self.assertEqual(task["current_stage"], "draft")
+        self.assertEqual(task["owner"], "claude")
+        self.assertEqual(task["transitions_count"], 2)
+        # The hold did not hit the cap, so the edge counter still advanced.
+        self.assertEqual(self._edge(status, "review.needs_user_decision")["count"], 1)
+        self.assertEqual(status["notifications"][-1]["reason"], "user_decision_required")
+        self.assertIn("user decision required", status["notifications"][-1]["message"])
+
+    def test_hold_resumes_straight_into_draft_without_rerun_stage(self):
+        controller, task_id = self._submit(
+            ["drafted", "needs_user_decision", "drafted", "ready"]
+        )
+        controller.run_until_stop(task_id)
+        held = controller.status(task_id)
+        self.assertEqual(held["task"]["stop_reason"], "user_decision_required")
+
+        # user_decision_required is not a containment stop, so plain resume works.
+        resumed = controller.resume(task_id)
+
+        self.assertEqual(resumed["task"]["status"], "done")
+        self.assertEqual(resumed["task"]["resume_allowance"], 0)
+        self.assertEqual(
+            self._stage_sequence(resumed), ["draft", "review", "draft", "review"]
+        )
+        # The hold does not compensate the edge counter the way edge_cap does.
+        self.assertEqual(self._edge(resumed, "review.needs_user_decision")["count"], 1)
+        # The immutable input never moves: before the hold, during it, after resume.
+        submitted_hash = held["task"]["input_hash"]
+        self.assertEqual(resumed["task"]["input_hash"], submitted_hash)
+        self.assertEqual(
+            controller.status(task_id)["task"]["input_hash"], submitted_hash
+        )
+
+    def test_edge_cap_takes_precedence_over_the_hold_on_the_second_crossing(self):
+        controller, task_id = self._submit(
+            ["drafted", "needs_user_decision", "drafted", "needs_user_decision"]
+        )
+        first = controller.run_until_stop(task_id)
+        self.assertEqual(first["task"]["stop_reason"], "user_decision_required")
+
+        second = controller.resume(task_id)
+
+        # The cap is 1, so the second crossing is capped; the elif ordering means
+        # the cap reason wins over the hold reason.
+        self.assertEqual(second["task"]["status"], "waiting_user")
+        self.assertEqual(second["task"]["stop_reason"], "edge_cap")
+        self.assertEqual(second["notifications"][-1]["reason"], "edge_cap")
+        self.assertEqual(self._edge(second, "review.needs_user_decision")["count"], 1)
+
+    def test_correction_routes_to_draft_until_its_cap_is_reached(self):
+        controller, task_id, status = self._run(
+            [
+                "drafted",
+                "needs_correction",
+                "drafted",
+                "needs_correction",
+                "drafted",
+                "needs_correction",
+            ]
+        )
+        self.assertEqual(status["task"]["status"], "waiting_user")
+        self.assertEqual(status["task"]["stop_reason"], "edge_cap")
+        self.assertEqual(status["task"]["current_stage"], "draft")
+        self.assertEqual(self._edge(status, "review.needs_correction")["count"], 2)
+        routed = [
+            row["to_status"]
+            for row in status["transitions"]
+            if row["outcome"] == "needs_correction"
+        ]
+        self.assertEqual(routed, ["queued", "queued", "waiting_user"])
+
+    def test_simplification_routes_to_the_simplify_stage_and_back_to_review(self):
+        controller, task_id, status = self._run(
+            ["drafted", "needs_simplification", "simplified", "ready"]
+        )
+        self.assertEqual(status["task"]["status"], "done")
+        self.assertEqual(
+            self._stage_sequence(status), ["draft", "review", "simplify", "review"]
+        )
+        routing = next(
+            row for row in status["transitions"] if row["outcome"] == "needs_simplification"
+        )
+        self.assertEqual(routing["edge"], "review.needs_simplification")
+        self.assertEqual(routing["to_status"], "queued")
+        simplify_run = next(
+            row for row in status["stage_runs"] if row["stage"] == "simplify"
+        )
+        self.assertEqual(simplify_run["owner"], "claude")
+
+    def test_a_profile_that_does_not_declare_the_hold_outcome_is_unaffected(self):
+        # spec-review has no needs_user_decision outcome; the reserved name must
+        # not leak into its behaviour.
+        controller, task_id, status = self._run(
+            ["reviewed", "ready"],
+            profile=self.SPEC_REVIEW_PROFILE,
+            task_type="spec-review",
+        )
+        self.assertEqual(status["task"]["status"], "done")
+        self.assertIsNone(status["task"]["stop_reason"])
+        self.assertNotIn(
+            "user_decision_required", [row["reason"] for row in status["transitions"]]
+        )
+        self.assertNotIn(
+            "user_decision_required", [row["reason"] for row in status["notifications"]]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
