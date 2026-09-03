@@ -15,6 +15,16 @@ from .doctor import run_doctor
 from .runner import ALLOW_UNSANDBOXED_ENV, UnattendedConsentError
 from .ipc import IPCError, daemon_is_running, enqueue_request, wait_for_result
 from .profile import ProfileError
+from .watch import (
+    WATCH_DEFAULT_BYTES,
+    WATCH_MIN_BYTES,
+    WATCH_SCHEMA_VERSION,
+    WatchError,
+    format_cursor,
+    parse_cursor,
+    read_window,
+    validate_window_bytes,
+)
 from .start import (
     gate_allow_from_args,
     gate_block_from_args,
@@ -124,6 +134,44 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="show task state (read-only, safe while daemon runs)")
     status.add_argument("id")
+
+    watch = subparsers.add_parser(
+        "watch",
+        help="print one bounded window of a run's live JSONL stream (read-only)",
+        description=(
+            "Print one bounded window of a stage run's live JSONL stream as a single JSON "
+            "envelope on stdout. Everything it returns is non-authoritative evidence: it "
+            "cannot mutate the task, the lease, the provider process, the stream or sealed "
+            "evidence. records[] holds standard base64 of each complete record's raw bytes, "
+            "trailing newline included, in file order. Feed next_cursor back verbatim to "
+            "continue. A walk is complete only when eof is true AND next_cursor equals "
+            "snapshot_bytes; eof true with next_cursor below snapshot_bytes means bytes are "
+            "withheld (a partial tail or a corrupt line), so call again at the SAME returned "
+            "cursor - that call returns the withheld record if an append completed it, else a "
+            "named error. Stop as soon as error is not null; resuming afterwards is an "
+            "explicit re-invocation, never an engine retry. Exit 0 on success, 2 on any "
+            "failure, with the machine-readable code in the envelope's error field."
+        ),
+    )
+    watch.add_argument("task_id")
+    watch.add_argument(
+        "--cursor",
+        help=(
+            "<run_token>:<offset> from a previous next_cursor, fed back verbatim. Selects the "
+            "run by token, so a walk finishes the run it started even after a later run "
+            "begins; drop it to watch the latest run from offset 0."
+        ),
+    )
+    watch.add_argument(
+        "--max-bytes",
+        type=int,
+        default=WATCH_DEFAULT_BYTES,
+        help=(
+            f"raw stream bytes this call may consider (default {WATCH_DEFAULT_BYTES}, minimum "
+            f"{WATCH_MIN_BYTES}, refused rather than clamped below it). It does NOT bound the "
+            "response, which is roughly 4/3 of the raw bytes plus envelope overhead."
+        ),
+    )
 
     resume = subparsers.add_parser("resume", help="resume through the daemon and wait for its result")
     resume.add_argument("id")
@@ -289,6 +337,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"orchestrator: {exc}", file=sys.stderr)
             return 2
 
+    if args.command == "watch":
+        try:
+            return _watch(home, args)
+        except (ControllerError, ProfileError, OSError) as exc:
+            # Pre-envelope generic failures - a mode=ro database open failure,
+            # an unreadable home - keep the CLI's existing stderr-only path.
+            # Inventing a watch error code for them would be new vocabulary
+            # for a risk H3 does not introduce.
+            print(f"orchestrator: {exc}", file=sys.stderr)
+            return 2
+
     if args.command == "status" and (home / "tasks" / f"{args.id}.yaml").is_file():
         try:
             print(json.dumps(read_start_status(home, args.id), ensure_ascii=False, indent=2))
@@ -329,6 +388,99 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if controller is not None:
             controller.close()
+
+
+def _watch(home: Path, args: argparse.Namespace) -> int:
+    """One read-only window, one envelope, one exit. No follow loop.
+
+    Every path builds the same envelope shape, so a caller parses one thing on
+    success and on a named failure. Resolution is entirely through reads that
+    already exist: the read-only controller (which returns before
+    `reconcile_startup`, so it cannot orphan-block a running task), the
+    stage_runs rows `status()` already orders, and H2's own
+    `log_path.with_suffix(".live.jsonl")` expression.
+    """
+    envelope: dict = {
+        "schema_version": WATCH_SCHEMA_VERSION,
+        "task_id": args.task_id,
+        "run_token": None,
+        # Echoed verbatim, including a malformed value, so an operator can see
+        # what was rejected. Never a repaired, clamped or normalised value.
+        "cursor": args.cursor,
+        "next_cursor": None,
+        "eof": False,
+        "snapshot_bytes": None,
+        "records": [],
+        "error": None,
+    }
+    controller = Controller(home, read_only=True)
+    try:
+        try:
+            validate_window_bytes(args.max_bytes)
+            cursor_token: str | None = None
+            cursor_offset = 0
+            if args.cursor is not None:
+                cursor_token, cursor_offset = parse_cursor(args.cursor)
+            try:
+                state = controller.status(args.task_id)
+            except ControllerError as exc:
+                # `Controller.status` looks the task up by exact equality and
+                # swallows every other failure inside itself, so the only
+                # ControllerError it can raise is the missing-task one.
+                raise WatchError("task_not_found", str(exc)) from exc
+            runs = state["stage_runs"]
+            if not runs:
+                raise WatchError("no_stage_run", f"task has no stage runs: {args.task_id}")
+            if cursor_token is None:
+                # Already ordered started_at,rowid by `status()`.
+                run = runs[-1]
+            else:
+                run = next((row for row in runs if row["run_token"] == cursor_token), None)
+                if run is None:
+                    raise WatchError(
+                        "cursor_run_token_unknown",
+                        f"no stage run of {args.task_id} has run token {cursor_token}",
+                    )
+            run_token = run["run_token"]
+            envelope["run_token"] = run_token
+            live_path = Path(run["log_path"]).with_suffix(".live.jsonl")
+            artifact_dir = Path(state["task"]["artifact_dir"])
+            try:
+                # Both sides resolved before the comparison, so a symlinked
+                # live path cannot pass a lexical-only check. Same containment
+                # the sealed manifest already applies to log_path.
+                resolved_live = live_path.resolve()
+                resolved_dir = artifact_dir.resolve()
+            except OSError as exc:
+                # Containment could not be established (a symlink loop, for
+                # instance). Fail closed on the containment code rather than
+                # read a path whose location is unknown.
+                raise WatchError(
+                    "live_path_outside_artifact_dir",
+                    f"cannot resolve live stream path {live_path}: {exc}",
+                ) from exc
+            if not resolved_live.is_relative_to(resolved_dir):
+                raise WatchError(
+                    "live_path_outside_artifact_dir",
+                    f"live stream outside artifact dir: {live_path}",
+                )
+            window = read_window(
+                live_path, cursor_offset=cursor_offset, window_bytes=args.max_bytes
+            )
+        except WatchError as exc:
+            envelope["error"] = exc.code
+            envelope["snapshot_bytes"] = exc.snapshot_bytes
+            print(json.dumps(envelope, ensure_ascii=False, indent=2))
+            print(f"orchestrator: {exc}", file=sys.stderr)
+            return 2
+        envelope["records"] = list(window.records)
+        envelope["next_cursor"] = format_cursor(run_token, window.next_offset)
+        envelope["eof"] = window.eof
+        envelope["snapshot_bytes"] = window.snapshot_bytes
+        print(json.dumps(envelope, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        controller.close()
 
 
 def _default_wait_timeout() -> float:
