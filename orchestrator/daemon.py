@@ -34,7 +34,7 @@ def run_daemon(home: Path, poll_interval: float = 3.0) -> None:
     require_unattended_consent()
     home = home.resolve()
     # A protected root that covers this home would turn every stage's own
-    # bookkeeping into a workspace_escape; refuse before creating anything.
+    # bookkeeping into protected_root_drift; refuse before creating anything.
     validate_home_outside_protected(home, protected_roots_from_env())
     inbox = home / "inbox"
     processing = home / "processing"
@@ -97,7 +97,7 @@ def _handle(controller: Controller, req_path: Path, processed: Path) -> None:
         if action == "resume":
             task_id = req["task_id"]
             print(f"[orchestrator-daemon] picked up {req_path.name}: resume {task_id}", flush=True)
-            result = controller.resume(task_id, operation_id=request_id)
+            result = controller.resume(task_id, operation_id=request_id, rerun_stage=req.get("rerun_stage", False))
         elif action == "run":
             task_type = req["type"]
             profile = Path(req["profile"])

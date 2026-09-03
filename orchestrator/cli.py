@@ -112,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--profile", type=Path)
     enqueue.add_argument("--input", type=Path)
     enqueue.add_argument("--resume", dest="resume_id", help="enqueue a resume request for an existing task id")
+    enqueue.add_argument("--rerun-stage", action="store_true", help="explicitly rerun a containment-blocked stage; does not clear its evidence")
 
     # The long-running service: watch the inbox and execute (the only Controller,
     # and the single writer).
@@ -135,6 +136,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="show task state (read-only, safe while daemon runs)")
     status.add_argument("id")
+    retained = subparsers.add_parser("containment-inspect", help="verify retained stage output without running a provider or clearing containment")
+    retained.add_argument("id")
 
     watch = subparsers.add_parser(
         "watch",
@@ -176,6 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     resume = subparsers.add_parser("resume", help="resume through the daemon and wait for its result")
     resume.add_argument("id")
+    resume.add_argument("--rerun-stage", action="store_true", help="explicitly rerun a containment-blocked stage; not an approval of its old result")
     resume.add_argument(
         "--in-process",
         action="store_true",
@@ -192,7 +196,11 @@ def _enqueue(home: Path, args: argparse.Namespace) -> dict:
         resume_id = args.id
     if resume_id:
         req = {"request_id": request_id, "action": "resume", "task_id": resume_id}
+        if getattr(args, "rerun_stage", False):
+            req["rerun_stage"] = True
     else:
+        if getattr(args, "rerun_stage", False):
+            raise ControllerError("--rerun-stage requires --resume")
         task_type = getattr(args, "task_type", None)
         profile = getattr(args, "profile", None)
         input_path = getattr(args, "input", None)
@@ -373,17 +381,19 @@ def main(argv: list[str] | None = None) -> int:
     # status is read-only: no orphan block, so it is safe while the daemon runs.
     controller = None
     try:
-        controller = Controller(home, read_only=(args.command == "status"))
+        controller = Controller(home, read_only=(args.command in {"status", "containment-inspect"}))
         if args.command == "submit":
             task_id = controller.submit(args.task_type, args.profile, args.input)
             result = controller.run_until_stop(task_id)
         elif args.command == "status":
             result = controller.status(args.id)
+        elif args.command == "containment-inspect":
+            result = controller.containment_inspect(args.id)
         else:
-            result = controller.resume(args.id)
+            result = controller.resume(args.id, rerun_stage=args.rerun_stage)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
-    except (ControllerError, ProfileError, OSError) as exc:
+    except (ControllerError, ProfileError, OSError, ValueError, KeyError, TypeError) as exc:
         print(f"orchestrator: {exc}", file=sys.stderr)
         return 2
     finally:

@@ -24,6 +24,7 @@ from .containment import (
 from .db import connect
 from .profile import Profile, ProfileError, canonical_json, load_profile, profile_from_snapshot, sha256_bytes
 from .runner import ProviderPreflightResult, RunResult, SubprocessRunner, classify_result
+from .retained import inspect_retained
 
 
 ACTIVE_STATUSES = {"queued", "running"}
@@ -358,7 +359,7 @@ class Controller:
         violations = sentinel.compare(before)
         if not violations:
             return result
-        return self._record_workspace_escape(task, log_path, result, violations)
+        return self._record_protected_root_drift(task, log_path, result, violations)
 
     def _runner_run_contained(
         self, stage: Any, prompt: str, log_path: Path, workspace: Path, reports_dir: Path | None = None
@@ -428,27 +429,31 @@ class Controller:
             excludes=DEFAULT_SENTINEL_EXCLUDES + sentinel_excludes_from_env(),
         )
 
-    def _record_workspace_escape(
+    def _record_protected_root_drift(
         self, task: sqlite3.Row, log_path: Path, result: RunResult, violations: list[Violation]
     ) -> RunResult:
-        """A stage wrote outside its workspace. Stop, quarantine, keep the evidence.
+        """Protected files changed during a stage; the writer is not established.
 
         The stage may well have "succeeded" by its own account — that is the
         dangerous case, and why this overrides the run's own classification
         instead of being folded into it.
         """
+        reason = "protected_root_drift"
         payload = {
+            "schema_version": 1,
             "task_id": task["id"],
+            "log_path": str(log_path),
+            "attribution": "unknown",
             "workspace_dir": task["workspace_dir"],
             "detected_at": _iso_now(),
             "violations": [item.as_dict() for item in violations],
         }
-        evidence_path = log_path.parent / "containment-violations.json"
+        evidence_path = log_path.with_suffix(".containment-drift.json")
         evidence_path.parent.mkdir(parents=True, exist_ok=True)
         self._atomic_write(
             evidence_path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
         )
-        self._quarantine(task["id"], None, evidence_path, "workspace_escape")
+        self._quarantine(task["id"], None, evidence_path, reason)
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(
                 f"containment_violation_count={len(violations)}\n"
@@ -456,7 +461,7 @@ class Controller:
             )
         return replace(
             result,
-            containment_stop="workspace_escape",
+            containment_stop=reason,
             containment_violations=tuple(item.as_dict() for item in violations),
         )
 
@@ -697,7 +702,11 @@ class Controller:
                 self.conn.execute("ROLLBACK")
             raise
 
-    def resume(self, task_id: str, *, operation_id: str | None = None) -> dict[str, Any]:
+    def resume(
+        self, task_id: str, *, operation_id: str | None = None, rerun_stage: bool = False
+    ) -> dict[str, Any]:
+        if type(rerun_stage) is not bool:
+            raise ControllerError("rerun_stage must be a boolean")
         if operation_id:
             existing = self.conn.execute(
                 "SELECT task_id FROM transitions WHERE operation_id=?", (operation_id,)
@@ -713,6 +722,12 @@ class Controller:
                 raise ControllerError(
                     f"task {task_id} cannot resume from {task['status']}; "
                     "expected waiting_user, paused, or blocked"
+                )
+            if task["stop_reason"] in {"workspace_escape", "protected_root_drift"} and not rerun_stage:
+                raise ControllerError(
+                    "containment_review_required: preserved stage output must be inspected with "
+                    f"containment-inspect {task_id}; --rerun-stage explicitly requests a new "
+                    "provider attempt, not clearance or reuse of the interrupted run"
                 )
             allowance = 1 if task["status"] == "waiting_user" else 0
             now = _now()
@@ -746,7 +761,7 @@ class Controller:
                 resumed_outcome,
                 task["status"],
                 "queued",
-                "manual_resume",
+                "manual_rerun_stage" if rerun_stage else "manual_resume",
             )
             self.conn.execute("COMMIT")
         except BaseException:
@@ -754,6 +769,21 @@ class Controller:
                 self.conn.execute("ROLLBACK")
             raise
         return self.run_until_stop(task_id)
+
+    def containment_inspect(self, task_id: str) -> dict[str, Any]:
+        """No state change, lease acquisition, provider invocation or clearance."""
+        self.conn.execute("BEGIN")
+        try:
+            task = self._task(task_id)
+            run = self.conn.execute(
+                "SELECT * FROM stage_runs WHERE task_id=? AND stage=? ORDER BY started_at DESC,rowid DESC LIMIT 1",
+                (task_id, task["current_stage"]),
+            ).fetchone()
+            if run is None:
+                raise ControllerError("retained_run_missing")
+            return inspect_retained(task, run)
+        finally:
+            self.conn.execute("ROLLBACK")
 
     def status(self, task_id: str) -> dict[str, Any]:
         task = self._task(task_id)
@@ -998,7 +1028,7 @@ class Controller:
         log_hash = hashlib.sha256(log_path.read_bytes()).hexdigest()
         output_hash = hashlib.sha256(result.output.encode("utf-8", errors="replace")).hexdigest()
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "task_id": task["id"],
             "run_token": run["run_token"],
             "lease_token": run["lease_token"],
@@ -1012,9 +1042,21 @@ class Controller:
             "log_path": str(log_path),
             "log_hash": log_hash,
             "output_hash": output_hash,
+            "profile_hash": task["profile_hash"],
+            "input_hash": task["input_hash"],
+            "candidate_outcome": result.candidate_outcome,
+            "candidate_classification": result.candidate_classification,
+            "candidate_reason": result.candidate_reason,
             "started_at": run["started_at"],
             "ended_at": ended_at_ms,
         }
+        output_path = log_path.with_suffix(".output.txt")
+        self._atomic_write(output_path, result.output.encode("utf-8", errors="replace"))
+        payload["output_path"] = str(output_path)
+        drift_path = log_path.with_suffix(".containment-drift.json")
+        if drift_path.is_file():
+            payload["containment_evidence_path"] = str(drift_path)
+            payload["containment_evidence_hash"] = hashlib.sha256(drift_path.read_bytes()).hexdigest()
         manifest_path = log_path.with_suffix(log_path.suffix + ".manifest.json")
         encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
         self._atomic_write(manifest_path, encoded)

@@ -86,8 +86,8 @@ history intact.
 
 **Requirements**
 
-- **Python 3.11 or newer.** The engine imports `tomllib`; there are no
-  third-party dependencies. CI exercises 3.12 on Linux and macOS.
+- **Python 3.12 or newer.** The engine uses only the standard library. CI
+  exercises 3.12 on Linux and macOS.
 - **Both provider CLIs installed and already authenticated.** `claude` and
   `codex` must be on the `PATH` *of the daemon process*, which is usually not
   the same PATH as your shell — a service manager starts with a minimal one, so
@@ -316,12 +316,55 @@ Which stop reason lands where, and who can move it on:
 | `sandbox_setup_failed` | `blocked` | human 👤 |
 | `containment_config_conflict` | `blocked` | human 👤 |
 | `runner_cannot_enforce_guard` | `blocked` | human 👤 |
-| `workspace_escape` | `blocked` | human 👤 |
+| `workspace_escape` (legacy manifests) | `blocked` | human 👤 |
+| `protected_root_drift` | `blocked` | independent containment review 👤 |
 
 `waiting_user` and `blocked` differ by cause, not severity. The first means a
 bound was reached — the loop was working, it just ran out of rope. The second
 means a run produced something the machine refuses to act on. Both need a
 human; both keep every artifact.
+
+### Protected-root drift and retained output
+
+L2 compares filesystem snapshots; it does **not** identify the process that
+wrote a file. New snapshot differences stop as `protected_root_drift`, with
+`attribution: unknown`, rather than asserting the task caused a workspace escape.
+This is still a fail-closed quarantine. A configured sandbox, a successful
+post-run probe, or an agent's explanation does not clear it. Genuine concurrent
+content changes can therefore still require operator review.
+
+Each stage now retains its own `<log-stem>.containment/` profile/git artifacts,
+`<log-stem>.containment-drift.json`, and exact `<log-stem>.output.txt`. A v2 sealed
+manifest binds the output, drift evidence, input and profile hashes. A
+`candidate_outcome` is the provider's unaccepted result, **not** a workflow edge.
+
+```sh
+python3 -m orchestrator containment-inspect TASK_ID
+```
+
+This command verifies the retained evidence using a read-only DB connection. It
+does not invoke a provider, acquire a task lease, change counters, restore a stage,
+or authorise advancement. Legacy v1 output can be reconstructed only when it
+matches the sealed output hash; old shared drift/profile artifacts are not
+historical attribution evidence. Workspace source snapshot verification is not
+claimed by this inspector. No automatic result-reuse/clearance API is provided.
+
+An ordinary resume of a drift-blocked task now refuses with
+`containment_review_required`, so it cannot silently spend another provider run.
+After inspection, an explicitly authorised **new attempt** can be requested:
+
+```sh
+python3 -m orchestrator enqueue --resume TASK_ID --rerun-stage
+```
+
+`resume TASK_ID --rerun-stage` is the waiting equivalent. This is not acceptance
+of the interrupted result: it retains its sealed manifest and quarantine, runs
+the stage again under the normal guards/caps, and records `manual_rerun_stage`.
+Never use it as a repeated automatic workaround for unexplained drift.
+
+The default sentinel hash threshold is 16 MiB, streamed in 1 MiB chunks. Identical
+content with only a timestamp change is not drift; above the threshold, changes
+remain unverified and stop. Failed or unstable attempted hashes fail closed.
 
 ## Stop gates
 
@@ -476,5 +519,7 @@ All rights reserved. **Source-available for reference and portfolio evaluation
 only** — see [LICENSE](LICENSE). Reading it, and running the bundled demo
 locally to see how it behaves, is welcome. Use in any product, service, or
 internal tool, redistribution, derivative works, and use as training data are
-not permitted without written permission. This is not open source; no OSI
-license is granted or implied.
+not permitted without written permission, except for rights that GitHub's terms
+necessarily grant to GitHub and its users while the repository is hosted there
+(including GitHub's fork feature). This is not open source; no OSI license is
+granted or implied.

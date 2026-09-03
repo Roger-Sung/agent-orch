@@ -33,7 +33,7 @@ Assets, in priority order:
 |---|---|---|---|
 | Git containment | dedicated worktree; credentials stripped from the environment; `GIT_ASKPASS`/`GIT_SSH_COMMAND` → `/usr/bin/false`; unconditional `pre-push` hook | results leaving through git | any other exfiltration path |
 | L1 prevention | `sandbox-exec` write allowlist | writes outside the workspace, artifact dir, temp dirs, provider state dirs | reads, network, writes to allowlisted paths |
-| L2 detection | sentinel snapshot of declared protected roots around each stage | reports and quarantines writes that happened anyway | anything outside the declared roots |
+| L2 detection | sentinel snapshot of declared protected roots around each stage | reports and quarantines observed drift | writer attribution; anything outside the declared roots |
 | Caps | attempt caps, per-edge transition caps, `max_transitions` | unbounded loops and quota burn | a single expensive stage |
 | Stop gate | reviewer from a different provider family; only `allow` reaches `done` | a model clearing its own work | a reviewer that is wrong in the same direction |
 | Sealed manifests | log hash + output hash recorded at commit | silent after-the-fact edits going unnoticed | a stage that corrupts its own log before the seal |
@@ -43,6 +43,23 @@ allowlist — **is not implemented**. Its absence is the single largest gap and
 is discussed under Residual risk.
 
 ## Known limitations
+
+### L2: observation is not attribution, and output retention is not clearance
+
+Concurrent writers can change protected roots during a legitimate stage. L2 has
+no process provenance, so it now stops these observations as `protected_root_drift`
+with unknown attribution. It does not infer non-causality from L1 or post-run
+probes: mediated writes and transient inode aliases still have to fail closed.
+This prevents false attribution, but **does not eliminate concurrency-related
+holds**. Genuine content changes need independent investigation.
+
+Per-run evidence and v2 manifests preserve the interrupted provider result as a
+candidate only. `containment-inspect` checks hashes without changing state; it
+does not prove historical sandbox enforcement or that the current workspace
+matches the one reviewed. Ordinary resume refuses a drift block until a new
+attempt is explicitly requested. No operator attestation or legacy-clearance
+exception was introduced. Artifact paths are run-scoped, not an adversarially
+immutable storage system; the existing same-identity/L3 limitations still apply.
 
 ### L1: temporary directories are writable, so nothing in them is protected
 
@@ -181,9 +198,9 @@ verifying it.
 ### L2: the hash threshold, and its deliberate asymmetry
 
 The sentinel records mtime and size for every file under the protected roots,
-plus a content hash for files below 256 KiB. When a file looks modified, the
-hash decides whether it really changed — that is what keeps a harmless `touch`
-from being reported as a violation.
+plus a streamed content hash for files up to 16 MiB. When a file looks modified,
+the hash decides whether it really changed — that is what keeps a harmless
+`touch` from being reported as a violation.
 
 Above the threshold there is no hash, so a change cannot be disproved, and any
 mtime or size difference counts as a violation. The expensive-to-verify case
@@ -203,7 +220,7 @@ must remain narrow and deployment-specific.
 Stage logs, manifests, and reports are written under `ORCH_HOME/tasks/`, and
 the sentinel excludes only the task workspace — not the engine's own state.
 A protected root covering `ORCH_HOME` would therefore report the engine's
-ordinary bookkeeping as a `workspace_escape` on every run; excluding
+ordinary bookkeeping as `protected_root_drift` on every run; excluding
 `ORCH_HOME` from L2 instead would exempt the evidence trail from the layer
 that guards it. Neither degradation is acceptable, so the daemon refuses to
 start when the two overlap (either direction, same alias-aware comparison as

@@ -356,13 +356,15 @@ class _ChildWatcher(threading.Thread):
         super().__init__(daemon=True)
         self._log_path = log_path
         self._origin = origin
-        self._stop = threading.Event()
+        # Do not shadow threading.Thread._stop(); join() calls that private
+        # method on Python 3.12.
+        self._stop_event = threading.Event()
         self.pid: int | None = None
         self.gone_at: float | None = None
 
     def run(self) -> None:
         deadline = time.monotonic() + 180
-        while not self._stop.is_set() and time.monotonic() < deadline:
+        while not self._stop_event.is_set() and time.monotonic() < deadline:
             pid = _read_child_pid(self._log_path)
             if pid is not None:
                 self.pid = pid
@@ -371,14 +373,14 @@ class _ChildWatcher(threading.Thread):
             time.sleep(0.002)
         if self.pid is None:
             return
-        while not self._stop.is_set() and time.monotonic() < deadline:
+        while not self._stop_event.is_set() and time.monotonic() < deadline:
             if not _alive(self.pid):
                 self.gone_at = time.monotonic()
                 return
             time.sleep(0.002)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=2.0)
 
     def lifetime_ms(self) -> int | None:
@@ -1199,20 +1201,25 @@ class _ReapedStub:
 # C12 - sealed manifest shape
 # ==========================================================================
 class SealedManifestShapeTests(_ParityCase):
-    # Frozen key set of controller._seal_run_manifest at the H2 base
-    # (d977b84). The spec cites a schema_version 2 payload from a newer
-    # engine snapshot; at this base the payload is schema_version 1 and this
-    # is the key set that must not move.
+    # Frozen key set of the integrated controller._seal_run_manifest payload.
+    # H2 may add live evidence beside the sealed artifacts, but must not add
+    # the live-file path to this schema_version 2 manifest.
     FROZEN_MANIFEST_KEYS = (
+        "candidate_classification",
+        "candidate_outcome",
+        "candidate_reason",
         "classification",
         "ended_at",
         "exit_code",
+        "input_hash",
         "lease_token",
         "log_hash",
         "log_path",
         "outcome",
         "output_hash",
+        "output_path",
         "owner",
+        "profile_hash",
         "reason",
         "run_token",
         "schema_version",
@@ -1248,7 +1255,7 @@ class SealedManifestShapeTests(_ParityCase):
                 controller.close()
         manifest = json.loads(manifest_text)
         self.assertEqual(tuple(sorted(manifest.keys())), self.FROZEN_MANIFEST_KEYS)
-        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["schema_version"], 2)
         self.assertNotIn(".live.jsonl", manifest_text)
         evidence = (log_path.parent.parent / "evidence.json")
         if evidence.is_file():

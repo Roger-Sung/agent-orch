@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
+import stat as stat_types
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -246,7 +247,7 @@ class Violation:
 
 @dataclass
 class Sentinel:
-    """Detects writes to protected roots that happen outside the workspace.
+    """Observes protected-root drift, not the identity or intent of its writer.
 
     Cost control, in order:
       1. excluded subtrees are never walked;
@@ -265,7 +266,7 @@ class Sentinel:
     roots: tuple[Path, ...]
     workspace: Path | None = None
     excludes: tuple[str, ...] = DEFAULT_SENTINEL_EXCLUDES
-    hash_below_bytes: int = 262_144
+    hash_below_bytes: int = 16 * 1024 * 1024
     _cache: dict[str, str] = field(default_factory=dict, repr=False)
 
     def _is_excluded(self, path: Path) -> bool:
@@ -319,8 +320,22 @@ class Sentinel:
     @staticmethod
     def _hash(path: Path) -> str | None:
         try:
-            with path.open("rb") as handle:
-                return hashlib.sha256(handle.read()).hexdigest()
+            # Nonblocking open also prevents a concurrently substituted FIFO
+            # from hanging the controller. Only regular files are hashable.
+            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as handle:
+                before = os.fstat(handle.fileno())
+                if not stat_types.S_ISREG(before.st_mode):
+                    return None
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                after = os.fstat(handle.fileno())
+                current = path.stat()
+                def identity(value: os.stat_result) -> tuple[int, ...]:
+                    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+                if identity(before) != identity(after) or identity(after) != identity(current):
+                    return None
+                return digest.hexdigest()
         except OSError:
             return None
 
@@ -331,6 +346,12 @@ class Sentinel:
             previous = before.get(path)
             if previous is None:
                 violations.append(Violation(path, "added"))
+                continue
+            if entry[2] is None and entry[1] <= self.hash_below_bytes:
+                # An attempted hash failed or raced a writer. Absence of a
+                # digest is not evidence of unchanged content, even if stat
+                # happens to be unchanged between the two snapshots.
+                violations.append(Violation(path, "unverified"))
                 continue
             if previous == entry:
                 continue
@@ -542,7 +563,7 @@ def validate_home_outside_protected(
     `ORCH_HOME/tasks/<id>/`. The sentinel excludes the task *workspace* but
     not the orchestrator's own state directory, so a protected root that
     covers ORCH_HOME turns the engine's ordinary bookkeeping into a
-    `workspace_escape` on every run — and deliberately excluding ORCH_HOME
+    `protected_root_drift` on every run — and deliberately excluding ORCH_HOME
     from L2 would instead exempt the evidence trail from the layer that
     guards it. Separation is the only configuration that keeps both
     properties, so overlap refuses to start rather than degrading one of

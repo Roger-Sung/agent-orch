@@ -42,10 +42,10 @@ reopen the hole the layer exists to close.
 
 ## L2 — the hash threshold and its asymmetry
 
-The sentinel stores mtime and size for every file, plus a content hash for
-files below 256 KiB. When a file looks modified, the hash decides whether it
-actually changed — that is what keeps a harmless `touch` from being reported
-as a violation.
+The sentinel stores mtime and size for every file, plus a content hash streamed
+in 1 MiB chunks for files up to 16 MiB. When a file looks modified, the hash
+decides whether it actually changed — that is what keeps a harmless `touch`
+from being reported as a violation.
 
 Above the threshold there is no hash, so a change cannot be disproved, and any
 mtime or size difference counts as a violation. The asymmetry is deliberate:

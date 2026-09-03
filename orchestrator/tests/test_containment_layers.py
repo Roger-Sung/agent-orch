@@ -380,7 +380,7 @@ class ControllerEscapeTest(SandboxFixture):
             status = controller.status(task_id)
             self.assertEqual(status["task"]["status"], "blocked")
             transitions = status["transitions"]
-            self.assertEqual(transitions[-1]["reason"], "workspace_escape")
+            self.assertEqual(transitions[-1]["reason"], "protected_root_drift")
         finally:
             controller.close()
 
@@ -390,7 +390,7 @@ class ControllerEscapeTest(SandboxFixture):
         try:
             rows = list(controller.conn.execute("SELECT * FROM quarantine WHERE task_id=?", (task_id,)))
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["reason"], "workspace_escape")
+            self.assertEqual(rows[0]["reason"], "protected_root_drift")
             evidence = json.loads(Path(rows[0]["artifact_path"]).read_text(encoding="utf-8"))
             self.assertEqual([item["path"] for item in evidence["violations"]], [str(victim)])
             self.assertEqual(evidence["violations"][0]["kind"], "added")
@@ -413,7 +413,7 @@ class GitIdentityTest(SandboxFixture):
     def _write_containment(self) -> str:
         log_path = self.artifacts / "stage.log"
         prepare_containment(self.workspace, log_path)
-        return (log_path.parent / "containment" / "gitconfig").read_text(encoding="utf-8")
+        return (log_path.with_suffix(".containment") / "gitconfig").read_text(encoding="utf-8")
 
     def test_default_identity_is_synthetic(self) -> None:
         with unittest.mock.patch.dict(os.environ, {}, clear=False):
@@ -440,7 +440,7 @@ class GitIdentityTest(SandboxFixture):
         with unittest.mock.patch.dict(os.environ, {GIT_IDENTITY_ENV: "global"}):
             log_path = self.artifacts / "stage.log"
             prepare_containment(self.workspace, log_path)
-            marker = (log_path.parent / "containment" / "identity-source").read_text(encoding="utf-8")
+            marker = (log_path.with_suffix(".containment") / "identity-source").read_text(encoding="utf-8")
         self.assertEqual(marker.strip(), "global")
 
     def test_commit_still_works_with_the_synthetic_default(self) -> None:

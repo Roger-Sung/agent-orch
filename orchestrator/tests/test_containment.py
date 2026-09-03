@@ -82,7 +82,7 @@ class PrepareContainmentTest(unittest.TestCase):
 
     def test_containment_artifacts_live_next_to_the_stage_log(self):
         prepare_containment(self.workspace, self.log_path)
-        artifacts = self.log_path.parent / "containment"
+        artifacts = self.log_path.with_suffix(".containment")
         self.assertTrue((artifacts / "gitconfig").is_file())
         hook = artifacts / "hooks" / "pre-push"
         self.assertTrue(hook.is_file())

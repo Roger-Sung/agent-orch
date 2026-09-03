@@ -13,7 +13,7 @@ import subprocess
 import threading
 import time
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -106,7 +106,7 @@ def prepare_containment(workspace: Path, log_path: Path) -> dict[str, str]:
     Committing still works. The constraint is on letting a result leave the
     worktree through git, not on doing the job.
     """
-    containment_root = log_path.parent / "containment"
+    containment_root = log_path.with_suffix(".containment")
     hooks_dir = containment_root / "hooks"
     try:
         hooks_dir.mkdir(parents=True, exist_ok=True)
@@ -316,6 +316,10 @@ class RunResult:
     usage_output_tokens: int | None = None
     usage_total_tokens: int | None = None
     usage_unavailable_reason: str | None = None
+    # Retained provider result for inspection, NEVER an accepted transition.
+    candidate_outcome: str | None = None
+    candidate_classification: str | None = None
+    candidate_reason: str | None = None
 
 
 def classify_result(
@@ -331,6 +335,12 @@ def classify_result(
         # Containment outranks every other signal: a stage that escaped its
         # workspace, or never got a sandbox, must not be reported as a plain
         # non-zero exit — the operator needs to know which of the two happened.
+        candidate = None
+        if source.containment_stop in {"protected_root_drift", "workspace_escape"}:
+            candidate = classify_result(
+                exit_code, output, allowed_outcomes, timed_out,
+                source=replace(source, containment_stop=None),
+            )
         return RunResult(
             exit_code,
             output,
@@ -340,6 +350,9 @@ def classify_result(
             timed_out,
             containment_stop=source.containment_stop,
             containment_violations=source.containment_violations,
+            candidate_outcome=candidate.outcome if candidate else None,
+            candidate_classification=candidate.classification if candidate else None,
+            candidate_reason=candidate.reason if candidate else None,
             **telemetry,
         )
     if timed_out:
@@ -802,7 +815,7 @@ class SubprocessRunner:
             try:
                 decision = prepare_sandbox(
                     workspace,
-                    log_path.parent / "containment",
+                    log_path.with_suffix(".containment"),
                     allow_unsandboxed=allow_unsandboxed_requested(),
                     extra_allow=(reports_dir,) if reports_dir is not None else (),
                     protected_roots=protected_roots,
