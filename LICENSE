@@ -7,6 +7,14 @@ interviewers, reviewers, and anyone else assessing the author's engineering
 work. It is not open source, and no open-source license is granted, implied,
 or intended.
 
+Hosting-platform terms. While the copyright holder makes this repository
+publicly available through GitHub, rights necessarily granted to GitHub and
+its users by GitHub's Terms of Service for hosting, viewing, cloning, and
+using GitHub's fork feature apply independently. Nothing in this license
+attempts to withdraw those platform-specific rights. They do not grant a
+right to use the software in a product, service, internal tool, or derivative
+work outside those platform functions.
+
 1. Permitted, without a separate agreement
    a. Viewing, reading, and reviewing the source code.
    b. Making a temporary local copy for the sole purpose of reading it or
@@ -20,7 +28,8 @@ or intended.
    a. Use of this software, in whole or in part, in any product, service,
       internal tool, or other software, whether commercial or not.
    b. Redistribution, publication, sublicensing, sale, or hosting of this
-      software or of any derivative work, in source or binary form.
+      software or of any derivative work, in source or binary form, except
+      through the hosting-platform functions described above.
    c. Modification for any purpose other than the local evaluation described
       in section 1(b).
    d. Use of this software, or any part of it, as training data or as input

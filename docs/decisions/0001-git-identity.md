@@ -1,8 +1,8 @@
 # ADR 0001 — Commit identity inside containment
 
-- Status: **proposed** (M0 deliverable; implementation belongs to M1)
+- Status: **accepted and implemented**
 - Date: 2026-08-17
-- Scope: `runner.py` containment gitconfig only. This document changes no code.
+- Scope: containment git identity and its recorded source marker.
 
 ## Context
 

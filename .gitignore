@@ -10,5 +10,8 @@ __pycache__/
 # Runtime state of a local orchestrator home.
 /orch-home/
 /output/
+# OpenSpec working artifacts can contain deployment paths, task IDs, and
+# operator evidence. Public design decisions belong in docs/ after sanitizing.
+/openspec/
 .containment-test-*/
 .sbtest-*/

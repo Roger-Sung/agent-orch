@@ -75,7 +75,7 @@ prefix named a private system and would have been meaningless here.
 >    inside the daemon's environment — it must print your roots, not `()`.
 > 2. Run a task with a workspace whose stage writes one file outside that
 >    workspace (the fake agent in `orchestrator/examples/` is enough). The task
->    must end `blocked` with reason `workspace_escape`, and a row must appear
+>    must end `blocked` with reason `protected_root_drift`, and a row must appear
 >    in the `quarantine` table with the offending path in its evidence file.
 > 3. Confirm the reverse: a stage that writes only inside its workspace still
 >    reaches `done`. A detection layer that blocks everything is as useless as
@@ -242,6 +242,3 @@ is visible too:
   profile's shape rather than observed.
 - **A recorded demo** (asciinema or similar) and a static architecture image
   for contexts that do not render Mermaid.
-- **Retiring the old copy** in the deployment this was extracted from: the
-  engine now runs from here, but the superseded directory still exists there
-  and is a trap for anyone reading the wrong one.
