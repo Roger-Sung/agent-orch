@@ -1521,6 +1521,24 @@ class WatchCliTests(unittest.TestCase):
         self.assertEqual(out.getvalue().strip(), "")
         self.assertIn("orchestrator:", err.getvalue())
 
+    def test_e12_database_query_failure_has_no_envelope_or_traceback(self):
+        harness = StageHarness(self)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, harness.env):
+            with mock.patch(
+                "orchestrator.cli.Controller.status",
+                side_effect=sqlite3.OperationalError("unable to open database file"),
+            ):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = cli_main(["watch", harness.task_id])
+        self.assertEqual(code, 2)
+        self.assertEqual(out.getvalue().strip(), "")
+        self.assertEqual(
+            err.getvalue().strip(),
+            "orchestrator: unable to open database file",
+        )
+        self.assertNotIn("Traceback", err.getvalue())
+
     def test_e12_help_states_the_composite_predicate_not_the_rejected_loop(self):
         parser = build_parser()
         actions = {

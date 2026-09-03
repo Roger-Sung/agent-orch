@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import uuid
 from pathlib import Path
@@ -340,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "watch":
         try:
             return _watch(home, args)
-        except (ControllerError, ProfileError, OSError) as exc:
+        except (ControllerError, ProfileError, OSError, sqlite3.Error) as exc:
             # Pre-envelope generic failures - a mode=ro database open failure,
             # an unreadable home - keep the CLI's existing stderr-only path.
             # Inventing a watch error code for them would be new vocabulary
