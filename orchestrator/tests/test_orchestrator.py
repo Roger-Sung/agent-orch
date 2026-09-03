@@ -1281,6 +1281,53 @@ class StartPhaseTests(unittest.TestCase):
             self.assertEqual(result["routing"]["gate"]["status"], "pending")
             self.assertNotIn("gate_decision", result["routing"])
 
+    def test_gate_sync_uses_latest_resume_result_for_same_reviewer_task(self):
+        controller_task_id = "controller-task-review"
+        cases = [
+            ("stalled-then-resumed-allow", {"status": "blocked", "stop_reason": "runner_nonzero"}, "allow", "ALLOW"),
+            ("stale-allow-then-resumed-block", None, "block", "BLOCK"),
+        ]
+        for name, stalled_payload, resumed_outcome, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory, patch(
+                "orchestrator.start.daemon_is_running", return_value=True
+            ):
+                home = Path(directory) / "runtime"
+                synced = self._synced_gate_pending_task(home, Path(directory))
+                enqueued_review = run_gate_run(home, synced["task_id"])
+                review_request_id = enqueued_review["routing"]["gate_review_execution"]["request_id"]
+
+                if stalled_payload is None:
+                    stale_path = self._write_gate_review_processed_result(home, review_request_id, "allow")
+                else:
+                    stale_path = self._write_processed_result(
+                        home,
+                        review_request_id,
+                        {"request_id": review_request_id, "task_id": controller_task_id, **stalled_payload},
+                    )
+
+                resume_request_id = f"resume-request-{name}"
+                resume_path = self._write_gate_review_processed_result(home, resume_request_id, resumed_outcome)
+                # The resume result must win on mtime regardless of filesystem timestamp granularity.
+                stale_stat = stale_path.stat()
+                os.utime(resume_path, ns=(stale_stat.st_atime_ns + 1_000_000, stale_stat.st_mtime_ns + 1_000_000))
+
+                result = run_gate_sync(home, synced["task_id"])
+
+                review_result = result["routing"]["gate_review_result"]
+                self.assertEqual(result["status"], "waiting_user")
+                self.assertEqual(review_result["recommendation"], expected)
+                self.assertEqual(review_result["outcome"], resumed_outcome)
+                self.assertEqual(review_result["processed_result_path"], str(resume_path))
+                self.assertEqual(review_result["request_id"], resume_request_id)
+                self.assertEqual(review_result["controller_task_id"], controller_task_id)
+                self.assertEqual(result["routing"]["gate"]["status"], "pending")
+                self.assertEqual(
+                    result["routing"]["gate"]["review_execution"]["request_id"], review_request_id
+                )
+                inbox_text = (home / "inbox.md").read_text(encoding="utf-8")
+                self.assertIn(f"stop-gate reviewer recommendation {expected}", inbox_text)
+                self.assertIn(str(resume_path), inbox_text)
+
     def test_gate_sync_rejects_missing_result_already_decided_already_synced_and_non_enqueued_gate(self):
         with tempfile.TemporaryDirectory() as directory, patch("orchestrator.start.daemon_is_running", return_value=True):
             home = Path(directory)

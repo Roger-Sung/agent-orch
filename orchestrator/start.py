@@ -636,6 +636,13 @@ def run_gate_sync(home: Path, task_id: str) -> dict[str, Any]:
     if not isinstance(processed_result, dict):
         raise ValueError(f"malformed stop-gate reviewer result {result_path}: root must be an object")
 
+    result_path, processed_result = _find_latest_processed_result_for_task(
+        home, result_path, processed_result
+    )
+    processed_request_id = processed_result.get("request_id")
+    if isinstance(processed_request_id, str) and processed_request_id:
+        request_id = processed_request_id
+
     outcome = _extract_gate_review_outcome(processed_result, request_id, result_path)
     recommendation = {"allow": "ALLOW", "block": "BLOCK"}[outcome]
     synced_at = _now()
