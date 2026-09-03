@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import codecs
 import json
 import os
+import queue
 import re
+import selectors
 import shlex
 import signal
 import shutil
 import subprocess
+import threading
 import time
 import tomllib
 from dataclasses import dataclass
@@ -33,6 +37,25 @@ SOCKET_SIGNATURES = (
 )
 LOCALHOST_SIGNATURE = re.compile(r"\b(localhost|127\.0\.0\.1|::1)\b", re.IGNORECASE)
 DEFAULT_CODEX_SERVICE_TIERS = frozenset({"fast", "priority"})
+
+# Identical to subprocess._communicate's read size, so the hand-rolled drain in
+# SubprocessRunner._drain_pipe reads the provider pipe in exactly the chunks
+# communicate() used to.
+DRAIN_READ_BYTES = 32768
+# Upper bound on one select() wait, so a silent child still wakes the drain.
+# min(remaining, LIVE_POLL_SECONDS) is what stops it from extending the
+# deadline the child runs under.
+LIVE_POLL_SECONDS = 1.0
+
+# Live stream: one run-local JSONL file beside the sealed stage log, evidence
+# only. None of these has an environment override; an override would be a new
+# operator knob with a new failure mode and nothing here needs one.
+LIVE_SCHEMA_VERSION = 1
+LIVE_MAX_BYTES = 8192              # whole-run footprint; never exceeded, never rewritten
+LIVE_TERMINAL_RESERVE_BYTES = 512  # a stage_end line is under 200 bytes
+LIVE_FRAGMENT_MAX_CHARS = 1024
+LIVE_QUEUE_MAX_RECORDS = 256       # optional-record depth; the slot beyond it is the terminal slot
+LIVE_CLOSE_JOIN_SECONDS = 1.0      # bounded, and taken only on a reaped-child path
 
 # Worktree + git containment: pin the stage's working directory to a worktree and
 # strip every push credential. This is enforcement, not an instruction in a
@@ -346,6 +369,324 @@ def classify_result(
     return RunResult(exit_code, output, outcome, "success", "success", False, **telemetry)
 
 
+def _decode_authoritative(raw: bytes, encoding: str, errors: str) -> str:
+    """Verbatim replica of subprocess.Popen._translate_newlines.
+
+    This is the authoritative decode: whole buffer, strict errors, run once
+    after the child is reaped. The live stream decodes the same bytes with
+    replacement instead, which is exactly what makes it non-authoritative.
+    """
+    return raw.decode(encoding, errors).replace("\r\n", "\n").replace("\r", "\n")
+
+
+_LIVE_TERMINAL = object()
+
+
+class _LiveStream:
+    """Non-authoritative live JSONL for one stage run.
+
+    Live rendering is evidence. It cannot kill, retry, resume, classify,
+    extend a deadline or mutate task state, and two properties make that true
+    rather than merely intended:
+
+    - Renderer failure cannot raise into the child's lifecycle. Every public
+      method contains `Exception` only. Process-control `BaseException` is
+      deliberately left on its legacy path, so a KeyboardInterrupt arriving
+      inside `fragment()` still reaches `run()`'s handler and still terminates
+      the child.
+    - Renderer *slowness* cannot stall the lifecycle either. All filesystem
+      I/O, file creation included, happens on one daemon writer thread. The
+      lifecycle thread only ever does `put_nowait`, and the single blocking
+      step - a bounded join in `close()` - is taken only once the runner has
+      already reaped the child, so it cannot delay the paths where the runner
+      returns immediately with a child still alive.
+    """
+
+    _THREAD_NAME = "orch-live-writer"
+
+    def __init__(self, path: Path, owner: str, timeout_seconds: int) -> None:
+        self._path = path
+        self._owner = owner
+        self._timeout_seconds = timeout_seconds
+        # One slot beyond the optional-record depth. That slot is the terminal
+        # record's, which is why put_nowait in close() cannot raise Full.
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=LIVE_QUEUE_MAX_RECORDS + 1)
+        self._closing = threading.Event()
+        # Set from either thread, read by the writer, so it is an Event rather
+        # than a bool: "is this live evidence complete" is the one thing a
+        # later reader must not get wrong.
+        self._incomplete = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._decoder: Any = None
+        self._terminal: dict[str, Any] | None = None
+        # Writer thread only, from here down.
+        self._handle: Any = None
+        self._written = 0
+        self._seq = 0
+
+    @classmethod
+    def open(cls, log_path: Path, *, owner: str, timeout_seconds: int) -> "_LiveStream":
+        """Start the writer thread. Total against renderer failure.
+
+        Touches no path and enqueues nothing, and is called before
+        `started = time.time()`, so no live filesystem I/O and no blocking wait
+        happens inside the authoritative duration interval. Because it raises
+        no `Exception`, one call binds the handle ahead of `run()`'s try, and a
+        spawn `OSError` still reaches the convergence-point `close()` against a
+        bound name.
+        """
+        try:
+            stream = cls(log_path.with_suffix(".live.jsonl"), owner, timeout_seconds)
+        except Exception:
+            return cls._inert()
+        try:
+            thread = threading.Thread(target=stream._writer, name=cls._THREAD_NAME, daemon=True)
+            thread.start()
+        except Exception:
+            # Same inert no-op state a failed file create leaves behind, not a
+            # second code path.
+            stream._incomplete.set()
+            return stream
+        stream._thread = thread
+        return stream
+
+    @classmethod
+    def _inert(cls) -> "_LiveStream":
+        stream = cls.__new__(cls)
+        stream._path = None  # type: ignore[assignment]
+        stream._owner = ""
+        stream._timeout_seconds = 0
+        stream._queue = queue.Queue(maxsize=1)
+        stream._closing = threading.Event()
+        stream._incomplete = threading.Event()
+        stream._incomplete.set()
+        stream._thread = None
+        stream._decoder = None
+        stream._terminal = None
+        stream._handle = None
+        stream._written = 0
+        stream._seq = 0
+        return stream
+
+    # -- lifecycle-thread side: in-memory only, never blocking --------------
+    def stage_start(self, *, child_pid: int, encoding: str) -> None:
+        try:
+            # Replacement errors, so invalid bytes render as U+FFFD in live
+            # evidence while the authoritative decode still raises. That
+            # divergence is the point of "non-authoritative".
+            self._decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+            self._offer(
+                {
+                    "event": "stage_start",
+                    "schema_version": LIVE_SCHEMA_VERSION,
+                    "seq": None,
+                    "ts_ms": _ms(time.time()),
+                    "owner": self._owner,
+                    "child_pid": child_pid,
+                    "timeout_seconds": self._timeout_seconds,
+                    "encoding": encoding,
+                }
+            )
+        except Exception:
+            self._decoder = None
+            self._degrade()
+
+    def fragment(self, chunk: bytes) -> None:
+        try:
+            if self._decoder is None:
+                self._incomplete.set()
+                return
+            self._emit_text(self._decoder.decode(chunk))
+        except Exception:
+            self._degrade()
+
+    def heartbeat(self) -> None:
+        try:
+            self._offer({"event": "heartbeat", "seq": None, "ts_ms": _ms(time.time())})
+        except Exception:
+            self._degrade()
+
+    def eof(self) -> None:
+        try:
+            if self._decoder is None:
+                return
+            self._emit_text(self._decoder.decode(b"", final=True))
+        except Exception:
+            self._degrade()
+
+    def close(self, *, process: subprocess.Popen[str] | None, timed_out: bool) -> None:
+        """Admit the terminal record always; wait for it only when free to.
+
+        Takes the `Popen` rather than a pre-computed exit code so the reaped
+        test, the `returncode` read and the join decision all happen inside
+        this method's exception wrapper - the call site at the convergence
+        point stays as exception-free as it was before H2.
+        """
+        try:
+            exit_code: int | None = None
+            reaped = False
+            if process is not None and process.poll() is not None:
+                reaped = True
+                exit_code = process.returncode
+            self._terminal = {
+                "event": "stage_end",
+                "seq": None,
+                "ts_ms": _ms(time.time()),
+                # Explicitly non-authoritative: on the decode-failure paths the
+                # authoritative exit_code is None while poll() returns the
+                # child's real code, and with no reaped child this is null.
+                "exit_code": exit_code,
+                "timed_out": bool(timed_out),
+                "live_complete": None,
+            }
+            self._closing.set()
+            try:
+                self._queue.put_nowait(_LIVE_TERMINAL)
+            except queue.Full:
+                self._incomplete.set()
+            thread = self._thread
+            # Only a path where the runner already reaped the child may wait.
+            # On a spawn OSError, a mid-drain OSError, or the unreaped variant
+            # of the interrupt path, the runner returns to the controller
+            # immediately - in the mid-drain case with an unowned child still
+            # running - and a slow writer must not add latency to exactly
+            # those. There, live evidence is best effort: the daemon writer may
+            # still persist stage_end, but nothing waits for it.
+            if reaped and thread is not None and thread.is_alive():
+                thread.join(LIVE_CLOSE_JOIN_SECONDS)
+        except Exception:
+            self._degrade()
+
+    def _emit_text(self, text: str) -> None:
+        if not text:
+            return
+        # Bounded per-record size. Not newline-normalized: normalization is
+        # stateful across chunk boundaries and belongs to the authoritative
+        # path only.
+        for start in range(0, len(text), LIVE_FRAGMENT_MAX_CHARS):
+            self._offer(
+                {
+                    "event": "output_fragment",
+                    "seq": None,
+                    "ts_ms": _ms(time.time()),
+                    "text": text[start : start + LIVE_FRAGMENT_MAX_CHARS],
+                }
+            )
+
+    def _offer(self, record: dict[str, Any]) -> None:
+        if self._thread is None:
+            self._incomplete.set()
+            return
+        # The lifecycle thread is the sole producer, so admission needs no
+        # lock. Optional records stop one short of the queue's capacity, which
+        # keeps the last slot for the terminal record - the same
+        # terminal-reserve arithmetic the byte budget uses, applied to depth.
+        if self._queue.qsize() >= LIVE_QUEUE_MAX_RECORDS:
+            self._incomplete.set()
+            return
+        self._queue.put_nowait(record)
+
+    def _degrade(self) -> None:
+        self._incomplete.set()
+
+    # -- writer thread side: the only place that touches the filesystem -----
+    def _writer(self) -> None:
+        try:
+            try:
+                self._handle = self._create_handle(self._path)
+            except BaseException:
+                self._handle = None
+                self._incomplete.set()
+            while True:
+                item = self._queue.get()
+                if self._closing.is_set():
+                    # Discard the optional backlog rather than write it, so
+                    # close()'s bounded join is not spent on records that are
+                    # no longer worth having.
+                    if item is not _LIVE_TERMINAL or not self._queue.empty():
+                        self._incomplete.set()
+                    self._finalize()
+                    return
+                self._write_record(item)
+        except BaseException:
+            # This thread has no lifecycle thread to propagate into, so it
+            # contains everything, including process-control exceptions.
+            self._incomplete.set()
+            self._close_handle()
+
+    def _write_record(self, record: dict[str, Any]) -> None:
+        if self._handle is None:
+            self._incomplete.set()
+            return
+        try:
+            record["seq"] = self._seq
+            line = json.dumps(record, ensure_ascii=False).encode("utf-8") + b"\n"
+        except Exception:
+            self._incomplete.set()
+            return
+        if self._written + len(line) + LIVE_TERMINAL_RESERVE_BYTES > LIVE_MAX_BYTES:
+            # An optional record may never eat into the terminal reserve. A
+            # continuous writer that exhausts the budget therefore also stops
+            # producing heartbeats and the stream looks stalled - which is what
+            # stage_end.live_complete=false tells the reader.
+            self._incomplete.set()
+            return
+        try:
+            self._handle.write(line)
+            self._handle.flush()
+        except Exception:
+            self._incomplete.set()
+            self._close_handle()
+            return
+        self._written += len(line)
+        self._seq += 1
+
+    def _finalize(self) -> None:
+        record = self._terminal or {
+            "event": "stage_end",
+            "seq": None,
+            "ts_ms": _ms(time.time()),
+            "exit_code": None,
+            "timed_out": False,
+            "live_complete": None,
+        }
+        try:
+            record["seq"] = self._seq
+            record["live_complete"] = not self._incomplete.is_set()
+            line = json.dumps(record, ensure_ascii=False).encode("utf-8") + b"\n"
+        except Exception:
+            self._close_handle()
+            return
+        # stage_end may consume the reserve. Because the reserve is larger than
+        # any stage_end line, rejection by byte-budget exhaustion is impossible
+        # here by arithmetic rather than by a runtime check.
+        if self._handle is not None and self._written + len(line) <= LIVE_MAX_BYTES:
+            try:
+                self._handle.write(line)
+                self._handle.flush()
+                self._written += len(line)
+                self._seq += 1
+            except Exception:
+                pass
+        self._close_handle()
+
+    @staticmethod
+    def _create_handle(path: Path) -> Any:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # No fsync: a same-host reader sees flushed bytes, and a per-record
+        # fsync would add I/O latency for no gain.
+        return path.open("ab")
+
+    def _close_handle(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+
 class SubprocessRunner:
     def preflight(self, owner: str, timeout: int = 5) -> ProviderPreflightResult:
         command = self._command(owner)
@@ -491,6 +832,12 @@ class SubprocessRunner:
             containment_env["ORCH_CONTAINMENT_SANDBOX"] = decision.mode
             model_command = command
             command = decision.wrap(command)
+        # Started before `started = time.time()` so the writer thread's
+        # creation cost can reach neither the deadline window nor the
+        # authoritative duration interval. open() raises no Exception, so the
+        # handle is bound on every path that reaches the convergence point -
+        # including a spawn OSError.
+        live = _LiveStream.open(log_path, owner=owner, timeout_seconds=timeout)
         started = time.time()
         exit_code: int | None = None
         output = ""
@@ -514,12 +861,30 @@ class SubprocessRunner:
             self._append_live_status(
                 log_path, f"{containment_line}provider_child_pid={child_pid}\nstage_status=running\n"
             )
+            stdout_encoding = process.stdout.encoding
+            stdout_errors = process.stdout.errors
+            # communicate() started its clock here; keeping the origin in the
+            # same statement position keeps the deadline the child runs under
+            # byte-for-byte the one it ran under before.
+            deadline = time.monotonic() + timeout
+            live.stage_start(child_pid=child_pid, encoding=stdout_encoding)
+            chunks: list[bytes] = []
             try:
-                output, _ = process.communicate(timeout=timeout)
+                self._drain_pipe(process, chunks, live, deadline, timeout)
+                process.wait(timeout=deadline - time.monotonic())
             except subprocess.TimeoutExpired:
                 timed_out = True
                 self._terminate_group(process)
-                output, _ = process.communicate()
+                # The final drain has no deadline, exactly as the second
+                # communicate() call had none. A grandchild still holding the
+                # pipe blocks the worker here as it always did.
+                self._drain_pipe(process, chunks, live, None, timeout)
+                process.wait()
+            live.eof()
+            # One whole-buffer strict decode, after the child is reaped and
+            # before exit_code is read: a UnicodeDecodeError therefore leaves
+            # exit_code at None, which is what the sealed log has always shown.
+            output = _decode_authoritative(b"".join(chunks), stdout_encoding, stdout_errors)
             exit_code = process.returncode
         except OSError as exc:
             error = f"failed to spawn runner: {exc}"
@@ -531,6 +896,7 @@ class SubprocessRunner:
             error = f"runner interrupted: {type(exc).__name__}: {exc}"
             output += error + "\n"
         ended = time.time()
+        live.close(process=process, timed_out=timed_out)
         self._write_log(log_path, owner, command, started, ended, exit_code, timed_out, output, error, child_pid)
         usage = _extract_usage(output)
         return RunResult(
@@ -593,6 +959,59 @@ class SubprocessRunner:
         if not command:
             raise ValueError(f"empty command for owner {owner}")
         return command
+
+    @staticmethod
+    def _drain_pipe(
+        process: subprocess.Popen[str],
+        chunks: list[bytes],
+        live: "_LiveStream",
+        deadline: float | None,
+        orig_timeout: float,
+    ) -> None:
+        """Read the provider pipe to EOF, or until the deadline expires.
+
+        Structured after subprocess.Popen._communicate on purpose: the parity
+        argument for the provider's lifecycle has to be readable line by line
+        against the loop this replaces. The only differences are that raw bytes
+        are accumulated for one whole-buffer decode later, that select() is
+        bounded so a silent child still produces evidence, and that each chunk
+        is offered to the live stream - an in-memory step that cannot raise or
+        block into this loop.
+        """
+        stdout = process.stdout
+        if stdout is None or stdout.closed:
+            return  # EOF was already reached in the first phase
+        with selectors.DefaultSelector() as selector:
+            selector.register(stdout, selectors.EVENT_READ)
+            while True:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(process.args, orig_timeout)
+                    wait_for = min(remaining, LIVE_POLL_SECONDS)
+                else:
+                    wait_for = LIVE_POLL_SECONDS
+                ready = selector.select(wait_for)
+                # Checked again before any ready event is consumed, exactly
+                # where _check_timeout sits in _communicate. min() above is
+                # also what keeps the poll bound from extending the deadline.
+                if deadline is not None and time.monotonic() > deadline:
+                    raise subprocess.TimeoutExpired(process.args, orig_timeout)
+                if not ready:
+                    live.heartbeat()
+                    continue
+                key = ready[0][0]
+                # An OSError here lands in run()'s OSError handler, which
+                # reports "failed to spawn runner", does not terminate, and
+                # returns while the child keeps running unowned. Misleading,
+                # and current behaviour.
+                data = os.read(key.fd, DRAIN_READ_BYTES)
+                if not data:
+                    selector.unregister(stdout)
+                    stdout.close()
+                    return
+                chunks.append(data)
+                live.fragment(data)
 
     @staticmethod
     def _terminate_group(process: subprocess.Popen[str]) -> None:
