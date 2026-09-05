@@ -170,7 +170,8 @@ Which stop reason lands where, and who can move it on:
 |---|---|---|
 | `attempt_cap` | `waiting_user` | human |
 | `edge_cap` | `waiting_user` | human |
-| `max_transitions` | `waiting_user` | human |
+| `transition_cap` | `waiting_user` | human |
+| `orphaned_running` (daemon died mid-stage) | `blocked` | human |
 | `rate_limited` | `paused` | automatic backoff |
 | `missing_outcome` | `blocked` | human |
 | `ambiguous_outcome` | `blocked` | human |

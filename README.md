@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/Roger-Sung/agent-orch/actions/workflows/ci.yml/badge.svg)](https://github.com/Roger-Sung/agent-orch/actions/workflows/ci.yml)
 
+繁體中文摘要 → [README.zh-TW.md](README.zh-TW.md)
+
 A stateful dispatcher for agent tasks. SQLite-backed state machine, a
 single-writer daemon, caps on every loop, cross-provider stop gates, and a
 sealed evidence trail for every stage that ran.
@@ -52,14 +54,12 @@ having kept a terminal open.
 
 This began as a way to stop babysitting an agent through a spec-to-code
 pipeline: start it, walk away, come back to a result that can be verified. Each
-mechanism here was added when that promise broke in a specific way. A run that
-could not be resumed safely became durable state with a single writer. A review
-from the same provider family that confirmed the executor's assumptions rather
-than testing them became the cross-provider gate. A stage that ignored its
-workspace and rewrote a live data store elsewhere on the machine — reporting
-success, caught by a human reading the result — became L1 prevention and L2
-detection. The shape is the record of what went wrong, not a design drawn up
-front.
+mechanism was added when that promise broke in a specific way. A run that could
+not be resumed safely became durable state with a single writer. A same-family
+review that confirmed the executor's assumptions instead of testing them became
+the cross-provider gate. A stage that ignored its workspace and rewrote a live
+data store elsewhere — reporting success, caught by a human reading the result —
+became L1 prevention and L2 detection. The shape is the record of what broke.
 
 ## 30-second demo — no credentials, no network
 
@@ -150,7 +150,7 @@ stateDiagram-v2
     failed --> [*]
 ```
 
-Three kinds of stop. A **cap** (`attempt_cap`, `edge_cap`, `max_transitions`)
+Three kinds of stop. A **cap** (`attempt_cap`, `edge_cap`, `transition_cap`)
 parks the task as `waiting_user`: the loop was working, it ran out of rope. A
 **refusal** (`missing_outcome`, `ambiguous_outcome`, `unknown_outcome`,
 `timeout`, sandbox or containment failures) parks it as `blocked`: a run
@@ -235,17 +235,18 @@ The filenames are descriptive only, but the owner IDs inside them (`claude`,
 `codex`) are part of the current implementation — the engine accepts exactly
 those two. A deployment is expected to write its own profiles. Review is a
 short-output, high-leverage position: a reviewer that finds one more real
-problem is worth more there than at the keyboard, and in practice Codex has
-been the stricter of the two, which is why it holds the default review seat.
+problem is worth more there than at the keyboard. Codex holds the default
+review seat; swapping the profiles reverses the pairing.
 
 ## Evidence
 
-- 342 engine tests (one skipped) and 13 sanitization-scanner tests, run on
-  Linux and macOS by CI. The engine suite includes the containment acceptance
-  tests.
-- Every stage run leaves a sealed manifest; `python3 -m orchestrator
-  containment-inspect TASK_ID` re-verifies the retained evidence over a
-  read-only connection.
+- 342 engine tests and 13 sanitization-scanner tests, run on Linux and macOS
+  by CI. The engine suite includes the containment acceptance tests; the L1
+  tests that need macOS `sandbox-exec` skip on hosts without it.
+- Every committed stage run leaves a sealed manifest — a run cut off by a
+  daemon crash is blocked with its log appended, not sealed. `python3 -m
+  orchestrator containment-inspect TASK_ID` re-verifies retained evidence over
+  a read-only connection.
 - CI runs only a partial sanitization scan, because the strict rules need
   site-local literals that never reach the repository. A green badge means the
   tests passed and the repository-side rules found nothing — the strict scan is
