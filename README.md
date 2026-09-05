@@ -6,7 +6,7 @@
 
 A stateful dispatcher for agent tasks. SQLite-backed state machine, a
 single-writer daemon, caps on every loop, cross-provider stop gates, and a
-sealed evidence trail for every stage that ran.
+sealed evidence trail for every committed stage run.
 
 Built to run long-lived Claude/Codex workflows unattended, where retries and
 side effects must be auditable afterwards. Published to be read, not adopted —
