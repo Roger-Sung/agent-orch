@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .profile import profile_from_snapshot
-from .runner import classify_result
+from .runner import allowed_outcomes, classify_result, extract_envelope
 
 
 DRIFT_REASONS = frozenset({"protected_root_drift", "workspace_escape"})
@@ -53,7 +53,7 @@ def inspect_retained(task: Mapping[str, Any], run: Mapping[str, Any]) -> dict[st
         if not isinstance(manifest.get(name), str) or not re.fullmatch(r"[0-9a-f]{64}", manifest[name]):
             raise ValueError(f"retained_manifest_invalid:{name}")
     log = read(run["log_path"], manifest["log_hash"])
-    read(task["input_snapshot_path"], task["input_hash"])
+    input_text = read(task["input_snapshot_path"], task["input_hash"]).decode("utf-8", errors="replace")
     read(task["profile_snapshot_path"], task["profile_hash"])
     profile = profile_from_snapshot(Path(task["profile_snapshot_path"]), task["profile_hash"])
     stage = profile.stage(run["stage"])
@@ -87,7 +87,11 @@ def inspect_retained(task: Mapping[str, Any], run: Mapping[str, Any]) -> dict[st
         output = next((value for value in candidates if hashlib.sha256(value).hexdigest() == manifest["output_hash"]), None)
         if output is None:
             raise ValueError("retained_legacy_output_unverifiable")
-    candidate = classify_result(manifest["exit_code"], output.decode("utf-8"), set(stage.outcomes), manifest["timed_out"])
+    # Same derivation as the prompt footer and the live classification, from
+    # the input snapshot this function already verifies: a drift-blocked
+    # envelope run must not report a spurious unknown_outcome here.
+    outcomes = set(allowed_outcomes(stage.outcomes, extract_envelope(input_text) is not None))
+    candidate = classify_result(manifest["exit_code"], output.decode("utf-8"), outcomes, manifest["timed_out"])
     if version == 2:
         for name in ("outcome", "classification", "reason"):
             if manifest.get(f"candidate_{name}") != getattr(candidate, name):

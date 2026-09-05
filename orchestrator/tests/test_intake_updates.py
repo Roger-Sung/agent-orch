@@ -19,7 +19,26 @@ from orchestrator.containment import ContainmentConfigError, validate_home_outsi
 from orchestrator.controller import Controller
 from orchestrator.doctor import run_doctor
 from orchestrator.runner import RunResult
+from orchestrator.tests.envelope_resolver_stub import patch_resolver
 from orchestrator.start import StartFlags, _spec_is_approved, run_start
+
+
+# Intake resolves an Interpretation Envelope by asking the routed executor one
+# bounded question about the task's own sources. These fixtures stay in the
+# natural language an operator types; only the provider process boundary is
+# replaced, so every engine-side validation of the reply still runs here.
+_RESOLVER = None
+
+
+def setUpModule() -> None:
+    global _RESOLVER
+    _RESOLVER = patch_resolver()
+    _RESOLVER.start()
+
+
+def tearDownModule() -> None:
+    if _RESOLVER is not None:
+        _RESOLVER.stop()
 
 
 class SpecApprovalMarkerTests(unittest.TestCase):

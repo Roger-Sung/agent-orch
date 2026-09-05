@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -17,6 +18,7 @@ from orchestrator.daemon import _reconcile_startup_requests
 from orchestrator.ipc import wait_for_result
 from orchestrator.profile import ProfileError, load_profile
 from orchestrator.runner import RunResult, SubprocessRunner, classify_result
+from orchestrator.tests.envelope_resolver_stub import patch_envelope, patch_resolver
 from orchestrator.start import (
     StartFlags,
     _read_yaml,
@@ -45,6 +47,24 @@ TRACKED_PROFILES = [
     ROOT / "orchestrator" / "profiles" / "provider_smoke_gated.yaml",
     ROOT / "orchestrator" / "profiles" / "artifact_validation.yaml",
 ]
+
+
+# Intake resolves an Interpretation Envelope by asking the routed executor one
+# bounded question about the task's own sources. These fixtures stay in the
+# natural language an operator types; only the provider process boundary is
+# replaced, so every engine-side validation of the reply still runs here.
+_RESOLVER = None
+
+
+def setUpModule() -> None:
+    global _RESOLVER
+    _RESOLVER = patch_resolver()
+    _RESOLVER.start()
+
+
+def tearDownModule() -> None:
+    if _RESOLVER is not None:
+        _RESOLVER.stop()
 
 
 class SequenceRunner:
@@ -325,11 +345,16 @@ class StartPhaseTests(unittest.TestCase):
     def _enqueued_stop_gate_apply_start(self, home: Path, worktree: Path) -> dict:
         spec = worktree / "approved-spec.md"
         spec.write_text("Status: approved\n", encoding="utf-8")
-        return run_start(
-            home,
-            "apply deploy metadata implementation to B17 worktree",
-            StartFlags("apply", "B17 worktree", worktree, spec, "medium", False),
-        )
+        # These sources name no writable path, so intake would stop on
+        # task_owned_write_targets (A-19) and this test would never reach the
+        # lifecycle it is about. The requirement text stays exactly as it was:
+        # the seam moves inward instead, to an already-accepted resolution.
+        with patch_envelope(write_targets=["orchestrator/deploy_metadata.py"]):
+            return run_start(
+                home,
+                "apply deploy metadata implementation to B17 worktree",
+                StartFlags("apply", "B17 worktree", worktree, spec, "medium", False),
+            )
 
     def _write_processed_result(self, home: Path, request_id: str, payload: dict) -> Path:
         processed = home / "processed"
@@ -371,9 +396,37 @@ class StartPhaseTests(unittest.TestCase):
             },
         )
 
+    def _write_controller_evidence(self, home: Path, start_task_id: str, controller_task_id: str) -> Path:
+        """A controller artifact dir with the evidence.json `gate-run` verifies against.
+
+        `gate-run` reuses the executor's frozen envelope by hash-verifying the
+        controller task's input snapshot through `evidence.json`, so a fixture
+        that fabricates a processed result has to fabricate that pairing too.
+        """
+        artifact_dir = home / "tasks" / controller_task_id
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        source = home / "tasks" / f"{start_task_id}-execution-input.md"
+        snapshot = artifact_dir / "input.snapshot.md"
+        data = source.read_bytes()
+        snapshot.write_bytes(data)
+        evidence_path = artifact_dir / "evidence.json"
+        evidence_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_id": controller_task_id,
+                    "input_snapshot_path": str(snapshot),
+                    "input_hash": hashlib.sha256(data).hexdigest(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return evidence_path
+
     def _synced_gate_pending_task(self, home: Path, worktree: Path) -> dict:
         started = self._enqueued_stop_gate_apply_start(home, worktree)
         request_id = started["routing"]["execution"]["request_id"]
+        evidence_path = self._write_controller_evidence(home, started["task_id"], "controller-task-gate")
         self._write_processed_result(
             home,
             request_id,
@@ -382,6 +435,7 @@ class StartPhaseTests(unittest.TestCase):
                 "task_id": "controller-task-gate",
                 "status": "done",
                 "stop_reason": "terminal_done",
+                "evidence_path": str(evidence_path),
             },
         )
         return run_start_sync(home, started["task_id"])
@@ -396,6 +450,7 @@ class StartPhaseTests(unittest.TestCase):
         )
         approved = run_start_go(home, started["task_id"])
         request_id = approved["routing"]["execution"]["request_id"]
+        evidence_path = self._write_controller_evidence(home, started["task_id"], "controller-task-gate")
         self._write_processed_result(
             home,
             request_id,
@@ -404,6 +459,7 @@ class StartPhaseTests(unittest.TestCase):
                 "task_id": "controller-task-gate",
                 "status": "done",
                 "stop_reason": "terminal_done",
+                "evidence_path": str(evidence_path),
             },
         )
         return run_start_sync(home, started["task_id"])
@@ -664,11 +720,14 @@ class StartPhaseTests(unittest.TestCase):
             home = Path(directory) / "runtime"
             spec = Path(directory) / "approved-spec.md"
             spec.write_text("Status: approved\n", encoding="utf-8")
-            result = run_start(
-                home,
-                "apply deploy metadata implementation to B17 worktree",
-                StartFlags("apply", "B17 worktree", Path(directory), spec, "medium", False),
-            )
+            # Routing, not resolution, is what this test observes; the
+            # requirement text is the operator's and stays as it is.
+            with patch_envelope(write_targets=["orchestrator/deploy_metadata.py"]):
+                result = run_start(
+                    home,
+                    "apply deploy metadata implementation to B17 worktree",
+                    StartFlags("apply", "B17 worktree", Path(directory), spec, "medium", False),
+                )
             routing = result["routing"]
             execution = routing["execution"]
             self.assertEqual(result["status"], "execute")
@@ -1941,19 +2000,50 @@ class FailureIntegrationTests(unittest.TestCase):
 
 
 class BrokerIntegrationTests(unittest.TestCase):
-    def _start_fake_daemon(self, home: Path, *, route_success: bool = False):
+    #: A provider shim that satisfies the E-13 convergence obligation.
+    #: `orch start` tasks now always carry an envelope, so every branching-stage
+    #: run must record a convergence block or fail closed to the engine hold.
+    #: The shim adds only that record and defers the outcome to the ordinary
+    #: fake agent, so what this test exercises is still the broker loop.
+    CONVERGENCE_AGENT = """#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+
+FAKE = {fake!r}
+prompt = sys.argv[2] if len(sys.argv) > 2 else ""
+proc = subprocess.run([sys.executable, FAKE, *sys.argv[1:]], capture_output=True, text=True)
+if "Convergence record obligation" in prompt:
+    if "REPEAT REVIEW" in prompt:
+        record = {{"live": [], "resolved": [], "new": [], "repeated": [], "verdict": "stalled"}}
+    else:
+        record = {{"live": [], "resolved": []}}
+    print("<!--ORCH-CONVERGENCE-BEGIN-->")
+    print(json.dumps(record))
+    print("<!--ORCH-CONVERGENCE-END-->")
+sys.stderr.write(proc.stderr)
+sys.stdout.write(proc.stdout)
+raise SystemExit(proc.returncode)
+"""
+
+    def _write_convergence_agent(self, directory: Path) -> Path:
+        path = directory / "convergence_agent.py"
+        path.write_text(
+            self.CONVERGENCE_AGENT.format(fake=str(ROOT / "orchestrator/examples/fake_agent.py")),
+            encoding="utf-8",
+        )
+        return path
+
+    def _start_fake_daemon(self, home: Path, *, route_success: bool = False, agent: Path | None = None):
+        agent_path = agent or (ROOT / "orchestrator/examples/fake_agent.py")
         env = os.environ.copy()
         env.update(
             {
                 "ORCH_HOME": str(home),
                 "ORCH_POLL_INTERVAL": "0.02",
                 "ORCH_WAIT_TIMEOUT": "10",
-                "ORCH_CLAUDE_COMMAND": (
-                    f"{sys.executable} {ROOT / 'orchestrator/examples/fake_agent.py'} claude"
-                ),
-                "ORCH_CODEX_COMMAND": (
-                    f"{sys.executable} {ROOT / 'orchestrator/examples/fake_agent.py'} codex"
-                ),
+                "ORCH_CLAUDE_COMMAND": f"{sys.executable} {agent_path} claude",
+                "ORCH_CODEX_COMMAND": f"{sys.executable} {agent_path} codex",
                 # L1 is a macOS mechanism, and a contained stage refuses to run
                 # where it is unavailable. This test is about the broker loop,
                 # not about containment: the fake agent writes nothing outside
@@ -2081,7 +2171,11 @@ class BrokerIntegrationTests(unittest.TestCase):
     def test_start_to_sync_gate_smoke_uses_fake_provider_without_network(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "runtime"
-            daemon, _env = self._start_fake_daemon(home, route_success=True)
+            daemon, _env = self._start_fake_daemon(
+                home,
+                route_success=True,
+                agent=self._write_convergence_agent(Path(directory)),
+            )
             try:
                 spec = Path(directory) / "approved-spec.md"
                 spec.write_text("Status: approved\n", encoding="utf-8")

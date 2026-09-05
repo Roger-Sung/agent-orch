@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import subprocess
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -14,7 +17,25 @@ from .containment import extra_write_roots_from_env, protected_roots_from_env, s
 from .ipc import atomic_write_text, daemon_is_running, enqueue_request
 from .profile import ProfileError, load_profile
 from .risk_rules import load_risk_rules
-from .runner import SubprocessRunner, allow_unsandboxed_requested
+from .runner import (
+    ENVELOPE_AXES,
+    ENVELOPE_BEGIN,
+    ENVELOPE_END,
+    ENVELOPE_ENUM_AXIS,
+    ENVELOPE_SCHEMA_VERSION,
+    ENVELOPE_SOURCE_DEFAULT,
+    ENVELOPE_SOURCE_ENGINE,
+    ENVELOPE_SOURCE_REQUIREMENT,
+    ENVELOPE_STATES,
+    SCOPE_EXPANSION_USER_DECISION,
+    EnvelopeError,
+    SubprocessRunner,
+    allow_unsandboxed_requested,
+    envelope_block_text,
+    extract_envelope,
+    provider_command,
+    render_envelope_block,
+)
 
 
 PROFILES_DIR_ENV = "ORCH_PROFILES_DIR"
@@ -313,6 +334,21 @@ def run_start(home: Path, description: str, flags: StartFlags) -> dict[str, Any]
                 f"task-{task_id} enqueued daemon request {execution['request_id']}",
                 Path(execution["request_path"]),
             )
+        elif execution["status"] == "waiting_user":
+            # An unresolved interpretation envelope is not a fault: it is the
+            # operator's question to answer. It takes the existing intake stop,
+            # so `start-go` refuses for the existing preflight reason until the
+            # requirement is restated and `orch start` is re-run.
+            task_record["stage"] = "waiting_user"
+            routing["auto_start"] = False
+            routing["preflight"] = {"status": "waiting_user", "reason": execution["reason"]}
+            _notify(
+                home,
+                "waiting_user",
+                "warn",
+                f"task-{task_id} waiting_user: {execution['reason']}",
+                routing_path,
+            )
         else:
             task_record["stage"] = "blocked"
             routing["auto_start"] = False
@@ -348,6 +384,25 @@ def run_start_go(home: Path, task_id: str) -> dict[str, Any]:
         raise ValueError(f"task {task_id} is not waiting for post-route go/no-go (stage={task_record.get('stage')})")
 
     execution = _enqueue_for_routing(home, task_id, task_record, routing, "explicit start-go")
+    if execution["status"] == "waiting_user":
+        # Same intake stop as the auto-start path: the task stays at
+        # waiting_user with the reason on the preflight record, and a repeated
+        # start-go refuses with the existing preflight refusal.
+        task_record["stage"] = "waiting_user"
+        task_record["execution"] = execution
+        routing["preflight"] = {"status": "waiting_user", "reason": execution["reason"]}
+        routing["auto_start"] = False
+        routing["execution"] = execution
+        _write_yaml(task_path, task_record)
+        _write_yaml(routing_path, routing)
+        _notify(
+            home,
+            "waiting_user",
+            "warn",
+            f"task-{task_id} waiting_user: {execution['reason']}",
+            routing_path,
+        )
+        raise ValueError(execution["reason"])
     if execution["status"] != "enqueued":
         task_record["stage"] = "blocked"
         task_record["execution"] = execution
@@ -643,6 +698,37 @@ def run_gate_sync(home: Path, task_id: str) -> dict[str, Any]:
     if isinstance(processed_request_id, str) and processed_request_id:
         request_id = processed_request_id
 
+    if _is_pending_user_decision(processed_result):
+        # A held gate reviewer is not a malformed result. Nothing is recorded as
+        # a recommendation, no ALLOW and no BLOCK, and `gate` keeps its pending
+        # status, so gate-allow and gate-block remain available afterwards.
+        pending = {
+            "type": "stop_gate_review_pending",
+            "task_id": task_id,
+            "observed_at": _now(),
+            "request_id": request_id,
+            "processed_result_path": str(result_path),
+            "controller_status": processed_result.get("status"),
+            "stop_reason": processed_result.get("stop_reason"),
+            "reason": "stop-gate reviewer printed needs_user_decision; the gate is still undecided",
+        }
+        updated_gate = dict(gate)
+        updated_gate["review_execution"] = review_execution
+        updated_gate["review_pending"] = pending
+        task_record["stage"] = "waiting_user"
+        task_record["gate"] = updated_gate
+        routing["gate"] = updated_gate
+        _write_yaml(task_path, task_record)
+        _write_yaml(routing_path, routing)
+        _notify(
+            home,
+            "gate-review-pending",
+            "warn",
+            f"task-{task_id} stop-gate reviewer requires a user decision; gate still undecided",
+            result_path,
+        )
+        return _result(task_id, task_path, routing_path, task_record, routing)
+
     outcome = _extract_gate_review_outcome(processed_result, request_id, result_path)
     recommendation = {"allow": "ALLOW", "block": "BLOCK"}[outcome]
     synced_at = _now()
@@ -796,6 +882,15 @@ def _require_pending_stop_gate(
     if execution_result.get("controller_lifecycle_stage") != "done" or execution_result.get("controller_status") != "done":
         raise ValueError(f"task {task_id} controller execution has not reached done")
     return gate, execution_result
+
+
+def _is_pending_user_decision(result: dict[str, Any]) -> bool:
+    """The reviewer's controller task stopped on the engine hold, not on a fault."""
+    return (
+        "error" not in result
+        and result.get("status") == "waiting_user"
+        and result.get("stop_reason") == "user_decision_required"
+    )
 
 
 def _extract_gate_review_outcome(result: dict[str, Any], expected_request_id: str, result_path: Path) -> str:
@@ -1014,9 +1109,71 @@ def _write_gate_review_input(
         "```",
         "",
     ]
+    block = _verified_envelope_block(home, task_id, execution_result)
+    if block is not None:
+        # The stop-gate reviews under the same frozen envelope the executor ran
+        # under. These are already-verified bytes copied unchanged, never a
+        # re-render and never a re-resolution, so no second authority is
+        # created (E-1, E-16). It is the final section here too, because the
+        # gate review input is hashed the same way when it is submitted.
+        lines.extend([block, ""])
     input_path.parent.mkdir(parents=True, exist_ok=True)
     input_path.write_text("\n".join(lines), encoding="utf-8")
     return input_path
+
+
+def _verified_envelope_block(
+    home: Path, task_id: str, execution_result: dict[str, Any]
+) -> str | None:
+    """The controller task's envelope block, verified before it is read.
+
+    `gate-run` runs outside the controller process, so it cannot rely on
+    `_read_verified_input`. The routing decision's
+    `execution_result.evidence_path` already names the controller task's
+    `evidence.json`, which already carries `input_snapshot_path` and
+    `input_hash`; this verifies that snapshot against that hash and then reads
+    the block out of the verified bytes.
+
+    A task whose own execution input carries a block but whose evidence cannot
+    be verified raises rather than reviewing without one — otherwise deleting
+    one file would silently downgrade a stop gate to an envelope-free review.
+    """
+    local_input = home / "tasks" / f"{task_id}-execution-input.md"
+    expected: str | None = None
+    if local_input.is_file():
+        expected = envelope_block_text(local_input.read_text(encoding="utf-8"))
+
+    def missing(reason: str) -> None:
+        if expected is not None:
+            raise ValueError(
+                f"stop-gate for task {task_id} cannot reuse the frozen interpretation envelope: {reason}"
+            )
+
+    evidence_path = execution_result.get("evidence_path")
+    if not evidence_path or not Path(str(evidence_path)).is_file():
+        missing(f"execution result names no readable evidence.json ({evidence_path})")
+        return None
+    try:
+        evidence = json.loads(Path(str(evidence_path)).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        missing(f"cannot read {evidence_path}: {exc}")
+        return None
+    snapshot_path = evidence.get("input_snapshot_path") if isinstance(evidence, dict) else None
+    input_hash = evidence.get("input_hash") if isinstance(evidence, dict) else None
+    if not snapshot_path or not input_hash or not Path(str(snapshot_path)).is_file():
+        missing(f"{evidence_path} names no readable input snapshot")
+        return None
+    data = Path(str(snapshot_path)).read_bytes()
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != input_hash:
+        raise ValueError(
+            f"stop-gate for task {task_id}: controller input snapshot {snapshot_path} hash mismatch "
+            f"(expected {input_hash}, got {actual})"
+        )
+    block = envelope_block_text(data.decode("utf-8"))
+    if block is None:
+        missing(f"verified controller input snapshot {snapshot_path} carries no envelope block")
+    return block
 
 
 def _execution_request_id(task_record: dict[str, Any], routing: dict[str, Any]) -> str | None:
@@ -1278,6 +1435,882 @@ def _signals(text: str, task_type: str, approved_spec_given: bool, scope_ambiguo
     ]
 
 
+# ---------------------------------------------------------------------------
+# Interpretation Envelope — intake resolution and emission (spec section 3,
+# steps 1-3).
+#
+# Resolution happens once per execution attempt, inside `_enqueue_for_routing`,
+# after routing and request-id creation and before the execution input is
+# written or anything is enqueued. That position is what makes the three
+# "before any provider is invoked" guarantees hold as stated: a structural
+# preflight stop and a `--dry-run` never reach this code and make zero resolver
+# calls, and an attempt that does reach enqueue makes at most one.
+#
+# The resolver reads the immutable requirement sources in the natural language
+# the operator already writes them in. No heading, bullet, keyword, marker,
+# section or ordering is required of the user, and none is parsed: the engine
+# owns validation of the reply, not the shape of the request.
+# ---------------------------------------------------------------------------
+
+#: Engine-internal framing for the resolver's single bounded proposal. This is
+#: not a user-facing format: it never appears in a task source, in an operator
+#: message, or in the canonical envelope, and the accepted result is re-rendered
+#: from scratch rather than copied out of these bytes.
+RESOLVER_BEGIN = "<!--ORCH-ENVELOPE-PROPOSAL-BEGIN-->"
+RESOLVER_END = "<!--ORCH-ENVELOPE-PROPOSAL-END-->"
+#: Bounds on the untrusted reply. Everything beyond them fails closed.
+RESOLVER_TIMEOUT_SECONDS = 240
+RESOLVER_REPLY_MAX_CHARS = 64 * 1024
+ENVELOPE_MAX_MEMBERS = 32
+ENVELOPE_MAX_MEMBER_CHARS = 400
+ENVELOPE_MAX_EVIDENCE_CHARS = 1200
+#: How many candidate files or modules a task_owned_write_targets stop names.
+#: The list is a prompt to think with, not an enumeration to trust.
+WRITE_TARGET_CANDIDATE_LIMIT = 12
+#: The one axis whose safe default is not `[]` (section 1.3).
+ENVELOPE_SEMANTIC_AXIS = "semantic_change_surface"
+#: The one axis with no default at all (section 1.3).
+ENVELOPE_WRITE_AXIS = "task_owned_write_targets"
+#: The axes whose safe default is the empty set.
+ENVELOPE_EMPTY_DEFAULT_AXES = ("assurance_ceiling", "threat_model", "evidence_ceiling")
+#: Exactly the keys one proposed axis object may carry.
+RESOLVER_AXIS_KEYS = frozenset({"state", "value", "evidence", "detail"})
+#: The intake resolver's owner, fixed rather than routed.
+#:
+#: The resolver is not a stage: it answers one bounded question about the
+#: task's own text before any stage exists, so it has no reason to follow the
+#: executor. Fixing it to Claude keeps the boundary a single auditable command
+#: whose CLI can state the required "no tools, no filesystem, no user settings,
+#: no session" shape in its own vocabulary, instead of one boundary per
+#: provider whose weakest member decides what intake is actually isolated from.
+#: This affects intake resolution only; executor and reviewer routing are
+#: untouched, and no fallback, alternate route or provider-selection policy is
+#: added — an unusable Claude fails intake closed like any other resolver
+#: failure.
+RESOLVER_OWNER = "claude"
+
+#: The isolation flags, spelled out so the boundary is auditable rather than
+#: assumed. They have to say, in the CLI's own vocabulary: no tools, no MCP
+#: servers, no user configuration, no session state carried in or out. A
+#: variadic option is never the last element, because the prompt is appended
+#: after these and a trailing `<tools...>` option would swallow it.
+RESOLVER_ISOLATION_FLAGS: tuple[str, ...] = (
+    # No tool at all. This is the CLI's availability control, not a permission
+    # list: `--tools ""` is documented as "disable all tools", so nothing from
+    # the built-in set exists in the child. An allowlist option such as
+    # `--allowedTools` only decides what is pre-approved among tools that are
+    # still present, which is a weaker claim than the boundary needs. With no
+    # tool available the child cannot read a file, run a command or browse.
+    "--tools", "",
+    # No MCP server from any other configuration may add one back.
+    "--strict-mcp-config",
+    # Load no user/project/local settings: no hooks, no plugins, no agents,
+    # no permission defaults from this machine's configuration.
+    "--setting-sources", "",
+    # Nothing about this call is written into session state.
+    "--no-session-persistence",
+)
+
+#: Options whose value is variadic in the CLI above. The prompt is a positional
+#: argument appended after the flags, so one of these may never be last:
+#: `--tools "" <prompt>` reads the prompt as a second tool name and leaves the
+#: resolver with no question to answer.
+RESOLVER_VARIADIC_FLAGS = frozenset(
+    {"--tools", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools"}
+)
+
+#: The only environment a resolver child inherits. An allowlist rather than a
+#: blocklist: a variable this engine has never heard of cannot leak workspace,
+#: deployment or task context into a process that is supposed to see nothing
+#: but the immutable sources. Provider authentication has to survive, so the
+#: resolver owner's own namespace and the machine's TLS/proxy settings are
+#: named — and only that owner's, since the resolver is no longer whichever
+#: provider routing happened to pick.
+RESOLVER_ENV_ALLOW_NAMES = frozenset(
+    {
+        "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TERM", "TZ",
+        "LANG", "LC_ALL", "LC_CTYPE",
+        "TMPDIR", "TEMP", "TMP",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    }
+)
+RESOLVER_ENV_ALLOW_PREFIXES = ("ANTHROPIC_", "CLAUDE_")
+
+
+class EnvelopeResolverError(ValueError):
+    """The resolver produced nothing the engine may act on. Always fails closed."""
+
+
+@dataclass(frozen=True)
+class EnvelopeAxis:
+    state: str
+    #: Members for a set-valued axis; the enum string for scope_expansion_policy.
+    value: Any
+    default_applied: bool
+    source: Any
+    #: Why the axis is unresolved, verbatim enough for the operator to restate.
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class EnvelopeResolution:
+    """Either a fully accepted envelope, or the fail-closed stop and its reason."""
+
+    axes: dict[str, EnvelopeAxis] | None
+    stop_reason: str | None
+    #: Display-only diagnostics. Never rendered into the canonical envelope.
+    candidates: tuple[str, ...] = ()
+
+
+def _requirement_sources(task_record: dict[str, Any]) -> list[tuple[str, str]]:
+    """The complete immutable requirement sources, in reading order.
+
+    Task text, user scope and any supplied approved spec — nothing else. A
+    provider or implementation choice is not a requirement source, which is
+    what stops `task_owned_write_targets` being derived from a layout the user
+    never stated. `--worktree` is absent for the same reason: it is the
+    execution boundary, and it grants no write authority.
+    """
+    sources: list[tuple[str, str]] = [("task text", str(task_record.get("task_description") or ""))]
+    scope = task_record.get("scope")
+    if scope:
+        sources.append(("scope", str(scope)))
+    approved_spec = (task_record.get("flags") or {}).get("approved_spec")
+    if approved_spec:
+        path = Path(str(approved_spec)).expanduser()
+        try:
+            sources.append((f"approved spec {path}", path.read_text(encoding="utf-8")))
+        except OSError:
+            # A missing or unreadable spec is already a preflight blocker; do
+            # not let it silently become "the sources said nothing".
+            sources.append((f"approved spec {path}", ""))
+    return sources
+
+
+def _scope_text(sources: list[tuple[str, str]]) -> str:
+    """The task's own scope — its task text when no scope was given."""
+    by_label = dict(sources)
+    scope = by_label.get("scope") or ""
+    return scope if scope.strip() else (by_label.get("task text") or "")
+
+
+def _normalise_for_grounding(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def _grounded(quote: str, blob: str) -> bool:
+    """Is `quote` verbatim in the immutable sources, up to whitespace?
+
+    Only whitespace runs and letter case are normalised, so a reply cannot
+    paraphrase, summarise or invent its way past this: the words have to be the
+    operator's own.
+    """
+    normalised = _normalise_for_grounding(quote)
+    return bool(normalised) and normalised in blob
+
+
+def _carried_by(member: str, quote: str) -> bool:
+    """Does the quoted source span actually contain this member?
+
+    Exact source-span grounding, and only that. Grounding a quote is not
+    grounding a member: a genuine sentence from the sources says nothing about
+    a requirement invented next to it, so every declared member has to occur in
+    the very text offered as its evidence.
+
+    What this deliberately does *not* do is read the span. Whether the span
+    authorises the member or forbids it — polarity, negation, a read-only
+    reference, an ambiguous authorisation — is ordinary natural language, and
+    the resolver is this engine's single semantic interpreter for it
+    (`_resolver_prompt`). A second, deterministic natural-language reader here
+    would be a keyword list pretending to be a parser: strong enough to look
+    like a guarantee, weak enough to miss the next phrasing, and impossible to
+    keep honest across the languages operators actually write in.
+    """
+    return _normalise_for_grounding(member) in _normalise_for_grounding(quote)
+
+
+#: A token in the sources that could be a repository path. Deliberately
+#: inclusive: it decides only whether the sources are *silent* about paths, and
+#: an over-inclusive match costs a stop, never an unearned authorisation.
+_SOURCE_PATH_TOKEN = re.compile(r"(?:[\w.~-]+/)+[\w.-]+")
+
+
+def _sources_name_any_path(sources: list[tuple[str, str]]) -> bool:
+    """Do the immutable sources mention anything path-shaped at all?
+
+    Used only to judge an empty declared write set. Prose slashes (`and/or`,
+    `read/write`) are excluded by requiring a file extension or a second
+    separator, so ordinary sentences stay silent while any real path — even one
+    the reply omitted — makes silence an unsupportable claim.
+    """
+    for _, text in sources:
+        for match in _SOURCE_PATH_TOKEN.finditer(text):
+            token = match.group(0)
+            if token.count("/") >= 2 or re.search(r"\.[A-Za-z0-9]{1,8}$", token):
+                return True
+    return False
+
+
+def _normalise_write_target(raw: str, worktree: str | None) -> str | None:
+    """A grounded path token, normalised. Callers ground it *before* calling.
+
+    A relative path is resolved against the execution worktree only here, after
+    its authority is already established in the sources: the worktree fixes
+    where a source-named relative path lands, it never adds one.
+    """
+    candidate = raw.strip().strip("`").strip().rstrip(",;")
+    if not candidate or " " in candidate.strip("/"):
+        return None
+    expanded = os.path.expanduser(candidate)
+    if not os.path.isabs(expanded) and worktree:
+        expanded = os.path.join(str(Path(str(worktree)).expanduser()), expanded)
+    normalised = os.path.normpath(expanded)
+    if normalised in {".", ""}:
+        return None
+    return normalised
+
+
+# ---------------------------------------------------------------------------
+# The resolver boundary.
+# ---------------------------------------------------------------------------
+
+
+def _resolver_prompt(sources: list[tuple[str, str]]) -> str:
+    """The one question the resolver is asked.
+
+    It carries the immutable sources and nothing else: no worktree, no routing
+    decision, no profile prompt, no prior report, no engine state. What it asks
+    for is a proposal; what the engine does with the answer is decided by
+    `_parse_resolver_reply`, which trusts none of it.
+
+    This prompt is where the semantic half of the contract lives. Reading
+    ordinary prose — polarity, negation, a read-only reference, an ambiguous
+    grant — belongs here and nowhere else, so the obligation is stated as a
+    rule the resolver must follow, not as a hint: anything it cannot pin down
+    is `unresolved`, and a stop is the correct answer.
+    """
+    blocks = [
+        f"### SOURCE: {label}\n{text.strip()}" if text.strip() else f"### SOURCE: {label}\n(empty)"
+        for label, text in sources
+    ]
+    return "\n\n".join(
+        [
+            "You are an intake resolver for one task. Read the immutable requirement sources "
+            "below and report what they do and do not determine. You have no tools, no "
+            "filesystem and no network. Do not perform the task. Do not ask questions. Do not "
+            "add requirements the sources do not carry.",
+            "\n\n".join(blocks),
+            "Report six axes:",
+            "- semantic_change_surface: the named behaviours the task is permitted to change.\n"
+            "- task_owned_write_targets: the paths the sources explicitly authorise writing. A "
+            "path is authorised only where a source says so; an execution directory, a "
+            "repository root or a path merely mentioned as context, background or read-only is "
+            "not authorisation.\n"
+            "- assurance_ceiling: the proof/hardening items the sources permit building.\n"
+            "- threat_model: the named adversaries the design must withstand.\n"
+            "- evidence_ceiling: the observation/instrumentation items the sources permit adding.\n"
+            "- scope_expansion_policy: what happens when work exceeds the surface; the only "
+            "value that can be honoured is \"user_decision\".",
+            "Give each axis exactly one state:\n"
+            "- \"declared\" — the sources state a requirement for this axis.\n"
+            "- \"semantically_silent\" — the sources say nothing about this axis.\n"
+            "- \"unresolved\" — the sources carry a requirement for this axis that you cannot "
+            "reduce to one determinate value, or two that conflict.\n"
+            "Prefer \"unresolved\" over a guess. Being unsure is a correct answer; inventing a "
+            "value is not.",
+            "You are the only reader of this text. Nothing downstream re-reads the sources to "
+            "check what they meant, so meaning is settled here:\n"
+            "- Read polarity before you read words. A sentence that forbids, excludes, defers or "
+            "restricts something is not a requirement to do it. \"Do not rewrite the daemon lease "
+            "protocol\" does not put rewriting the daemon lease protocol in "
+            "semantic_change_surface; \"Keep orchestrator/controller.py untouched\" and "
+            "\"orchestrator/controller.py is read-only background\" do not put that path in "
+            "task_owned_write_targets. A negated or read-only reference is never returned as "
+            "write authority or as positive semantic-change authority — not as a member, and not "
+            "with the negating sentence as its evidence.\n"
+            "- Where authorisation, polarity or scope is ambiguous — the sources hint at a "
+            "requirement without stating it, permit something only conditionally, or could be "
+            "read either way — the axis is \"unresolved\". Do not resolve an ambiguity in the "
+            "direction of more authority.\n"
+            "- A quote is evidence only for what it actually asserts about the member. A true "
+            "sentence that happens to sit near the member, or that concerns a different axis, is "
+            "not evidence; if you cannot quote a span that states the requirement, the member "
+            "does not belong in \"declared\".\n"
+            "- \"unresolved\" costs the operator one restatement. A wrong \"declared\" freezes "
+            "authority the sources never granted. They are not comparable; choose the stop.",
+            "Special rules:\n"
+            "- task_owned_write_targets has no default: if the sources do not determine the set, "
+            "its state is \"unresolved\". An empty declared set means the sources determine that "
+            "this task writes no repository path at all; if the sources mention any path, or the "
+            "task is one that changes the repository, the set is not empty but \"unresolved\".\n"
+            "- If semantic_change_surface is \"semantically_silent\", its value is the behaviours "
+            "the task's own scope names, quoted verbatim from the scope and not expanded. If you "
+            "cannot read that behaviour set off the scope, the axis is \"unresolved\".\n"
+            "- If assurance_ceiling, threat_model or evidence_ceiling is \"semantically_silent\", "
+            "its value is [].\n"
+            "- If scope_expansion_policy is \"semantically_silent\", its value is \"user_decision\".",
+            "Answer with exactly one JSON object between the two markers below and nothing else "
+            "outside them. Each axis is an object with exactly the keys \"state\", \"value\", "
+            "\"evidence\" and \"detail\".\n"
+            "- \"value\": a list of short strings, or \"user_decision\" for scope_expansion_policy. "
+            "Use [] when the state is \"unresolved\".\n"
+            "- \"evidence\": one verbatim quote from the sources per declared member, in the same "
+            "order as \"value\"; [] otherwise. Each quote must contain the member it is offered "
+            "for: a genuine sentence that says nothing about the member is not evidence. A "
+            "write-target quote must contain the path itself and must not be a quote that "
+            "forbids writing it or calls it read-only.\n"
+            "- \"detail\": for \"unresolved\", one sentence naming the conflicting or unrecognised "
+            "text; otherwise \"\".\n"
+            "When task_owned_write_targets is \"unresolved\" you may add a top-level "
+            "\"candidates\" list of files or modules the change may reach. It is a prompt for the "
+            "operator to think with and confers no authority.",
+            f"{RESOLVER_BEGIN}\n"
+            '{"schema_version": 1, "semantic_change_surface": {"state": "...", "value": [], '
+            '"evidence": [], "detail": ""}, "task_owned_write_targets": {...}, '
+            '"assurance_ceiling": {...}, "threat_model": {...}, "evidence_ceiling": {...}, '
+            '"scope_expansion_policy": {...}}\n'
+            f"{RESOLVER_END}",
+        ]
+    )
+
+
+def _resolver_command() -> list[str]:
+    """The existing Claude provider command, isolated.
+
+    A misconfigured provider command is a resolver failure, not a crash: every
+    error raised here is an `EnvelopeResolverError`, so it takes the same
+    fail-closed `waiting_user` path as a timeout or a malformed reply. An
+    unset, empty or unquotable `ORCH_CLAUDE_COMMAND` must stop intake, not the
+    process — there is no retry and no fallback to another provider.
+    """
+    flags = RESOLVER_ISOLATION_FLAGS
+    if flags[-1] in RESOLVER_VARIADIC_FLAGS:
+        raise EnvelopeResolverError(
+            f"the intake resolver isolation flags end with the variadic option {flags[-1]!r}, "
+            "which would consume the prompt"
+        )
+    try:
+        configured = list(provider_command(RESOLVER_OWNER))
+    except ValueError as exc:
+        raise EnvelopeResolverError(
+            f"the configured provider command for the {RESOLVER_OWNER!r} intake resolver is "
+            f"unusable: {exc}"
+        ) from exc
+    return configured + list(flags)
+
+
+def _resolver_environment(env: dict[str, str] | None = None) -> dict[str, str]:
+    """The child's environment: provider authentication and nothing else.
+
+    An allowlist, not a blocklist. Orchestrator variables name homes,
+    workspaces and commands the resolver has no business seeing — but so do
+    editor, CI, shell and deployment variables this engine has never heard of,
+    and a blocklist silently forwards every one of them. What survives is the
+    resolver owner's own namespace plus the TLS/proxy settings its
+    authentication needs; anything else that a deployment turns out to require
+    will fail the call closed rather than widen the child's view.
+    """
+    source = os.environ if env is None else env
+    return {
+        key: value
+        for key, value in source.items()
+        if key in RESOLVER_ENV_ALLOW_NAMES or key.startswith(RESOLVER_ENV_ALLOW_PREFIXES)
+    }
+
+
+def _invoke_resolver(prompt: str) -> str:
+    """The provider process boundary. One bounded call, no tools, no workspace.
+
+    This is the only function in intake that spawns anything, and it is the
+    seam an offline test replaces: everything above it is engine logic and
+    everything below it is the Claude CLI.
+    """
+    command = _resolver_command() + [prompt]
+    with tempfile.TemporaryDirectory(prefix="orch-envelope-resolver-") as sandbox:
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=RESOLVER_TIMEOUT_SECONDS,
+                check=False,
+                cwd=sandbox,
+                env=_resolver_environment(),
+            )
+        except FileNotFoundError as exc:
+            raise EnvelopeResolverError(f"intake resolver CLI is unavailable: {exc}") from exc
+        except OSError as exc:
+            raise EnvelopeResolverError(f"intake resolver could not be started: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise EnvelopeResolverError(
+                f"intake resolver timed out after {RESOLVER_TIMEOUT_SECONDS}s"
+            ) from exc
+    if completed.returncode != 0:
+        tail = (completed.stdout or "").strip()[-400:]
+        raise EnvelopeResolverError(
+            f"intake resolver exited {completed.returncode}: {tail or '(no output)'}"
+        )
+    return completed.stdout or ""
+
+
+def _resolver_payload(reply: str) -> dict[str, Any]:
+    """The single bounded proposal carried by an untrusted reply."""
+    if len(reply) > RESOLVER_REPLY_MAX_CHARS:
+        raise EnvelopeResolverError(
+            f"intake resolver reply is oversized ({len(reply)} > {RESOLVER_REPLY_MAX_CHARS} chars)"
+        )
+    begins = reply.count(RESOLVER_BEGIN)
+    ends = reply.count(RESOLVER_END)
+    if begins != 1 or ends != 1:
+        raise EnvelopeResolverError(
+            f"intake resolver reply does not carry exactly one proposal (begin={begins}, end={ends})"
+        )
+    start = reply.index(RESOLVER_BEGIN) + len(RESOLVER_BEGIN)
+    stop = reply.index(RESOLVER_END)
+    if stop < start:
+        raise EnvelopeResolverError("intake resolver reply closes its proposal before it opens it")
+    try:
+        payload = json.loads(reply[start:stop])
+    except json.JSONDecodeError as exc:
+        raise EnvelopeResolverError(f"intake resolver proposal is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise EnvelopeResolverError("intake resolver proposal must be a JSON object")
+    if payload.get("schema_version") != ENVELOPE_SCHEMA_VERSION:
+        raise EnvelopeResolverError(
+            f"intake resolver proposal has unsupported schema_version {payload.get('schema_version')!r}"
+        )
+    allowed = {"schema_version", "candidates", *ENVELOPE_AXES}
+    if not set(ENVELOPE_AXES) <= set(payload) or not set(payload) <= allowed:
+        missing = sorted(set(ENVELOPE_AXES) - set(payload))
+        extra = sorted(set(payload) - allowed)
+        raise EnvelopeResolverError(
+            f"intake resolver proposal axes missing={missing} unexpected={extra}"
+        )
+    return payload
+
+
+def _proposed_members(axis: str, entry: dict[str, Any]) -> list[str]:
+    value = entry["value"]
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise EnvelopeResolverError(f"proposed {axis} value must be a list of non-empty strings")
+    members = [item.strip() for item in value]
+    if len(members) > ENVELOPE_MAX_MEMBERS:
+        raise EnvelopeResolverError(
+            f"proposed {axis} names {len(members)} members, over the {ENVELOPE_MAX_MEMBERS} bound"
+        )
+    if any(len(item) > ENVELOPE_MAX_MEMBER_CHARS for item in members):
+        raise EnvelopeResolverError(
+            f"proposed {axis} carries a member longer than {ENVELOPE_MAX_MEMBER_CHARS} characters"
+        )
+    if len(set(members)) != len(members):
+        raise EnvelopeResolverError(f"proposed {axis} repeats a member")
+    return members
+
+
+def _proposed_evidence(axis: str, entry: dict[str, Any]) -> list[str]:
+    evidence = entry["evidence"]
+    if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence):
+        raise EnvelopeResolverError(f"proposed {axis} evidence must be a list of strings")
+    if any(len(item) > ENVELOPE_MAX_EVIDENCE_CHARS for item in evidence):
+        raise EnvelopeResolverError(
+            f"proposed {axis} carries a quote longer than {ENVELOPE_MAX_EVIDENCE_CHARS} characters"
+        )
+    return evidence
+
+
+def _proposed_detail(axis: str, entry: dict[str, Any]) -> str:
+    detail = entry["detail"]
+    if not isinstance(detail, str):
+        raise EnvelopeResolverError(f"proposed {axis} detail must be a string")
+    return detail.strip()[:ENVELOPE_MAX_EVIDENCE_CHARS]
+
+
+def _axis_from_proposal(
+    axis: str,
+    entry: Any,
+    *,
+    blob: str,
+    scope_blob: str,
+    worktree: str | None,
+    apply_shaped: bool,
+    sources_name_paths: bool,
+) -> EnvelopeAxis:
+    """One proposed axis, validated into an engine value or into `unresolved`.
+
+    Nothing here is repaired, retried or partially accepted: a proposal that
+    does not satisfy the axis's own rule either raises — which fails the whole
+    resolution closed — or is recorded `unresolved`, which takes the section
+    1.4 stop.
+    """
+    if not isinstance(entry, dict) or set(entry) != RESOLVER_AXIS_KEYS:
+        raise EnvelopeResolverError(
+            f"proposed {axis} must be an object with exactly {sorted(RESOLVER_AXIS_KEYS)}"
+        )
+    state = entry["state"]
+    if state not in ENVELOPE_STATES:
+        raise EnvelopeResolverError(f"proposed {axis} has unknown state {state!r}")
+    detail = _proposed_detail(axis, entry)
+
+    if state == "unresolved":
+        return EnvelopeAxis(
+            "unresolved", None, False, None,
+            detail or "the sources do not reduce this axis to one determinate value",
+        )
+
+    if axis == ENVELOPE_ENUM_AXIS:
+        if entry["value"] != SCOPE_EXPANSION_USER_DECISION:
+            # Section 1.3: a declared value intake cannot express in the axis's
+            # canonical shape is unresolved, not a silent downgrade.
+            return EnvelopeAxis(
+                "unresolved", None, False, None,
+                f"the sources ask for a scope expansion policy the engine does not honour "
+                f"({entry['value']!r}); {SCOPE_EXPANSION_USER_DECISION} is the only value",
+            )
+        if state == "declared":
+            quotes = _proposed_evidence(axis, entry)
+            if not quotes or not all(_grounded(quote, blob) for quote in quotes):
+                raise EnvelopeResolverError(
+                    f"proposed {axis} is declared without a verbatim quote from the sources"
+                )
+            return EnvelopeAxis("declared", SCOPE_EXPANSION_USER_DECISION, False, ENVELOPE_SOURCE_REQUIREMENT)
+        return EnvelopeAxis(
+            "semantically_silent", SCOPE_EXPANSION_USER_DECISION, True, ENVELOPE_SOURCE_DEFAULT
+        )
+
+    members = _proposed_members(axis, entry)
+    quotes = _proposed_evidence(axis, entry)
+
+    if state == "semantically_silent":
+        if axis == ENVELOPE_WRITE_AXIS:
+            # Section 1.3 gives this axis no default, so the state is
+            # unreachable: silence about paths is exactly the unresolved case.
+            return EnvelopeAxis(
+                "unresolved", None, False, None,
+                "the sources name no write targets, and this axis has no default; it is never "
+                "inferred from the semantic change surface, from an implementation layout, or "
+                "from the execution worktree",
+            )
+        if axis in ENVELOPE_EMPTY_DEFAULT_AXES:
+            if members:
+                raise EnvelopeResolverError(
+                    f"proposed {axis} is semantically_silent but carries members; "
+                    "its safe default is []"
+                )
+            return EnvelopeAxis("semantically_silent", [], True, {})
+        # semantic_change_surface: the section 1.3 default is the behaviours
+        # the task's own scope names, verbatim and unexpanded. A non-empty
+        # scope may not silently produce [].
+        if not members:
+            if _normalise_for_grounding(scope_blob):
+                raise EnvelopeResolverError(
+                    "proposed semantic_change_surface is semantically_silent with an empty value "
+                    "while the task's scope is not empty; the default is the behaviours the scope "
+                    "names, and an undeterminable behaviour set is unresolved"
+                )
+            return EnvelopeAxis("semantically_silent", [], True, {})
+        ungrounded = [member for member in members if not _grounded(member, scope_blob)]
+        if ungrounded:
+            raise EnvelopeResolverError(
+                f"proposed semantic_change_surface default expands beyond the task's own scope: "
+                f"{ungrounded!r} is not verbatim in it"
+            )
+        return EnvelopeAxis(
+            "semantically_silent",
+            members,
+            True,
+            {member: ENVELOPE_SOURCE_DEFAULT for member in members},
+        )
+
+    # state == "declared"
+    if not members:
+        if axis == ENVELOPE_WRITE_AXIS:
+            # "This task authorises no repository write" is a claim about the
+            # sources, so the sources have to support it. Two conditions the
+            # engine can check for itself, because a resolver assertion is not
+            # evidence: the request is not apply-shaped (an apply task changes
+            # the repository, so an empty write set contradicts it), and the
+            # sources name nothing path-shaped that the reply left unaccounted
+            # for. Otherwise the set is undetermined, which is `unresolved`.
+            if apply_shaped:
+                return EnvelopeAxis(
+                    "unresolved", None, False, None,
+                    "the sources authorise no write target, but this is an apply task, which "
+                    "changes the repository; the paths it may write are undetermined and are "
+                    "never inferred from the semantic change surface, from an implementation "
+                    "layout, or from the execution worktree",
+                )
+            if sources_name_paths:
+                return EnvelopeAxis(
+                    "unresolved", None, False, None,
+                    "the sources authorise no write target while naming paths the reply does "
+                    "not account for, so the sources do not determine the write set",
+                )
+            # A determinate "this task authorises no repository write" — the
+            # shape of a propose or review task, whose only output is its own
+            # report. It is not silence: E-17 still puts the engine-owned
+            # outputs inside the axis, and E-11 turns any other write into a
+            # user decision. Section 1.3 reserves `unresolved` for sources that
+            # do not determine the set, not for sources that determine it empty.
+            return EnvelopeAxis("declared", [], False, {})
+        raise EnvelopeResolverError(f"proposed {axis} is declared with an empty value")
+    if len(quotes) != len(members):
+        raise EnvelopeResolverError(
+            f"proposed {axis} carries {len(quotes)} quotes for {len(members)} declared members"
+        )
+    for member, quote in zip(members, quotes):
+        if not _grounded(quote, blob):
+            raise EnvelopeResolverError(
+                f"proposed {axis} member {member!r} quotes {quote!r}, which is not verbatim in the sources"
+            )
+    if axis != ENVELOPE_WRITE_AXIS:
+        for member, quote in zip(members, quotes):
+            # A genuine quote is not evidence for a requirement it does not
+            # carry. Without this, an invented member paired with any real
+            # sentence from the sources would freeze into the envelope as a
+            # declared requirement the operator never wrote.
+            if not _carried_by(member, quote):
+                raise EnvelopeResolverError(
+                    f"proposed {axis} member {member!r} is not carried by the source text quoted "
+                    f"for it ({quote!r}), so the sources do not declare it"
+                )
+        return EnvelopeAxis(
+            "declared", members, False, {member: ENVELOPE_SOURCE_REQUIREMENT for member in members}
+        )
+
+    targets: list[str] = []
+    for member, quote in zip(members, quotes):
+        if not _carried_by(member, quote):
+            # The path's authority has to be in the quote, not merely near it.
+            return EnvelopeAxis(
+                "unresolved", None, False, None,
+                f"the write target {member!r} is not carried by the source text quoted for it, so "
+                "the sources do not authorise writing it",
+            )
+        # Whether that span authorises the path or forbids it is the resolver's
+        # judgement, made once, in the one place this engine reads prose. The
+        # prompt requires `unresolved` for a negated, read-only or otherwise
+        # ambiguous reference, and a reply that ignores that is a resolver
+        # failure — not something a denial-word list here could reliably catch.
+        normalised = _normalise_write_target(member, worktree)
+        if normalised is None:
+            return EnvelopeAxis(
+                "unresolved", None, False, None,
+                f"the sources name {member!r} as a write target, which is not a path",
+            )
+        if normalised not in targets:
+            targets.append(normalised)
+    return EnvelopeAxis(
+        "declared", targets, False, {target: ENVELOPE_SOURCE_REQUIREMENT for target in targets}
+    )
+
+
+def _proposed_candidates(payload: dict[str, Any], axes: dict[str, EnvelopeAxis]) -> list[str]:
+    """The display-only diagnostic list, accepted only where it is meaningful.
+
+    It is stripped here and never reaches `_envelope_payload`, so no candidate
+    can become authority by being mentioned.
+    """
+    raw = payload.get("candidates")
+    if raw is None:
+        return []
+    if axes[ENVELOPE_WRITE_AXIS].state != "unresolved":
+        raise EnvelopeResolverError(
+            "intake resolver offered write-target candidates for an axis that is not unresolved"
+        )
+    if not isinstance(raw, list) or any(not isinstance(item, str) or not item.strip() for item in raw):
+        raise EnvelopeResolverError("intake resolver candidates must be a list of non-empty strings")
+    if len(raw) > WRITE_TARGET_CANDIDATE_LIMIT:
+        raise EnvelopeResolverError(
+            f"intake resolver offered {len(raw)} candidates, over the {WRITE_TARGET_CANDIDATE_LIMIT} bound"
+        )
+    if any(len(item) > ENVELOPE_MAX_MEMBER_CHARS for item in raw):
+        raise EnvelopeResolverError("intake resolver offered an oversized candidate")
+    return [item.strip() for item in raw]
+
+
+def _parse_resolver_reply(
+    reply: str, sources: list[tuple[str, str]], task_record: dict[str, Any]
+) -> tuple[dict[str, EnvelopeAxis], list[str]]:
+    payload = _resolver_payload(reply)
+    blob = _normalise_for_grounding("\n".join(text for _, text in sources))
+    scope_blob = _normalise_for_grounding(_scope_text(sources))
+    worktree = (task_record.get("flags") or {}).get("worktree")
+    apply_shaped = str(task_record.get("task_type_hint") or "") == "apply"
+    sources_name_paths = _sources_name_any_path(sources)
+    axes = {
+        axis: _axis_from_proposal(
+            axis,
+            payload[axis],
+            blob=blob,
+            scope_blob=scope_blob,
+            worktree=worktree,
+            apply_shaped=apply_shaped,
+            sources_name_paths=sources_name_paths,
+        )
+        for axis in ENVELOPE_AXES
+    }
+    return axes, _proposed_candidates(payload, axes)
+
+
+def _resolve_envelope(task_record: dict[str, Any]) -> EnvelopeResolution:
+    """One resolver call, then the accepted envelope or the fail-closed stop.
+
+    The routing decision is not an input: the resolver owner is fixed
+    (`RESOLVER_OWNER`), and the sources it reads are the task's own immutable
+    requirement text. Routing still decides who executes and who reviews.
+    """
+    sources = _requirement_sources(task_record)
+    try:
+        reply = _invoke_resolver(_resolver_prompt(sources))
+        axes, candidates = _parse_resolver_reply(reply, sources, task_record)
+    except EnvelopeResolverError as exc:
+        return EnvelopeResolution(
+            None,
+            "interpretation envelope unresolved before any provider runs; the intake resolver "
+            f"produced nothing the engine may act on: {exc}",
+        )
+    if _unresolved_axes(axes):
+        return EnvelopeResolution(
+            None, _envelope_stop_reason(axes, task_record, candidates), tuple(candidates)
+        )
+    return EnvelopeResolution(axes, None)
+
+
+def _unresolved_axes(axes: dict[str, EnvelopeAxis]) -> list[str]:
+    return [axis for axis in ENVELOPE_AXES if axes[axis].state == "unresolved"]
+
+
+# ---------------------------------------------------------------------------
+# Emission and the section 1.4 stop.
+# ---------------------------------------------------------------------------
+
+
+def _engine_owned_write_targets(home: Path, task_id: str, request_id: str, routing: dict[str, Any]) -> list[str]:
+    """This task's own outputs, added to the axis unconditionally (E-17).
+
+    Deterministic functions of the task id and the routing decision, not an
+    inference from the sources: the controller writes stage reports into the
+    task artifact directory, and a stop-gate task's reviewer is told to write
+    exactly one output path. A declared value that omits them is not a
+    conflict; intake adds them regardless.
+    """
+    targets = [os.path.normpath(str(home / "tasks" / request_id / "reports"))]
+    if routing.get("stop_gate") is True:
+        targets.append(os.path.normpath(str(home / "tasks" / f"{task_id}-gate-review-output.md")))
+    return targets
+
+
+def _envelope_payload(
+    axes: dict[str, EnvelopeAxis],
+    *,
+    home: Path,
+    task_id: str,
+    request_id: str,
+    routing: dict[str, Any],
+) -> dict[str, Any]:
+    """The canonical JSON for a fully resolved envelope.
+
+    Re-rendered from the accepted values; no provider byte is copied through.
+    """
+    payload: dict[str, Any] = {"schema_version": ENVELOPE_SCHEMA_VERSION}
+    for axis in ENVELOPE_AXES:
+        resolved = axes[axis]
+        value = resolved.value
+        source = resolved.source
+        if axis == ENVELOPE_WRITE_AXIS:
+            value = list(value)
+            source = dict(source)
+            for engine_owned in _engine_owned_write_targets(home, task_id, request_id, routing):
+                if engine_owned not in value:
+                    value.append(engine_owned)
+                source[engine_owned] = ENVELOPE_SOURCE_ENGINE
+        payload[axis] = {
+            "state": resolved.state,
+            "value": value,
+            "default_applied": resolved.default_applied,
+            "source": source,
+        }
+    return payload
+
+
+def _envelope_stop_reason(
+    axes: dict[str, EnvelopeAxis], task_record: dict[str, Any], candidates: list[str]
+) -> str:
+    """The section 1.4 stop message: names the axis and the offending text."""
+    unresolved = _unresolved_axes(axes)
+    parts = [
+        "interpretation envelope unresolved before any provider runs; restate the requirement and "
+        "re-run orch start"
+    ]
+    for axis in unresolved:
+        parts.append(f"axis {axis}: {axes[axis].detail}")
+    if ENVELOPE_WRITE_AXIS in unresolved:
+        parts.append(_write_target_stop_guidance(task_record, candidates))
+    return "; ".join(parts)
+
+
+def _write_target_stop_guidance(task_record: dict[str, Any], candidates: list[str]) -> str:
+    """The four things a write-target stop must additionally carry (section 1.4).
+
+    The operator is being asked to enumerate a scope they may not have
+    considered in full, so the stop warns about impact reach, offers candidates
+    to think with, states what leaving one out costs, and says plainly that the
+    candidates authorise nothing.
+    """
+    named = candidates or _write_target_candidates(task_record)
+    return (
+        "the impact scope of this change may reach files or modules beyond the ones the task text "
+        "named; candidates to think with (these confer NO write authority and none of them is "
+        f"written into any envelope): {', '.join(named)}; leaving a needed target out means a "
+        "later in-scope write to an unlisted path falls outside the frozen envelope, becomes "
+        "needs_user_decision and stops the task again after provider cost has been spent; only your "
+        "restated requirement, re-read at the next orch start, can put a path in this axis"
+    )
+
+
+def _write_target_candidates(task_record: dict[str, Any]) -> list[str]:
+    """Candidate files or modules the change may reach.
+
+    The engine's own fallback, used when the resolver offered none. Section 1.4
+    forbids issuing the stop without at least one candidate, so this always
+    returns something. Deliberately not confined to the immutable sources — the
+    axis is unresolved precisely because those sources do not determine it —
+    and deliberately never written into an envelope.
+    """
+    candidates: list[str] = []
+
+    def add(value: str) -> None:
+        if value and value not in candidates and len(candidates) < WRITE_TARGET_CANDIDATE_LIMIT:
+            candidates.append(value)
+
+    flags = task_record.get("flags") or {}
+    text = " ".join(part for _, part in _requirement_sources(task_record) if part)
+    for match in re.finditer(r"(?:[\w.~-]*/)+[\w.-]+", text):
+        add(match.group(0))
+    for match in re.finditer(r"\b[\w-]+\.(?:py|sh|md|ya?ml|json|db|ts|tsx|js|mjs)\b", text):
+        add(match.group(0))
+    worktree = flags.get("worktree")
+    if worktree:
+        root = Path(str(worktree)).expanduser()
+        try:
+            entries = sorted(entry.name for entry in root.iterdir() if not entry.name.startswith("."))
+        except OSError:
+            entries = []
+        for entry in entries:
+            add(str(root / entry))
+        add(str(root))
+    approved_spec = flags.get("approved_spec")
+    if approved_spec:
+        add(str(approved_spec))
+    if not candidates:
+        add(f"{task_record['task_id']} task artifact reports/ directory")
+    return candidates
+
+
 def _preflight(task_record: dict[str, Any], flags: StartFlags) -> dict[str, str | None]:
     task_type = task_record["task_type_hint"]
     signal_map = _signal_map(task_record)
@@ -1307,6 +2340,23 @@ def _preflight(task_record: dict[str, Any], flags: StartFlags) -> dict[str, str 
                 "marker line (e.g. 'Status: approved'); a marker word in prose does not count"
             ),
         }
+    # Interpretation envelope, last, and structural only: a task source that
+    # carries an envelope marker of its own would make the writer-owned block
+    # unverifiable, so it stops here. This is a text check on the immutable
+    # sources — it invokes nothing. Axis resolution itself is not a preflight
+    # condition; it happens once per execution attempt in
+    # `_enqueue_for_routing`, so a stop here and a `--dry-run` both cost zero
+    # resolver calls.
+    for label, text in _requirement_sources(task_record):
+        if ENVELOPE_BEGIN in text or ENVELOPE_END in text:
+            return {
+                "status": "waiting_user",
+                "reason": (
+                    f"{label} carries an interpretation-envelope marker; the block is writer-owned and "
+                    "task-supplied markers are never read as an envelope. Remove the marker and re-run "
+                    "orch start"
+                ),
+            }
     return {"status": "pass", "reason": None}
 
 
@@ -1558,8 +2608,32 @@ def _enqueue_for_routing(
             "pattern": pattern,
         }
 
-    input_path = _write_execution_input(home, task_id, task_record, routing, reason)
+    # The request id is drawn before the input is written because it is also
+    # the controller task id, and E-17 puts that task's own reports directory
+    # inside `task_owned_write_targets`.
     request_id = str(uuid.uuid4())
+    # The one resolver call of this execution attempt, after routing and the
+    # request id and before anything is written or enqueued. Routing order,
+    # input-write timing and request-id generation are all unchanged, and an
+    # unresolved result stops here — before the daemon, and therefore before
+    # any task executor, task reviewer or stop-gate provider runs.
+    resolution = _resolve_envelope(task_record)
+    if resolution.axes is None:
+        return {
+            "status": "waiting_user",
+            "reason": resolution.stop_reason,
+            "pattern": pattern,
+        }
+    try:
+        input_path = _write_execution_input(
+            home, task_id, task_record, routing, reason, request_id, resolution.axes
+        )
+    except EnvelopeError as exc:
+        return {
+            "status": "blocked",
+            "reason": f"interpretation envelope framing rejected before enqueue: {exc}",
+            "pattern": pattern,
+        }
     request = {
         "request_id": request_id,
         "action": "run",
@@ -1592,6 +2666,8 @@ def _write_execution_input(
     task_record: dict[str, Any],
     routing: dict[str, Any],
     reason: str,
+    request_id: str | None = None,
+    axes: dict[str, "EnvelopeAxis"] | None = None,
 ) -> Path:
     input_path = home / "tasks" / f"{task_id}-execution-input.md"
     scope = task_record.get("scope") or "(none)"
@@ -1621,8 +2697,26 @@ def _write_execution_input(
         "```",
         "",
     ]
+    emit_envelope = request_id is not None and axes is not None
+    if emit_envelope:
+        # The envelope is the final section, so its writer-owned position is
+        # part of what makes the block verifiable, not just its markers.
+        unresolved = _unresolved_axes(axes)
+        if unresolved:
+            raise EnvelopeError(f"unresolved interpretation envelope axes: {', '.join(unresolved)}")
+        payload = _envelope_payload(
+            axes, home=home, task_id=task_id, request_id=request_id, routing=routing
+        )
+        lines.extend([render_envelope_block(payload), ""])
+    rendered = "\n".join(lines)
+    if emit_envelope:
+        # Read the rendered file back through the same fail-closed extractor
+        # every consumer uses, before anything is enqueued (E-20).
+        readback = extract_envelope(rendered)
+        if readback != payload:
+            raise EnvelopeError("rendered envelope block does not read back as the resolved envelope")
     input_path.parent.mkdir(parents=True, exist_ok=True)
-    input_path.write_text("\n".join(lines), encoding="utf-8")
+    input_path.write_text(rendered, encoding="utf-8")
     return input_path
 
 

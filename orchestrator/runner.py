@@ -89,6 +89,307 @@ exit 1
 """
 
 
+# ---------------------------------------------------------------------------
+# Interpretation Envelope — the task-level system contract.
+#
+# The envelope is a six-axis record resolved once at intake, carried inside the
+# already-hashed execution input, and injected by the controller's single
+# prompt-composition chokepoint. These primitives live here rather than in
+# controller.py because all three consumers of the envelope — intake
+# (start.py), the controller, and retained inspection — import this module and
+# nothing here imports them, so one definition serves all of them without a
+# cycle.
+# ---------------------------------------------------------------------------
+
+# Engine-reserved outcome name. A stage outcome spelled exactly HOLD_OUTCOME
+# stops the task at waiting_user instead of continuing, so a spec can hand a
+# genuinely irreducible decision back to the operator. The semantics live in
+# the engine, not in the task's profile snapshot, which is why the name is
+# reserved: see docs/decisions/propose-convergence-policy.md, "Engine reserved
+# outcome names". A legacy task is unaffected bit-for-bit.
+HOLD_OUTCOME = "needs_user_decision"
+HOLD_STOP_REASON = "user_decision_required"
+
+ENVELOPE_BEGIN = "<!--ORCH-ENVELOPE-BEGIN-->"
+ENVELOPE_END = "<!--ORCH-ENVELOPE-END-->"
+ENVELOPE_SCHEMA_VERSION = 1
+
+#: The set-valued axes, in canonical order. Membership of the written path /
+#: named behaviour / named item in the axis value is the containment test.
+ENVELOPE_SET_AXES = (
+    "semantic_change_surface",
+    "task_owned_write_targets",
+    "assurance_ceiling",
+    "threat_model",
+    "evidence_ceiling",
+)
+#: The one enum axis. `user_decision` is the only value the engine honours.
+ENVELOPE_ENUM_AXIS = "scope_expansion_policy"
+ENVELOPE_AXES = ENVELOPE_SET_AXES + (ENVELOPE_ENUM_AXIS,)
+ENVELOPE_STATES = ("declared", "semantically_silent", "unresolved")
+ENVELOPE_AXIS_KEYS = frozenset({"state", "value", "default_applied", "source"})
+#: Provenance recorded against each member of a set-valued axis.
+ENVELOPE_SOURCE_REQUIREMENT = "requirement_sources"
+ENVELOPE_SOURCE_DEFAULT = "safe_default"
+ENVELOPE_SOURCE_ENGINE = "engine_owned"
+ENVELOPE_MEMBER_SOURCES = frozenset(
+    {ENVELOPE_SOURCE_REQUIREMENT, ENVELOPE_SOURCE_DEFAULT, ENVELOPE_SOURCE_ENGINE}
+)
+#: The only scope_expansion_policy value the engine honours (spec section 1.3).
+SCOPE_EXPANSION_USER_DECISION = "user_decision"
+
+
+class EnvelopeError(ValueError):
+    """Envelope framing or schema failure. Always fails closed: never legacy."""
+
+
+def render_envelope_block(envelope: dict[str, Any]) -> str:
+    """The canonical delimited block, markers on their own lines.
+
+    Rendering validates first, so an envelope that could not be read back is
+    never written in the first place.
+    """
+    validate_envelope(envelope)
+    body = json.dumps(envelope, ensure_ascii=False, indent=2, sort_keys=True)
+    return f"{ENVELOPE_BEGIN}\n{body}\n{ENVELOPE_END}"
+
+
+def envelope_block_text(text: str) -> str | None:
+    """The raw delimited block, or None for a legacy task.
+
+    Fail-closed framing (E-20). Task input is untrusted and may contain either
+    marker itself, so marker presence alone is never verification: exactly one
+    begin and one end marker, each alone on its line, in that order, with the
+    end marker in the writer-owned final position. Only the complete absence of
+    both markers is legacy; every other shape raises.
+    """
+    lines = text.split("\n")
+    begins = [index for index, line in enumerate(lines) if line.strip() == ENVELOPE_BEGIN]
+    ends = [index for index, line in enumerate(lines) if line.strip() == ENVELOPE_END]
+    loose_begin = text.count(ENVELOPE_BEGIN)
+    loose_end = text.count(ENVELOPE_END)
+    if not begins and not ends and not loose_begin and not loose_end:
+        return None
+    if loose_begin != 1 or loose_end != 1 or len(begins) != 1 or len(ends) != 1:
+        raise EnvelopeError(
+            f"envelope marker count is not exactly one pair "
+            f"(begin={loose_begin}, end={loose_end})"
+        )
+    begin, end = begins[0], ends[0]
+    if end <= begin:
+        raise EnvelopeError("envelope end marker precedes its begin marker")
+    if any(line.strip() for line in lines[end + 1:]):
+        raise EnvelopeError("envelope block is not in the writer-owned final position")
+    return "\n".join(lines[begin:end + 1])
+
+
+def extract_envelope(text: str) -> dict[str, Any] | None:
+    """The validated envelope carried by `text`, or None for a legacy task."""
+    block = envelope_block_text(text)
+    if block is None:
+        return None
+    body = "\n".join(block.split("\n")[1:-1])
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise EnvelopeError(f"envelope block is not valid JSON: {exc}") from exc
+    return validate_envelope(payload)
+
+
+def validate_envelope(payload: Any) -> dict[str, Any]:
+    """Schema check for a rendered envelope. Returns it, or raises."""
+    if not isinstance(payload, dict):
+        raise EnvelopeError("envelope must be a JSON object")
+    if payload.get("schema_version") != ENVELOPE_SCHEMA_VERSION:
+        raise EnvelopeError(f"unsupported envelope schema_version: {payload.get('schema_version')!r}")
+    expected = {"schema_version", *ENVELOPE_AXES}
+    if set(payload) != expected:
+        missing = sorted(expected - set(payload))
+        extra = sorted(set(payload) - expected)
+        raise EnvelopeError(f"envelope axes missing={missing} unexpected={extra}")
+    for axis in ENVELOPE_AXES:
+        _validate_axis(axis, payload[axis])
+    return payload
+
+
+def _validate_axis(axis: str, entry: Any) -> None:
+    if not isinstance(entry, dict):
+        raise EnvelopeError(f"envelope axis {axis} must be an object")
+    if set(entry) != ENVELOPE_AXIS_KEYS:
+        raise EnvelopeError(f"envelope axis {axis} keys must be exactly {sorted(ENVELOPE_AXIS_KEYS)}")
+    state = entry["state"]
+    if state not in ENVELOPE_STATES:
+        raise EnvelopeError(f"envelope axis {axis} has unknown state {state!r}")
+    if state == "unresolved":
+        # An unresolved axis takes the intake stop; it is never emitted.
+        raise EnvelopeError(f"envelope axis {axis} is unresolved and must not be emitted")
+    default_applied = entry["default_applied"]
+    if type(default_applied) is not bool:
+        raise EnvelopeError(f"envelope axis {axis} default_applied must be a boolean")
+    if default_applied and state != "semantically_silent":
+        raise EnvelopeError(f"envelope axis {axis} applies a default without being semantically_silent")
+    if state == "semantically_silent" and not default_applied:
+        raise EnvelopeError(f"envelope axis {axis} is semantically_silent without default_applied")
+    if axis == "task_owned_write_targets" and state != "declared":
+        raise EnvelopeError("task_owned_write_targets has no default and must be declared")
+    value = entry["value"]
+    source = entry["source"]
+    if axis == ENVELOPE_ENUM_AXIS:
+        if value != SCOPE_EXPANSION_USER_DECISION:
+            raise EnvelopeError(f"scope_expansion_policy must be {SCOPE_EXPANSION_USER_DECISION!r}")
+        if source not in ENVELOPE_MEMBER_SOURCES:
+            raise EnvelopeError(f"scope_expansion_policy has unknown source {source!r}")
+        return
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        raise EnvelopeError(f"envelope axis {axis} value must be a list of non-empty strings")
+    if len(set(value)) != len(value):
+        raise EnvelopeError(f"envelope axis {axis} value repeats a member")
+    if not isinstance(source, dict) or set(source) != set(value):
+        raise EnvelopeError(f"envelope axis {axis} source must name exactly its value members")
+    for member, provenance in source.items():
+        if provenance not in ENVELOPE_MEMBER_SOURCES:
+            raise EnvelopeError(f"envelope axis {axis} member {member!r} has unknown source {provenance!r}")
+    if state == "declared" and all(
+        provenance == ENVELOPE_SOURCE_DEFAULT for provenance in source.values()
+    ) and source:
+        raise EnvelopeError(f"envelope axis {axis} is declared but every member is a safe default")
+
+
+def allowed_outcomes(stage_outcomes: Any, envelope_present: bool) -> list[str]:
+    """The one derivation of allowed typed outcomes, shared by all consumers.
+
+    Prompt footer, `classify_result` and `inspect_retained` used to each build
+    this expression independently, which is how a footer, a classification and
+    a retained candidate drift apart. For an envelope task the reserved hold
+    outcome is allowed on every profile, including one that never declared it;
+    for a legacy task the profile's own outcomes are returned in unchanged
+    order, so the composed prompt bytes do not move.
+    """
+    names = list(stage_outcomes)
+    if envelope_present and HOLD_OUTCOME not in names:
+        names.append(HOLD_OUTCOME)
+    return names
+
+
+# ---------------------------------------------------------------------------
+# Repeat-review convergence (spec section 1.7).
+# ---------------------------------------------------------------------------
+
+CONVERGENCE_BEGIN = "<!--ORCH-CONVERGENCE-BEGIN-->"
+CONVERGENCE_END = "<!--ORCH-CONVERGENCE-END-->"
+CONVERGENCE_FIRST_KEYS = frozenset({"live", "resolved"})
+CONVERGENCE_REPEAT_KEYS = frozenset({"live", "resolved", "new", "repeated", "verdict"})
+CONVERGENCE_VERDICTS = ("improved", "stalled", "oscillating")
+
+
+class ConvergenceError(ValueError):
+    """A convergence record that is missing, malformed or self-contradicting."""
+
+
+def extract_convergence(output: str, *, repeat: bool | None = None) -> dict[str, Any]:
+    """The convergence record a branching-stage run must carry in its output.
+
+    `repeat` says which shape is required. `None` reads the record in whichever
+    shape it was written in, which is what reading a *prior* run's record needs:
+    whether that run was itself a repeat is not the current run's business.
+
+    Raises rather than guessing: every failure here routes to the engine hold,
+    so a prose, absent or self-describing record can never reach an ordinary
+    profile outcome.
+    """
+    begins = output.count(CONVERGENCE_BEGIN)
+    ends = output.count(CONVERGENCE_END)
+    if begins == 0 and ends == 0:
+        raise ConvergenceError("convergence record missing")
+    if begins != 1 or ends != 1:
+        raise ConvergenceError(f"convergence marker count is not exactly one pair (begin={begins}, end={ends})")
+    start = output.index(CONVERGENCE_BEGIN) + len(CONVERGENCE_BEGIN)
+    stop = output.index(CONVERGENCE_END)
+    if stop < start:
+        raise ConvergenceError("convergence end marker precedes its begin marker")
+    try:
+        record = json.loads(output[start:stop])
+    except json.JSONDecodeError as exc:
+        raise ConvergenceError(f"convergence record is not valid JSON: {exc}") from exc
+    if not isinstance(record, dict):
+        raise ConvergenceError("convergence record must be a JSON object")
+    keys = set(record)
+    if repeat is None:
+        repeat = "verdict" in keys
+    if repeat:
+        if keys != CONVERGENCE_REPEAT_KEYS:
+            raise ConvergenceError(
+                f"repeat review convergence keys must be exactly {sorted(CONVERGENCE_REPEAT_KEYS)}, got {sorted(keys)}"
+            )
+        if record["verdict"] not in CONVERGENCE_VERDICTS:
+            raise ConvergenceError(f"unknown convergence verdict {record['verdict']!r}")
+        for name in ("live", "resolved", "new", "repeated"):
+            _convergence_identities(record, name)
+    else:
+        if "verdict" in keys:
+            raise ConvergenceError("a first branching run must not carry a verdict")
+        if keys != CONVERGENCE_FIRST_KEYS:
+            raise ConvergenceError(
+                f"first branching run convergence keys must be exactly {sorted(CONVERGENCE_FIRST_KEYS)}, got {sorted(keys)}"
+            )
+        if _convergence_identities(record, "resolved"):
+            raise ConvergenceError("a first branching run must record an empty resolved set")
+        _convergence_identities(record, "live")
+    return record
+
+
+def _convergence_identities(record: dict[str, Any], name: str) -> set[str]:
+    value = record.get(name)
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ConvergenceError(f"convergence {name} must be a list of non-empty failure-scenario identities")
+    return set(value)
+
+
+def convergence_verdict(
+    prior_live: set[str], historical_resolved: set[str], current: set[str]
+) -> str:
+    """The section 1.7 rule: total, mutually exclusive, evaluated in order.
+
+    Total over every input including empty sets: an empty `prior_live` admits
+    no strict subset, so the rule assigns `stalled` and the run fails closed to
+    a user decision. That is the rule, not an exception.
+    """
+    if current & historical_resolved:
+        return "oscillating"
+    new = current - prior_live
+    if current < prior_live and not new:
+        return "improved"
+    return "stalled"
+
+
+def validate_convergence(
+    record: dict[str, Any], prior_live: set[str], historical_resolved: set[str]
+) -> str:
+    """Validate a repeat review's declared partition and verdict; return the verdict.
+
+    Runs before any verdict is accepted. Any inequality with the computed sets
+    or the computed verdict is contradictory and raises.
+    """
+    current = set(record["live"])
+    expected = {
+        "resolved": prior_live - current,
+        "repeated": prior_live & current,
+        "new": current - prior_live,
+    }
+    for name, computed in expected.items():
+        declared = set(record[name])
+        if declared != computed:
+            raise ConvergenceError(
+                f"declared {name}={sorted(declared)} contradicts computed {name}={sorted(computed)}"
+            )
+    verdict = convergence_verdict(prior_live, historical_resolved, current)
+    if record["verdict"] != verdict:
+        raise ConvergenceError(
+            f"declared verdict {record['verdict']!r} contradicts computed verdict {verdict!r}"
+        )
+    return verdict
+
+
 def prepare_containment(workspace: Path, log_path: Path) -> dict[str, str]:
     """Prepare worktree + git containment for one stage run; return the child env.
 
@@ -163,6 +464,25 @@ UNATTENDED_FLAGS = (
     "--approve-for-me",
 )
 PROVIDER_COMMAND_ENV = ("ORCH_CLAUDE_COMMAND", "ORCH_CODEX_COMMAND")
+
+
+def provider_command(owner: str) -> list[str]:
+    """The configured CLI invocation for one provider owner.
+
+    One derivation, so a stage run and the intake resolver cannot drift apart
+    on which binary, model or flags the operator actually configured.
+    """
+    if owner == "claude":
+        raw = os.environ.get("ORCH_CLAUDE_COMMAND", "claude -p")
+    elif owner == "codex":
+        raw = os.environ.get("ORCH_CODEX_COMMAND", "codex exec")
+    else:
+        raise ValueError(f"unsupported owner: {owner}")
+    command = shlex.split(raw)
+    if not command:
+        raise ValueError(f"empty command for owner {owner}")
+    return command
+
 
 UNATTENDED_CONSENT_MESSAGE = """refusing to start.
 
@@ -962,16 +1282,7 @@ class SubprocessRunner:
 
     @staticmethod
     def _command(owner: str) -> list[str]:
-        if owner == "claude":
-            raw = os.environ.get("ORCH_CLAUDE_COMMAND", "claude -p")
-        elif owner == "codex":
-            raw = os.environ.get("ORCH_CODEX_COMMAND", "codex exec")
-        else:
-            raise ValueError(f"unsupported owner: {owner}")
-        command = shlex.split(raw)
-        if not command:
-            raise ValueError(f"empty command for owner {owner}")
-        return command
+        return provider_command(owner)
 
     @staticmethod
     def _drain_pipe(

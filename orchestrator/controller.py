@@ -23,21 +23,28 @@ from .containment import (
 )
 from .db import connect
 from .profile import Profile, ProfileError, canonical_json, load_profile, profile_from_snapshot, sha256_bytes
-from .runner import ProviderPreflightResult, RunResult, SubprocessRunner, classify_result
+from .runner import (
+    CONVERGENCE_BEGIN,
+    CONVERGENCE_END,
+    HOLD_OUTCOME,
+    HOLD_STOP_REASON,
+    ConvergenceError,
+    EnvelopeError,
+    ProviderPreflightResult,
+    RunResult,
+    SubprocessRunner,
+    allowed_outcomes,
+    classify_result,
+    envelope_block_text,
+    extract_convergence,
+    extract_envelope,
+    validate_convergence,
+)
 from .retained import inspect_retained
 
 
 ACTIVE_STATUSES = {"queued", "running"}
 RESUMABLE_STATUSES = {"waiting_user", "paused", "blocked"}
-
-# Engine-reserved outcome name. A stage outcome spelled exactly HOLD_OUTCOME stops
-# the task at waiting_user instead of continuing, so a spec can hand a genuinely
-# irreducible decision back to the operator. The semantics live in the engine, not
-# in the task's profile snapshot, which is why the name is reserved: see
-# docs/decisions/propose-convergence-policy.md, "Engine reserved outcome names".
-# A profile that does not declare this outcome is unaffected bit-for-bit.
-HOLD_OUTCOME = "needs_user_decision"
-HOLD_STOP_REASON = "user_decision_required"
 
 
 def _protected_roots_support(run: Any) -> str:
@@ -262,6 +269,18 @@ class Controller:
                 },
             )
             input_text = self._read_verified_input(task_id)
+            try:
+                envelope = extract_envelope(input_text)
+            except EnvelopeError as exc:
+                # Framing is fail-closed on every read, not only at intake: the
+                # stage is already claimed, so record the stop as a blocked run
+                # rather than invoking a provider against an input whose
+                # authoritative region cannot be identified.
+                self._stop_claimed_run(
+                    task_id, run_token, profile, stage, log_path,
+                    "envelope_invalid", f"controller rejected envelope framing: {exc}",
+                )
+                return self.status(task_id)
             reports_dir, reports_location = self._reports_target_for(task)
             if reports_dir is not None:
                 try:
@@ -274,7 +293,12 @@ class Controller:
                     # elsewhere the provider CLI can create the directory or
                     # fail visibly in its own output.
                     pass
-            prompt = self._build_prompt(task_id, stage, input_text, reports_location)
+            convergence = (
+                self._convergence_context(task_id, stage, profile) if envelope is not None else None
+            )
+            prompt = self._build_prompt(
+                task_id, stage, input_text, reports_location, envelope, convergence
+            )
             try:
                 raw_result = self._invoke_runner(task, stage, prompt, log_path, reports_dir)
             except BaseException as exc:
@@ -286,10 +310,12 @@ class Controller:
             result = classify_result(
                 raw_result.exit_code,
                 raw_result.output,
-                set(stage.outcomes),
+                set(allowed_outcomes(stage.outcomes, envelope is not None)),
                 raw_result.timed_out,
                 source=raw_result,
             )
+            if convergence is not None:
+                result = self._apply_convergence(result, convergence)
             self.commit_run(task_id, run_token, result, profile)
             self._emit_event(
                 "stage_finished",
@@ -305,6 +331,43 @@ class Controller:
                     "timed_out": result.timed_out,
                 },
             )
+
+    def _stop_claimed_run(
+        self,
+        task_id: str,
+        run_token: str,
+        profile: Profile,
+        stage: Any,
+        log_path: Path,
+        reason: str,
+        message: str,
+    ) -> None:
+        """Close an already-claimed stage as blocked without invoking a provider.
+
+        A claimed stage cannot simply be abandoned — it would stay `running`
+        until orphan reconciliation — so the stop travels the ordinary
+        commit_run failure path, which seals a manifest and needs the log to
+        exist.
+        """
+        text = message + "\n"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(text)
+        self.commit_run(task_id, run_token, RunResult(None, text, None, "blocked", reason), profile)
+        self._emit_event(
+            "stage_finished",
+            {
+                "task_id": task_id,
+                "run_token": run_token,
+                "stage": stage.name,
+                "owner": stage.owner,
+                "classification": "blocked",
+                "reason": reason,
+                "outcome": None,
+                "exit_code": None,
+                "timed_out": False,
+            },
+        )
 
     def _reports_target_for(self, task: sqlite3.Row) -> tuple[Path | None, str]:
         """(path the runner should allowlist or None, location line for the prompt).
@@ -611,6 +674,61 @@ class Controller:
 
             outcome = result.outcome
             assert outcome is not None
+            if outcome == HOLD_OUTCOME and self._envelope_for_task(task) is not None:
+                # Before the outcome-to-target lookup and before the edge-cap
+                # test, so a profile that never declared this outcome is fully
+                # served and a held task neither consumes an edge nor loses its
+                # stage. `stage.outcomes[outcome]` below would raise KeyError
+                # for exactly those profiles (E-10).
+                self.conn.execute(
+                    """UPDATE stage_runs SET status='committed',exit_code=?,outcome=?,ended_at=?,
+                       duration_ms=?,model=?,usage_input_tokens=?,usage_output_tokens=?,
+                       usage_total_tokens=?,usage_unavailable_reason=?,manifest_path=?,manifest_hash=?,sealed=1
+                       WHERE run_token=?""",
+                    (
+                        result.exit_code,
+                        outcome,
+                        now,
+                        duration_ms,
+                        result.model or run["model"] or "unspecified",
+                        result.usage_input_tokens,
+                        result.usage_output_tokens,
+                        result.usage_total_tokens,
+                        self._usage_unavailable_reason(result),
+                        str(manifest_path),
+                        manifest_hash,
+                        run_token,
+                    ),
+                )
+                seq = self._insert_transition(
+                    task_id,
+                    str(uuid.uuid4()),
+                    run_token,
+                    stage.name,
+                    stage.owner,
+                    None,
+                    outcome,
+                    "running",
+                    "waiting_user",
+                    HOLD_STOP_REASON,
+                )
+                updated = self.conn.execute(
+                    """UPDATE tasks SET status='waiting_user',stop_reason=?,lease_token=NULL,
+                       revision=revision+1,updated_at=? WHERE id=? AND revision=? AND lease_token=?""",
+                    (HOLD_STOP_REASON, now, task_id, task["revision"], run["lease_token"]),
+                )
+                if updated.rowcount != 1:
+                    raise ControllerError("commit_run CAS conflict")
+                self._notify(
+                    task_id,
+                    seq,
+                    HOLD_STOP_REASON,
+                    f"task {task_id} waiting_user: user decision required ({result.reason})",
+                )
+                self._write_evidence_index(task_id)
+                self.conn.execute("COMMIT")
+                return
+
             target_name = stage.outcomes[outcome]
             target = profile.stage(target_name)
             edge = profile.edge_id(stage.name, outcome)
@@ -821,6 +939,154 @@ class Controller:
 
     def _profile_for(self, task: sqlite3.Row) -> Profile:
         return profile_from_snapshot(Path(task["profile_snapshot_path"]), task["profile_hash"])
+
+    # -- Interpretation envelope: repeat-review convergence (spec section 1.7) --
+
+    @staticmethod
+    def _stage_arity(profile: Profile, stage_name: str) -> str:
+        """branching, correction, or neither, derived from the profile snapshot.
+
+        E-12's definitions verbatim: a branching stage is a non-terminal stage
+        with more than one outcome, a correction stage a non-terminal stage
+        with exactly one. Nothing is added to the profile schema to say so.
+        """
+        try:
+            stage = profile.stage(stage_name)
+        except (ProfileError, KeyError):
+            return "neither"
+        if stage.terminal:
+            return "neither"
+        count = len(stage.outcomes or {})
+        if count > 1:
+            return "branching"
+        if count == 1:
+            return "correction"
+        return "neither"
+
+    def _committed_run_history(self, task_id: str) -> list[dict[str, Any]]:
+        """The task's committed run history, totally ordered by commit sequence."""
+        rows = self.conn.execute(
+            """SELECT t.seq AS seq, t.run_token AS run_token, t.stage AS stage,
+                      r.manifest_path AS manifest_path, r.manifest_hash AS manifest_hash
+               FROM transitions t JOIN stage_runs r ON r.run_token = t.run_token
+               WHERE t.task_id=? AND r.status='committed' ORDER BY t.seq""",
+            (task_id,),
+        )
+        return [dict(row) for row in rows]
+
+    def _read_sealed_convergence(self, run: dict[str, Any]) -> dict[str, Any]:
+        """A prior branching run's convergence record, read through its seal.
+
+        The record lives in the run's own provider output, which
+        `_seal_run_manifest` already writes as `<log>.output.txt` under
+        `output_hash`; both hashes are re-verified here, so an edited output
+        is unreadable rather than quietly authoritative.
+        """
+        manifest_path = run.get("manifest_path")
+        manifest_hash = run.get("manifest_hash")
+        if not manifest_path or not manifest_hash:
+            raise ConvergenceError(f"run {run['run_token']} is not sealed")
+        self._verify_file(Path(manifest_path), manifest_hash, "prior run manifest")
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        output_path = manifest.get("output_path")
+        output_hash = manifest.get("output_hash")
+        if not output_path or not output_hash:
+            raise ConvergenceError(f"run {run['run_token']} manifest names no sealed output")
+        self._verify_file(Path(output_path), output_hash, "prior run output")
+        output = Path(output_path).read_text(encoding="utf-8", errors="replace")
+        return extract_convergence(output)
+
+    def _convergence_context(self, task_id: str, stage: Any, profile: Profile) -> dict[str, Any] | None:
+        """What section 1.7 needs about this run, or None if it is not branching."""
+        if self._stage_arity(profile, stage.name) != "branching":
+            return None
+        history = self._committed_run_history(task_id)
+        arities = [(run, self._stage_arity(profile, run["stage"])) for run in history]
+        branching = [(index, run) for index, (run, arity) in enumerate(arities) if arity == "branching"]
+        correction_at = [index for index, (_, arity) in enumerate(arities) if arity == "correction"]
+        # A committed branching run qualifies iff at least one committed
+        # correction run lies between it and now; the prior branching run is
+        # the last qualifying one, whatever the history's shape.
+        qualifying = [
+            (index, run) for index, run in branching
+            if any(correction > index for correction in correction_at)
+        ]
+        context: dict[str, Any] = {
+            "repeat": bool(qualifying),
+            "prior_live": set(),
+            "historical_resolved": set(),
+            "prior_stage": None,
+            "prior_run_token": None,
+            "corrections_between": [],
+            "error": None,
+        }
+        if not qualifying:
+            return context
+        prior_index, prior = qualifying[-1]
+        context["prior_stage"] = prior["stage"]
+        context["prior_run_token"] = prior["run_token"]
+        context["corrections_between"] = [
+            history[index]["stage"] for index in correction_at if index > prior_index
+        ]
+        try:
+            context["prior_live"] = set(self._read_sealed_convergence(prior)["live"])
+            resolved: set[str] = set()
+            for _, run in branching:
+                resolved |= set(self._read_sealed_convergence(run).get("resolved") or [])
+            context["historical_resolved"] = resolved
+        except (ConvergenceError, ControllerError, OSError, ValueError) as exc:
+            context["error"] = f"prior convergence record unreadable: {exc}"
+        return context
+
+    def _apply_convergence(self, result: RunResult, convergence: dict[str, Any]) -> RunResult:
+        """Validate the convergence record before the typed outcome is accepted.
+
+        Every failure — an unreadable prior, a missing, malformed or
+        contradicting current record, and a `stalled` or `oscillating` verdict
+        — becomes the reserved hold outcome, which commit_run short-circuits
+        before the outcome-to-target lookup and before the edge-cap test. The
+        caps stay cost failsafes; they are not the convergence signal.
+
+        The record obligation itself is unconditional (E-13), so a run that
+        prints the reserved hold outcome directly is checked too: it is still a
+        committed branching run, and accepting it without a record would leave
+        a later repeat review with no baseline to be scored against.
+        """
+        if result.classification != "success":
+            return result
+
+        def hold(reason: str) -> RunResult:
+            return replace(result, outcome=HOLD_OUTCOME, classification="success", reason=reason)
+
+        if convergence["error"]:
+            return hold(f"convergence_unverifiable: {convergence['error']}")
+        try:
+            record = extract_convergence(result.output, repeat=convergence["repeat"])
+        except ConvergenceError as exc:
+            return hold(f"convergence_record_invalid: {exc}")
+        if not convergence["repeat"]:
+            return result
+        try:
+            verdict = validate_convergence(
+                record, convergence["prior_live"], convergence["historical_resolved"]
+            )
+        except ConvergenceError as exc:
+            return hold(f"convergence_contradictory: {exc}")
+        if result.outcome == HOLD_OUTCOME:
+            # E-13 binds every branching run, so the record obligation above is
+            # checked for a directly printed hold too; the verdict below only
+            # decides whether an *ordinary* outcome may continue, so the
+            # provider's own hold reason is kept rather than restated.
+            return result
+        if verdict != "improved":
+            return hold(f"convergence_{verdict}")
+        return result
+
+    def _envelope_for_task(self, task: sqlite3.Row) -> dict[str, Any] | None:
+        """Envelope presence, read from the hash-verified input snapshot."""
+        snapshot = Path(task["input_snapshot_path"])
+        self._verify_file(snapshot, task["input_hash"], "input snapshot")
+        return extract_envelope(snapshot.read_text(encoding="utf-8"))
 
     def _read_verified_input(self, task_id: str) -> str:
         task = self._task(task_id)
@@ -1110,16 +1376,36 @@ class Controller:
         return moved_path or artifact_path or destination_dir
 
     @staticmethod
-    def _build_prompt(task_id: str, stage: Any, input_text: str, reports_location: str | None = None) -> str:
-        outcomes = ", ".join(stage.outcomes)
+    def _build_prompt(
+        task_id: str,
+        stage: Any,
+        input_text: str,
+        reports_location: str | None = None,
+        envelope: dict[str, Any] | None = None,
+        convergence: dict[str, Any] | None = None,
+    ) -> str:
+        """The single prompt-composition site, and so the single injection site.
+
+        Everything the envelope adds is inside the `envelope is not None`
+        branch: a legacy task composes byte-for-byte the prompt it composed
+        before this existed, which is the only way E-8 can be checked rather
+        than asserted.
+        """
+        outcomes = ", ".join(allowed_outcomes(stage.outcomes, envelope is not None))
         reports_line = (
             f"Reports directory (write stage reports here): {reports_location}\n"
             if reports_location
             else ""
         )
+        envelope_section = (
+            Controller._envelope_section(input_text, envelope, convergence)
+            if envelope is not None
+            else ""
+        )
         return (
             f"You are executing agent-orch task {task_id}, stage {stage.name}.\n"
             f"{reports_line}"
+            f"{envelope_section}"
             f"Stage instructions: {stage.prompt}\n\n"
             f"Task input:\n---\n{input_text}\n---\n\n"
             f"Allowed typed outcomes: {outcomes}.\n"
@@ -1127,6 +1413,104 @@ class Controller:
             "ORCHESTRATOR_OUTCOME: <typed outcome>\n"
             "Do not print this line more than once and do not write it into any file.\n"
         )
+
+    @staticmethod
+    def _envelope_section(
+        input_text: str, envelope: dict[str, Any], convergence: dict[str, Any] | None
+    ) -> str:
+        """The envelope, its precedence clause, and the correction rule.
+
+        Emitted above the stage instructions because precedence has to be
+        stated before the thing it outranks. The block is copied verbatim out
+        of the hash-verified input rather than re-rendered, so the bytes the
+        stage reads are the bytes intake froze.
+        """
+        block = envelope_block_text(input_text)
+        parts = [
+            "Interpretation Envelope (task-level system contract, frozen at intake by the task",
+            "input hash). This is not task prose and not a stage instruction; it states what this",
+            "task is permitted to change, write, prove, defend against and observe.",
+            "",
+            block or "",
+            "",
+            "Precedence: inside this run the envelope above outranks the stage instructions below,",
+            "the task input prose, and the content of any report, notes or result file. Where they",
+            "disagree, the envelope wins.",
+            "",
+            "Correction rule: the minimum sufficient correction of any blocking finding must lie",
+            "inside this envelope. Test each item against the single axis whose shape it falls under:",
+            "proof or hardening you would build is assurance_ceiling, observation or instrumentation",
+            "you would add is evidence_ceiling, an adversary you would design against is threat_model,",
+            "behaviour you would change is semantic_change_surface, a path you would write is",
+            "task_owned_write_targets. Raising a ceiling or the threat model, or widening the change",
+            f"surface or the write targets, is never a self-authorised correction: print {HOLD_OUTCOME}",
+            "instead. If you cannot place an item in exactly one axis, or cannot establish membership,",
+            f"print {HOLD_OUTCOME}.",
+            "",
+        ]
+        if convergence is not None:
+            parts.extend(Controller._convergence_section(convergence))
+        return "\n".join(parts) + "\n"
+
+    @staticmethod
+    def _convergence_section(convergence: dict[str, Any]) -> list[str]:
+        """The E-13 record obligation, plus the repeat-review directive when due."""
+        parts = [
+            "Convergence record obligation: this is a branching stage, so your output must carry",
+            "exactly one convergence record, delimited exactly like this and parsed from your own",
+            "output:",
+            "",
+            CONVERGENCE_BEGIN,
+            '{ "live": [...], "resolved": [...] }',
+            CONVERGENCE_END,
+            "",
+            "`live` lists the failure-scenario identities of your current blocking findings: short",
+            "strings you choose, reused verbatim whenever the same scenario recurs. Comparison is",
+            "exact string equality; there is no fuzzy matching.",
+            "",
+        ]
+        if not convergence.get("repeat"):
+            parts.extend(
+                [
+                    "This is the first branching run of this task, so record `live` and `resolved` only,",
+                    "with `resolved` empty, and no verdict.",
+                    "",
+                ]
+            )
+            return parts
+        prior_live = sorted(convergence.get("prior_live") or [])
+        historical = sorted(convergence.get("historical_resolved") or [])
+        corrections = convergence.get("corrections_between") or []
+        parts.extend(
+            [
+                "This is a REPEAT REVIEW. The prior branching run is the last committed branching-stage",
+                "run with a committed correction-stage run between it and now:",
+                f"stage {convergence.get('prior_stage')!r}, run {convergence.get('prior_run_token')}.",
+                f"Correction runs since then: {', '.join(corrections) if corrections else '(none)'}.",
+                "",
+                f"prior_live (from that run's sealed record): {json.dumps(prior_live, ensure_ascii=False)}",
+                f"historical_resolved (union over every earlier branching run): "
+                f"{json.dumps(historical, ensure_ascii=False)}",
+                "",
+                "Record all five keys:",
+                "",
+                CONVERGENCE_BEGIN,
+                '{ "live": [...], "resolved": [...], "new": [...], "repeated": [...],',
+                '  "verdict": "improved" | "stalled" | "oscillating" }',
+                CONVERGENCE_END,
+                "",
+                "with resolved = prior_live \\ live, repeated = prior_live ∩ live, new = live \\ prior_live,",
+                "and the verdict from this total rule, in order: live ∩ historical_resolved non-empty →",
+                "oscillating; otherwise live a strict subset of prior_live with new empty → improved;",
+                "otherwise stalled.",
+                "",
+                "The engine recomputes all four before accepting your typed outcome. A missing, malformed",
+                f"or contradicting record, and a verdict of stalled or oscillating, all end this run at",
+                f"{HOLD_OUTCOME} regardless of the outcome you print.",
+                "",
+            ]
+        )
+        return parts
 
     @staticmethod
     def _atomic_write(path: Path, data: bytes) -> None:
