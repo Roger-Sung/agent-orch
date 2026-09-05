@@ -142,6 +142,30 @@ class ProfileValidationTests(unittest.TestCase):
         self.assertEqual(profiles["artifact_validation.yaml"].stages["validate"].owner, "claude")
         self.assertEqual(profiles["artifact_validation.yaml"].stages["review"].owner, "codex")
 
+    def test_stop_gate_reuses_only_valid_final_candidate_evidence(self):
+        prompts = [
+            load_profile(ROOT / "orchestrator" / "profiles" / name).stages["review"].prompt
+            for name in ("stop_gate_codex.yaml", "stop_gate_claude.yaml")
+        ]
+        for prompt in prompts:
+            with self.subTest(owner=prompt.split()[8]):
+                self.assertIn("## Final-candidate evidence", prompt)
+                self.assertIn("Recompute the current candidate fingerprint", prompt)
+                self.assertIn("the exact verification command", prompt)
+                self.assertIn("a successful result", prompt)
+                self.assertIn("a named owner", prompt)
+                self.assertIn("do not rerun that exact expensive command", prompt)
+                self.assertIn("Missing, stale", prompt)
+                self.assertIn("run only the required checks not covered", prompt)
+                self.assertIn("DEFERRED with an explicit command, owner", prompt)
+
+        normalized = [prompt.replace("Claude", "PROVIDER").replace("Codex", "PROVIDER") for prompt in prompts]
+        self.assertEqual(normalized[0], normalized[1])
+        self.assertEqual(
+            [load_profile(path).stages["review"].timeout for path in TRACKED_PROFILES[-5:-3]],
+            [600, 600],
+        )
+
 
 class ClassificationTests(unittest.TestCase):
     def test_explicit_rate_limit_signature_pauses(self):
