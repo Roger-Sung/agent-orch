@@ -22,7 +22,7 @@
 
 ## 證據
 
-- 342 個引擎測試與 13 個去識別化掃描器測試，CI 在 Linux 與 macOS 上執行；引擎測試包含圍堵層的驗收測試，需要 macOS `sandbox-exec` 的 L1 測試在沒有它的主機上會跳過。
+- 426 個引擎測試與 13 個去識別化掃描器測試，CI 在 Linux 與 macOS 上執行；引擎測試包含圍堵層的驗收測試，需要 macOS `sandbox-exec` 的 L1 測試在沒有它的主機上會跳過。
 - 每個已提交的階段執行都留下封存的 manifest（daemon 中途死掉的執行只會標記 blocked 並補 log，不封存）；`python3 -m orchestrator containment-inspect TASK_ID` 以唯讀連線重新驗證保留的證據。
 - CI 只跑部分去識別化掃描——嚴格規則需要的站點字串刻意不進 repo。綠色 badge 代表測試通過且 repo 端規則沒有發現問題；嚴格掃描是發佈者的責任，見 [`docs/operating.md`](docs/operating.md)。
 
