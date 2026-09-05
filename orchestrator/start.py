@@ -1611,26 +1611,6 @@ def _grounded(quote: str, blob: str) -> bool:
     return bool(normalised) and normalised in blob
 
 
-def _carried_by(member: str, quote: str) -> bool:
-    """Does the quoted source span actually contain this member?
-
-    Exact source-span grounding, and only that. Grounding a quote is not
-    grounding a member: a genuine sentence from the sources says nothing about
-    a requirement invented next to it, so every declared member has to occur in
-    the very text offered as its evidence.
-
-    What this deliberately does *not* do is read the span. Whether the span
-    authorises the member or forbids it — polarity, negation, a read-only
-    reference, an ambiguous authorisation — is ordinary natural language, and
-    the resolver is this engine's single semantic interpreter for it
-    (`_resolver_prompt`). A second, deterministic natural-language reader here
-    would be a keyword list pretending to be a parser: strong enough to look
-    like a guarantee, weak enough to miss the next phrasing, and impossible to
-    keep honest across the languages operators actually write in.
-    """
-    return _normalise_for_grounding(member) in _normalise_for_grounding(quote)
-
-
 #: A token in the sources that could be a repository path. Deliberately
 #: inclusive: it decides only whether the sources are *silent* about paths, and
 #: an over-inclusive match costs a stop, never an unearned authorisation.
@@ -1757,10 +1737,11 @@ def _resolver_prompt(sources: list[tuple[str, str]]) -> str:
             "- \"value\": a list of short strings, or \"user_decision\" for scope_expansion_policy. "
             "Use [] when the state is \"unresolved\".\n"
             "- \"evidence\": one verbatim quote from the sources per declared member, in the same "
-            "order as \"value\"; [] otherwise. Each quote must contain the member it is offered "
-            "for: a genuine sentence that says nothing about the member is not evidence. A "
-            "write-target quote must contain the path itself and must not be a quote that "
-            "forbids writing it or calls it read-only.\n"
+            "order as \"value\"; [] otherwise. Each quote must be the span that asserts the "
+            "member it is offered for. A faithful summary of that span is a valid member, in "
+            "your own words or in another language than the span; a genuine sentence that does "
+            "not assert the member is not evidence. A write-target quote must not be a quote "
+            "that forbids writing it or calls it read-only.\n"
             "- \"detail\": for \"unresolved\", one sentence naming the conflicting or unrecognised "
             "text; otherwise \"\".\n"
             "When task_owned_write_targets is \"unresolved\" you may add a top-level "
@@ -1818,6 +1799,108 @@ def _resolver_environment(env: dict[str, str] | None = None) -> dict[str, str]:
         for key, value in source.items()
         if key in RESOLVER_ENV_ALLOW_NAMES or key.startswith(RESOLVER_ENV_ALLOW_PREFIXES)
     }
+
+
+#: Seconds `--help` gets to answer. The capability probe is an operator-invoked
+#: read, not a stage, so a hung CLI must report rather than block.
+RESOLVER_CAPABILITY_TIMEOUT_SECONDS = 5
+
+
+@dataclass(frozen=True)
+class ResolverIsolationSupport:
+    """What the installed resolver CLI says about the isolation options.
+
+    `missing` is what an operator has to act on; `verified` separates "the CLI
+    answered and these options are absent" from "the CLI never answered, so
+    treat all of them as unproven". Both land as a `fail`, but only the second
+    one is a wiring problem rather than a CLI release renaming its options.
+    """
+
+    #: The argv actually run, or empty when the command could not be derived.
+    command: tuple[str, ...]
+    missing: tuple[str, ...]
+    verified: bool
+    #: Why, verbatim enough for the operator to restate without reading source.
+    detail: str
+
+
+def resolver_isolation_option_names() -> tuple[str, ...]:
+    """The option names inside `RESOLVER_ISOLATION_FLAGS`, without their values."""
+    return tuple(item for item in RESOLVER_ISOLATION_FLAGS if item.startswith("--"))
+
+
+def resolver_isolation_support() -> ResolverIsolationSupport:
+    """Ask the installed resolver CLI whether the isolation options still exist.
+
+    `_resolver_command` assumes four Claude CLI options are real. Nothing else
+    ever checks, so a silent rename would fail every intake with a provider
+    exit code instead of a statement about which capability vanished. This asks
+    once, read-only, and is called only from `orch doctor` — never from intake,
+    `claim_stage`, `commit_run` or the daemon loop.
+
+    The whole configured invocation is probed, prefix, wrapper, interpreter and
+    flags intact, with `--help` appended where the resolver appends its own
+    flags: with `ORCH_CLAUDE_COMMAND="/usr/bin/python3 /opt/claude-wrapper.py"`
+    the thing asked about its options is the wrapper, not the interpreter.
+    Every failure returns the options as unverified with the reason; nothing
+    raises into the caller.
+    """
+    options = resolver_isolation_option_names()
+    try:
+        configured = list(provider_command(RESOLVER_OWNER))
+    except ValueError as exc:
+        return ResolverIsolationSupport(
+            (),
+            options,
+            False,
+            f"the configured provider command for the {RESOLVER_OWNER!r} intake resolver is "
+            f"unusable: {exc}",
+        )
+    command = tuple(configured) + ("--help",)
+    with tempfile.TemporaryDirectory(prefix="orch-resolver-capability-") as sandbox:
+        try:
+            completed = subprocess.run(
+                list(command),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=RESOLVER_CAPABILITY_TIMEOUT_SECONDS,
+                check=False,
+                cwd=sandbox,
+                env=_resolver_environment(),
+            )
+        except FileNotFoundError as exc:
+            return ResolverIsolationSupport(command, options, False, f"intake resolver CLI is unavailable: {exc}")
+        except OSError as exc:
+            return ResolverIsolationSupport(
+                command, options, False, f"intake resolver CLI could not be started: {exc}"
+            )
+        except subprocess.TimeoutExpired:
+            return ResolverIsolationSupport(
+                command,
+                options,
+                False,
+                f"`--help` did not answer within {RESOLVER_CAPABILITY_TIMEOUT_SECONDS}s",
+            )
+    if completed.returncode != 0:
+        tail = (completed.stdout or "").strip()[-400:]
+        return ResolverIsolationSupport(
+            command,
+            options,
+            False,
+            f"`--help` exited {completed.returncode}: {tail or '(no output)'}",
+        )
+    text = completed.stdout or ""
+    # Word-boundary rather than plain substring, so `--tools` is not reported
+    # present because the help text happens to mention `--toolsomething`.
+    missing = tuple(option for option in options if not re.search(re.escape(option) + r"\b", text))
+    return ResolverIsolationSupport(
+        command,
+        missing,
+        True,
+        f"{len(options) - len(missing)} of {len(options)} isolation option(s) present in `--help`",
+    )
 
 
 def _invoke_resolver(prompt: str) -> str:
@@ -2066,31 +2149,22 @@ def _axis_from_proposal(
             raise EnvelopeResolverError(
                 f"proposed {axis} member {member!r} quotes {quote!r}, which is not verbatim in the sources"
             )
+    # A member is the resolver's reading of the span quoted for it, and only
+    # the span has to be the operator's own words. Requiring the member to
+    # occur lexically inside its own quote made every faithful summary — and
+    # every faithful mapping from a described change to the path that carries
+    # it — fail closed, which is what took tasks `d73d31a3` and `6b84744d` to
+    # `waiting_user` on genuine, verbatim evidence. Semantic mapping is the
+    # resolver's responsibility (`_resolver_prompt`); what stays deterministic
+    # here is that the quote itself is verbatim in the sources, checked above.
     if axis != ENVELOPE_WRITE_AXIS:
-        for member, quote in zip(members, quotes):
-            # A genuine quote is not evidence for a requirement it does not
-            # carry. Without this, an invented member paired with any real
-            # sentence from the sources would freeze into the envelope as a
-            # declared requirement the operator never wrote.
-            if not _carried_by(member, quote):
-                raise EnvelopeResolverError(
-                    f"proposed {axis} member {member!r} is not carried by the source text quoted "
-                    f"for it ({quote!r}), so the sources do not declare it"
-                )
         return EnvelopeAxis(
             "declared", members, False, {member: ENVELOPE_SOURCE_REQUIREMENT for member in members}
         )
 
     targets: list[str] = []
-    for member, quote in zip(members, quotes):
-        if not _carried_by(member, quote):
-            # The path's authority has to be in the quote, not merely near it.
-            return EnvelopeAxis(
-                "unresolved", None, False, None,
-                f"the write target {member!r} is not carried by the source text quoted for it, so "
-                "the sources do not authorise writing it",
-            )
-        # Whether that span authorises the path or forbids it is the resolver's
+    for member in members:
+        # Whether the quoted span authorises the path or forbids it is the resolver's
         # judgement, made once, in the one place this engine reads prose. The
         # prompt requires `unresolved` for a negated, read-only or otherwise
         # ambiguous reference, and a reply that ignores that is a resolver

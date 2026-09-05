@@ -236,10 +236,23 @@ class DoctorTests(unittest.TestCase):
                 report = run_doctor(Path(directory) / "home")
         names = {item["check"] for item in report["checks"]}
         self.assertLessEqual(
-            {"orch_home", "provider_claude", "provider_codex", "l1_sandbox", "l2_protected_roots"}, names
+            {
+                "orch_home",
+                "provider_claude",
+                "provider_codex",
+                "resolver_isolation",
+                "l1_sandbox",
+                "l2_protected_roots",
+            },
+            names,
         )
         by_name = {item["check"]: item for item in report["checks"]}
         self.assertEqual(by_name["provider_claude"]["status"], "fail")
+        # An absent resolver CLI proves nothing about its option surface, so
+        # the four isolation options are reported unverified rather than
+        # quietly assumed.
+        self.assertEqual(by_name["resolver_isolation"]["status"], "fail")
+        self.assertIn("unverified", by_name["resolver_isolation"]["detail"])
         self.assertEqual(by_name["l2_protected_roots"]["status"], "warn")
         self.assertGreaterEqual(report["summary"]["fail"], 2)
 

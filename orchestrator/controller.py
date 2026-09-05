@@ -551,7 +551,21 @@ class Controller:
             if stage.terminal:
                 raise ControllerError(f"queued task points at terminal stage {stage.name}")
             allowance = task["resume_allowance"]
-            if task["transitions_count"] >= task["max_transitions"] and not allowance:
+            # For an envelope task whose frozen profile graph can actually
+            # score its own loops, convergence is the gate and the legacy caps
+            # only observe: the counter keeps counting past `max_transitions`
+            # and stays readable in `orch status`, but it no longer rejects.
+            # Both conjuncts are read from this task's own frozen snapshots, so
+            # a task submitted before this release and resumed after it meets
+            # exactly the same test as a new one.
+            envelope_uncapped = (
+                self._envelope_for_task(task) is not None and self._gate_reachable(profile)
+            )
+            if (
+                task["transitions_count"] >= task["max_transitions"]
+                and not allowance
+                and not envelope_uncapped
+            ):
                 self._stop_for_cap(task, "transition_cap", f"max_transitions={task['max_transitions']} reached")
                 self.conn.execute("COMMIT")
                 return None
@@ -674,7 +688,11 @@ class Controller:
 
             outcome = result.outcome
             assert outcome is not None
-            if outcome == HOLD_OUTCOME and self._envelope_for_task(task) is not None:
+            # One hash-verified read of the frozen input per commit, used by
+            # both the hold short-circuit below and the edge-cap test further
+            # down. Hold routing stays keyed on envelope presence alone.
+            envelope_present = self._envelope_for_task(task) is not None
+            if outcome == HOLD_OUTCOME and envelope_present:
                 # Before the outcome-to-target lookup and before the edge-cap
                 # test, so a profile that never declared this outcome is fully
                 # served and a held task neither consumes an edge nor loses its
@@ -737,7 +755,13 @@ class Controller:
             ).fetchone()
             if not edge_row:
                 raise ControllerError(f"missing seeded edge counter: {edge}")
-            edge_cap_hit = edge_row["count"] >= edge_row["cap"]
+            # Same lift as the transition cap: for an envelope task on a
+            # gate-reachable profile the edge counter counts without gating, so
+            # `edge_counts.count` may exceed `cap` and the count stays
+            # observable rather than becoming the stop condition.
+            edge_cap_hit = edge_row["count"] >= edge_row["cap"] and not (
+                envelope_present and self._gate_reachable(profile)
+            )
             next_status = target.terminal or "queued"
             stop_reason = None
             if edge_cap_hit:
@@ -962,6 +986,87 @@ class Controller:
         if count == 1:
             return "correction"
         return "neither"
+
+    @staticmethod
+    def _reachable_stages(profile: Profile) -> set[str]:
+        """The stages an execution of this profile can actually enter."""
+        seen: set[str] = set()
+        frontier = [profile.initial_stage]
+        while frontier:
+            name = frontier.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            try:
+                stage = profile.stage(name)
+            except (ProfileError, KeyError):
+                continue
+            frontier.extend(target for target in (stage.outcomes or {}).values())
+        return seen
+
+    @staticmethod
+    def _has_cycle(profile: Profile, nodes: set[str]) -> bool:
+        """Is there a cycle inside this node set? Iterative three-colour DFS.
+
+        Edges leaving the set are ignored, so removing a node removes every
+        cycle that ran through it — which is the whole point: what survives the
+        removal is exactly what never needed the removed kind of stage.
+        """
+        def successors(name: str) -> list[str]:
+            try:
+                stage = profile.stage(name)
+            except (ProfileError, KeyError):
+                return []
+            return [target for target in (stage.outcomes or {}).values() if target in nodes]
+
+        WHITE, GREY, BLACK = 0, 1, 2
+        colour = dict.fromkeys(nodes, WHITE)
+        for root in sorted(nodes):
+            if colour[root] != WHITE:
+                continue
+            colour[root] = GREY
+            stack: list[tuple[str, list[str]]] = [(root, successors(root))]
+            while stack:
+                name, pending = stack[-1]
+                if not pending:
+                    colour[name] = BLACK
+                    stack.pop()
+                    continue
+                target = pending.pop()
+                if colour[target] == GREY:
+                    return True
+                if colour[target] == WHITE:
+                    colour[target] = GREY
+                    stack.append((target, successors(target)))
+        return False
+
+    def _gate_reachable(self, profile: Profile) -> bool:
+        """Can convergence score every loop this profile can enter?
+
+        `_convergence_context` scores a *repeat* branching run: one with a
+        committed correction-arity run between it and the previous branching
+        run. So a cycle is only gated if it carries both arities. Two shapes
+        break that and would loop for ever once the caps stop rejecting — a
+        cycle of single-outcome stages, which reaches no branching stage at
+        all, and a cycle with no correction stage (`review --again--> review`,
+        or a branching-only multi-stage cycle), which reaches the gate but
+        never satisfies the repeat predicate, so every visit files another
+        first-run record and no strict-subset comparison ever runs.
+
+        This is that repeat predicate read off the frozen graph: drop the
+        correction stages and require what remains acyclic (every cycle
+        carries a correction), then drop the branching stages and require the
+        same (every cycle carries a branching stage). Static, linear in the
+        graph, and pure: no cycle enumeration, no stored state, and no number.
+        A profile that fails the proof keeps the caps that already ship.
+        """
+        reachable = self._reachable_stages(profile)
+        arity = {name: self._stage_arity(profile, name) for name in reachable}
+        without_correction = {name for name in reachable if arity[name] != "correction"}
+        if self._has_cycle(profile, without_correction):
+            return False
+        without_branching = {name for name in reachable if arity[name] != "branching"}
+        return not self._has_cycle(profile, without_branching)
 
     def _committed_run_history(self, task_id: str) -> list[dict[str, Any]]:
         """The task's committed run history, totally ordered by commit sequence."""
@@ -1446,6 +1551,18 @@ class Controller:
             f"surface or the write targets, is never a self-authorised correction: print {HOLD_OUTCOME}",
             "instead. If you cannot place an item in exactly one axis, or cannot establish membership,",
             f"print {HOLD_OUTCOME}.",
+            "",
+            "Blocking-finding rule: every blocking finding you record this round must name the single",
+            "envelope axis it falls under AND state, in its simplest sufficient correction, that the",
+            "correction lies inside all five set axes — semantic_change_surface,",
+            "task_owned_write_targets, assurance_ceiling, threat_model and evidence_ceiling — naming",
+            "each one, not only the axis you filed it under. A finding whose smallest sufficient",
+            "correction would raise a ceiling, widen the semantic change surface or the write targets,",
+            "or require evidence beyond the evidence ceiling — on any of the five, including one it was",
+            "not filed under — is not a blocking finding for automatic repair: print",
+            f"{HOLD_OUTCOME} and leave the finding recorded with the expansion it would require.",
+            "A containment statement you cannot make for all five set axes is itself an expansion,",
+            "and takes the same route.",
             "",
         ]
         if convergence is not None:

@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import orchestrator.start
 from orchestrator.controller import Controller
+from orchestrator.doctor import run_doctor
 from orchestrator.retained import inspect_retained
 from orchestrator.runner import (
     CONVERGENCE_BEGIN,
@@ -53,6 +54,8 @@ from orchestrator.start import (
     RESOLVER_VARIADIC_FLAGS,
     EnvelopeResolverError,
     StartFlags,
+    resolver_isolation_option_names,
+    resolver_isolation_support,
     _resolver_command,
     _resolver_environment,
     _read_yaml,
@@ -70,6 +73,7 @@ from orchestrator.tests.envelope_resolver_stub import scripted_reply
 ROOT = Path(__file__).resolve().parents[2]
 PROFILES = ROOT / "orchestrator" / "profiles"
 APPLY_PROFILE = PROFILES / "claude_apply_codex_review.yaml"
+IMPLEMENT_PROFILE = PROFILES / "codex_implement_claude_review.yaml"
 ARTIFACT_PROFILE = PROFILES / "artifact_validation.yaml"
 STOP_GATE_CODEX_PROFILE = PROFILES / "stop_gate_codex.yaml"
 DEMO_PROFILE = ROOT / "orchestrator" / "examples" / "demo-loop.yaml"
@@ -426,6 +430,130 @@ class IntakeResolutionTests(EnvelopeFixture):
             self.assertIn(path, targets["value"])
         self.assertFalse(targets["default_applied"])
 
+    # --- A1: a faithful semantic summary is a valid member ------------------
+    #
+    # Regression for the two production intake failures the follow-up brief
+    # names: tasks `d73d31a3` and `6b84744d` both stopped at `waiting_user`
+    # with a genuine, verbatim quote and a faithful summary of it, because the
+    # engine additionally required the *member* to occur lexically inside its
+    # own quote. Semantic mapping is the resolver's job; the deterministic
+    # side grounds the quote, not the reading of it.
+
+    def test_a1_a_faithful_summary_of_its_own_quote_resolves(self):
+        # `6b84744d`'s shape: an assurance_ceiling member that summarises a
+        # long sentence instead of repeating a span of it.
+        home = self.root / "a1-summary"
+        scope = (
+            "Repair stages use focused tests; full-suite, live-provider, deployment, and "
+            "repository hygiene evidence run once on the final ready candidate with explicit "
+            "ownership.\n"
+            "Change the greeting text emitted by the demo stage, and write only work/greeting.txt.\n"
+        )
+        result = self.start(
+            home,
+            "apply the greeting change",
+            scope,
+            reply=_reply(
+                semantic_change_surface=_axis(
+                    "semantically_silent", ["the greeting text emitted by the demo stage"]
+                ),
+                task_owned_write_targets=_axis(
+                    "declared", ["work/greeting.txt"], ["write only work/greeting.txt"]
+                ),
+                assurance_ceiling=_axis(
+                    "declared",
+                    ["focused tests at repair stages"],
+                    [
+                        "Repair stages use focused tests; full-suite, live-provider, deployment, "
+                        "and repository hygiene evidence run once on the final ready candidate "
+                        "with explicit ownership."
+                    ],
+                ),
+            ),
+        )
+
+        self.assertEqual(result["routing"]["preflight"]["status"], "pass")
+        self.assertNotEqual(result["status"], "waiting_user")
+        envelope = self.rendered_envelope(home, result["task_id"])
+        self.assertEqual(envelope["assurance_ceiling"]["state"], "declared")
+        self.assertEqual(
+            envelope["assurance_ceiling"]["value"], ["focused tests at repair stages"]
+        )
+        self.assertFalse(envelope["assurance_ceiling"]["default_applied"])
+
+    def test_a1_a_summary_in_another_language_than_its_quote_resolves(self):
+        # `d73d31a3`'s shape: Chinese sources, an English member. Lexical
+        # identity between the two is impossible in principle, not merely
+        # inconvenient.
+        home = self.root / "a1-cross-language"
+        scope = (
+            "讓 envelope task 的 blocking finding 受 Interpretation Envelope 約束。\n"
+            "只修改 orchestrator/controller.py 這個檔案。\n"
+        )
+        result = self.start(
+            home,
+            "apply a change to envelope blocking findings",
+            scope,
+            reply=_reply(
+                semantic_change_surface=_axis(
+                    "declared",
+                    ["envelope task blocking finding constrained by Interpretation Envelope"],
+                    ["讓 envelope task 的 blocking finding 受 Interpretation Envelope 約束"],
+                ),
+                task_owned_write_targets=_axis(
+                    "declared",
+                    ["orchestrator/controller.py"],
+                    ["只修改 orchestrator/controller.py 這個檔案"],
+                ),
+            ),
+        )
+
+        self.assertEqual(result["routing"]["preflight"]["status"], "pass")
+        self.assertNotEqual(result["status"], "waiting_user")
+        envelope = self.rendered_envelope(home, result["task_id"])
+        self.assertEqual(
+            envelope["semantic_change_surface"]["value"],
+            ["envelope task blocking finding constrained by Interpretation Envelope"],
+        )
+
+    def test_a1_a_write_target_its_quote_does_not_spell_resolves(self):
+        # The write axis is no longer exempt from the same rule. The sources
+        # describe the change without spelling the file that carries it; the
+        # resolver maps one to the other, and the path is still normalised
+        # against the execution worktree and still bounded at execution time.
+        home = self.root / "a1-write-mapping"
+        scope = "change stop-gate behaviour so a held gate stays pending\n"
+        result = self.start(
+            home,
+            "apply a change to stop-gate behaviour",
+            scope,
+            reply=_reply(
+                semantic_change_surface=_axis(
+                    "semantically_silent",
+                    ["change stop-gate behaviour so a held gate stays pending"],
+                ),
+                task_owned_write_targets=_axis(
+                    "declared",
+                    ["orchestrator/controller.py"],
+                    ["change stop-gate behaviour so a held gate stays pending"],
+                ),
+            ),
+        )
+
+        self.assertEqual(result["routing"]["preflight"]["status"], "pass")
+        self.assertNotEqual(result["status"], "waiting_user")
+        envelope = self.rendered_envelope(home, result["task_id"])
+        targets = envelope["task_owned_write_targets"]
+        self.assertEqual(targets["state"], "declared")
+        self.assertTrue(
+            any(path.endswith("orchestrator/controller.py") for path in targets["value"]),
+            targets["value"],
+        )
+        # Normalised against the worktree, exactly as a spelled-out path is.
+        self.assertTrue(
+            all(path.startswith("/") for path in targets["value"]), targets["value"]
+        )
+
     def test_a2_silent_axis_records_the_safe_default(self):
         # Chinese prose, no axis vocabulary of any kind.
         home = self.root / "a2"
@@ -682,28 +810,6 @@ class IntakeResolutionTests(EnvelopeFixture):
         self.assertIn("axis task_owned_write_targets", result["routing"]["preflight"]["reason"])
         self.assertFalse(list((home / "inbox").glob("*.json")))
 
-    def test_a19_a_write_target_the_quoted_source_does_not_carry_is_refused(self):
-        # Incomplete write authority: the quote is verbatim, but it does not
-        # carry the path the reply attributes to it.
-        home = self.root / "a19-ungrounded-path"
-        result = self.start(
-            home,
-            "apply the greeting change",
-            SILENT_SCOPE,
-            reply=_reply(
-                semantic_change_surface=_axis("semantically_silent", ["修改 demo stage 的問候文字"]),
-                task_owned_write_targets=_axis(
-                    "declared", ["orchestrator/controller.py"], ["修改 demo stage 的問候文字"]
-                ),
-            ),
-        )
-
-        self.assertEqual(result["status"], "waiting_user")
-        reason = result["routing"]["preflight"]["reason"]
-        self.assertIn("axis task_owned_write_targets", reason)
-        self.assertIn("not carried by the source text quoted for it", reason)
-        self.assertFalse(list((home / "inbox").glob("*.json")))
-
     def test_a24_the_write_target_stop_carries_all_four_required_elements(self):
         home = self.root / "a24"
         result = self.start(
@@ -810,6 +916,27 @@ class ResolverBoundaryTests(EnvelopeFixture):
         result, calls = self.start(self.root / "once")
         self.assertEqual(result["status"], "execute")
         self.assertEqual(len(calls), 1)
+
+    def test_a6_intake_spawns_nothing_for_capability_evidence(self):
+        # The capability probe is an operator-invoked read, not a per-task
+        # provider call: one full intake must reach the resolver exactly once
+        # and never reach `resolver_isolation_support`. Patched at the module
+        # attribute, so any intake-side caller would be counted.
+        probes: list[int] = []
+        with patch.object(
+            orchestrator.start,
+            "resolver_isolation_support",
+            side_effect=lambda: probes.append(1),
+        ):
+            with patch.object(orchestrator.start.subprocess, "run") as spawn:
+                result, calls = self.start(self.root / "no-probe")
+
+        self.assertEqual(result["status"], "execute")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(probes, [])
+        # `_invoke_resolver` is stubbed by `start`, so the only way a real
+        # process could be spawned during intake is a second, unstubbed caller.
+        self.assertEqual(spawn.call_args_list, [])
 
     def test_the_resolver_sees_only_the_immutable_sources(self):
         home = self.root / "sources"
@@ -955,36 +1082,12 @@ class ResolverBoundaryTests(EnvelopeFixture):
 
     # --- what the sources do not authorise ---------------------------------
     #
-    # The three cases below are the ones a resolver gets wrong by being
-    # helpful rather than by being broken: it answers the question it thinks
-    # was asked. Each presents a well-framed, schema-valid, individually
-    # grounded reply, and each must still be refused.
-
-    def test_a_declared_member_the_quote_does_not_carry_is_refused(self):
-        # The quote is genuine and verbatim from the scope. It simply says
-        # nothing about the requirement attributed to it. A quote is evidence
-        # for what it carries, not for whatever is listed beside it.
-        home = self.root / "unentailed-member"
-        result, _calls = self.start(
-            home,
-            scope=DECLARED_SCOPE,
-            reply=_reply(
-                semantic_change_surface=_axis(
-                    "declared",
-                    ["rewrite the daemon lease protocol"],
-                    ["Change the greeting text emitted by the demo stage"],
-                ),
-                task_owned_write_targets=_axis(
-                    "declared", ["work/greeting.txt"], ["write only work/greeting.txt"]
-                ),
-            ),
-        )
-
-        self.assertEqual(result["status"], "waiting_user")
-        reason = result["routing"]["preflight"]["reason"]
-        self.assertIn("not carried by the source text quoted for it", reason)
-        self.assertFalse(list((home / "inbox").glob("*.json")))
-        self.assertFalse((home / "tasks" / f"{result['task_id']}-execution-input.md").exists())
+    # The cases below are the ones a resolver gets wrong by being helpful
+    # rather than by being broken: it answers the question it thinks was
+    # asked. Each presents a well-framed, schema-valid, individually grounded
+    # reply, and each must still be refused. What is *not* refused any more is
+    # a member that faithfully summarises its own quote instead of repeating
+    # it — see `SemanticMemberTests`.
 
     def test_d1_a_negated_or_read_only_reference_is_not_authority(self):
         # The three cases the delta review reported, driven through the
@@ -1106,10 +1209,23 @@ class ResolverBoundaryTests(EnvelopeFixture):
             with self.subTest(constant=name):
                 self.assertEqual(matched, [], f"{name} is a denial-word list")
 
-        # What remains is exact source-span grounding: the member has to occur
-        # in the span quoted for it, whatever that span goes on to say.
-        self.assertTrue(orchestrator.start._carried_by("work/greeting.txt", "write work/greeting.txt"))
-        self.assertFalse(orchestrator.start._carried_by("work/greeting.txt", "write the other file"))
+        # Nor a lexical-identity check on the member under any name: reading
+        # the member back out of its own quote is the same deterministic
+        # natural-language reader, and it is gone from every axis.
+        self.assertFalse(hasattr(orchestrator.start, "_carried_by"))
+
+        # What remains is exact grounding of the *quote* in the sources, plus
+        # path normalisation for a declared write target. Neither reads prose.
+        blob = orchestrator.start._normalise_for_grounding(
+            "修改 demo stage 的問候文字，只寫 work/greeting.txt 這個檔案。"
+        )
+        self.assertTrue(orchestrator.start._grounded("只寫 work/greeting.txt 這個檔案", blob))
+        self.assertFalse(orchestrator.start._grounded("rewrite the daemon lease protocol", blob))
+        self.assertEqual(
+            orchestrator.start._normalise_write_target("work/greeting.txt", "/tmp/wt"),
+            "/tmp/wt/work/greeting.txt",
+        )
+        self.assertIsNone(orchestrator.start._normalise_write_target("the demo stage", None))
 
     def test_an_empty_declared_write_set_is_refused_for_a_task_that_changes_code(self):
         # A pathless apply. "This task writes nothing" is a claim about the
@@ -1323,6 +1439,156 @@ class ResolverProcessBoundaryTests(unittest.TestCase):
         self.assertFalse(Path(observed["cwd"]).exists())
 
 
+#: A stand-in CLI that records every argv it is given and answers `--version`
+#: and `--help`. No provider and no network are involved; what is under test is
+#: which process the engine asks about its options, and what it does with the
+#: answer.
+FAKE_CLI_SOURCE = """\
+#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+Path(__file__).with_name("argv.log").open("a", encoding="utf-8").write(
+    "\\x00".join(sys.argv[1:]) + "\\n"
+)
+
+OPTIONS = {options!r}
+argv = sys.argv[1:]
+if "--version" in argv:
+    print("9.9.9 (Fake Claude Code)")
+    sys.exit(0)
+if "--help" in argv:
+    print("Usage: fake-claude [options]")
+    for option in OPTIONS:
+        print("  " + option + " <value>   an option")
+    sys.exit(0)
+sys.exit(0)
+"""
+
+
+class ResolverCapabilityEvidenceTests(unittest.TestCase):
+    """A6 — the resolver isolation flags are checked, locally and once.
+
+    `_resolver_command` asserts four Claude CLI options exist. Nothing else
+    reads the CLI's option surface, so a rename would fail every intake with a
+    provider exit code and no statement of which capability vanished. These
+    tests observe the probe's argv, its verdict, and the `orch doctor` check
+    that carries it.
+    """
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp(prefix="orch-capability-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.directory, ignore_errors=True))
+        self.log = self.directory / "argv.log"
+
+    def write_cli(self, options) -> Path:
+        script = self.directory / "fake-claude.py"
+        script.write_text(FAKE_CLI_SOURCE.format(options=list(options)), encoding="utf-8")
+        script.chmod(0o755)
+        return script
+
+    def recorded_argv(self) -> list[list[str]]:
+        if not self.log.is_file():
+            return []
+        return [
+            line.split("\x00")
+            for line in self.log.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+
+    def test_a6_the_whole_configured_command_is_asked_not_its_interpreter(self):
+        # A wrapper invocation has more than one element. What must be asked
+        # about its options is the wrapper, with the configured flags intact
+        # and `--help` where the resolver appends its own flags — never
+        # `command[0]` alone, which here is the Python interpreter.
+        script = self.write_cli(resolver_isolation_option_names())
+        command = f"{sys.executable} {script} --model fake"
+        with patch.dict(os.environ, {"ORCH_CLAUDE_COMMAND": command}, clear=False):
+            support = resolver_isolation_support()
+
+        self.assertEqual(
+            list(support.command), [sys.executable, str(script), "--model", "fake", "--help"]
+        )
+        # The wrapper received the flags and `--help`; the interpreter was only
+        # the thing that ran it.
+        self.assertEqual(self.recorded_argv(), [["--model", "fake", "--help"]])
+        self.assertTrue(support.verified)
+        self.assertEqual(support.missing, ())
+
+    def test_a6_a_renamed_option_is_reported_by_name_and_fails_doctor(self):
+        options = [
+            option for option in resolver_isolation_option_names() if option != "--strict-mcp-config"
+        ]
+        script = self.write_cli(options)
+        with patch.dict(os.environ, {"ORCH_CLAUDE_COMMAND": str(script)}, clear=False):
+            support = resolver_isolation_support()
+            report = run_doctor(self.directory / "home")
+
+        self.assertTrue(support.verified)
+        self.assertEqual(support.missing, ("--strict-mcp-config",))
+
+        check = {item["check"]: item for item in report["checks"]}["resolver_isolation"]
+        self.assertEqual(check["status"], "fail")
+        self.assertIn("--strict-mcp-config", check["detail"])
+        for present in ("--tools", "--setting-sources", "--no-session-persistence"):
+            self.assertNotIn(present, check["detail"])
+        # `orch doctor` exits 1 on any fail, so a provisioning script gates on
+        # this with no new plumbing.
+        self.assertGreaterEqual(report["summary"]["fail"], 1)
+        self.assertEqual(1 if report["summary"]["fail"] else 0, 1)
+
+    def test_a6_a_complete_cli_is_ok_and_costs_no_second_version_spawn(self):
+        script = self.write_cli(resolver_isolation_option_names())
+        with patch.dict(os.environ, {"ORCH_CLAUDE_COMMAND": str(script)}, clear=False):
+            report = run_doctor(self.directory / "home")
+
+        by_name = {item["check"]: item for item in report["checks"]}
+        self.assertEqual(by_name["provider_claude"]["status"], "ok")
+        check = by_name["resolver_isolation"]
+        self.assertEqual(check["status"], "ok")
+        # The version comes from the `provider_claude` preflight that already
+        # ran, not from a second `--version`.
+        self.assertIn("9.9.9 (Fake Claude Code)", check["detail"])
+        argv = self.recorded_argv()
+        self.assertEqual([call for call in argv if call == ["--version"]], [["--version"]])
+        self.assertEqual([call for call in argv if call == ["--help"]], [["--help"]])
+        self.assertEqual(len(argv), 2)
+
+    def test_a6_every_probe_failure_is_unverified_rather_than_raised(self):
+        cases = {
+            "": "unusable",
+            'claude -p "unbalanced': "unusable",
+            str(self.directory / "not-installed"): "unavailable",
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                with patch.dict(os.environ, {"ORCH_CLAUDE_COMMAND": command}, clear=False):
+                    support = resolver_isolation_support()  # must not raise
+                self.assertFalse(support.verified)
+                self.assertEqual(support.missing, resolver_isolation_option_names())
+                self.assertIn(expected, support.detail)
+
+        # A CLI that answers, but not successfully, is unverified too.
+        failing = self.directory / "failing-claude.py"
+        failing.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(2)\n", encoding="utf-8")
+        failing.chmod(0o755)
+        with patch.dict(os.environ, {"ORCH_CLAUDE_COMMAND": str(failing)}, clear=False):
+            support = resolver_isolation_support()
+        self.assertFalse(support.verified)
+        self.assertEqual(support.missing, resolver_isolation_option_names())
+        self.assertIn("exited 2", support.detail)
+
+    def test_a6_the_probe_reports_no_option_present_by_accident(self):
+        # A help text mentioning a longer option that merely starts with one of
+        # ours must not be read as that option being present.
+        script = self.write_cli(["--toolsets", "--strict-mcp-configuration"])
+        with patch.dict(os.environ, {"ORCH_CLAUDE_COMMAND": str(script)}, clear=False):
+            support = resolver_isolation_support()
+
+        self.assertTrue(support.verified)
+        self.assertEqual(support.missing, resolver_isolation_option_names())
+
+
 # ---------------------------------------------------------------------------
 # Slice 2 — chokepoint, shared outcomes, hold
 # ---------------------------------------------------------------------------
@@ -1350,16 +1616,32 @@ class ChokepointTests(EnvelopeFixture):
                 self.assertIn("the envelope above outranks the stage instructions below", prompt)
                 self.assertLess(prompt.index(ENVELOPE_END), prompt.index("Stage instructions:"))
 
-    def test_a5_no_shipped_profile_stage_prompt_text_changes(self):
-        diff = subprocess.run(
-            ["git", "diff", "HEAD", "--", "orchestrator/profiles"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
+    def test_a5_the_hold_outcome_is_named_in_exactly_one_shipped_profile(self):
+        # A5 used to assert that `git diff HEAD -- orchestrator/profiles` was
+        # empty, which made it fail for *any* profile edit ever, for any
+        # reason — a self-invalidating check, not an invariant. Its real
+        # invariant, "the envelope feature needs no profile change", is
+        # carried by A6 (a legacy prompt is byte-identical) and A7 (the hold
+        # outcome is accepted on a profile that never declared it). What is
+        # durable is its reserved-name half: the hold outcome is engine-owned,
+        # so no shipped profile may declare it as an ordinary stage outcome.
+        naming = sorted(
+            path.name
+            for path in PROFILES.glob("*.yaml")
+            if HOLD_OUTCOME in path.read_text(encoding="utf-8")
         )
-        self.assertEqual(diff.returncode, 0, diff.stderr)
-        self.assertEqual(diff.stdout, "")
+
+        self.assertEqual(naming, ["propose.yaml"])
+        # And only there is it a routed stage outcome. Everywhere else the
+        # engine supplies it for envelope tasks and short-circuits it before
+        # the outcome-to-target lookup, which is what A7 pins.
+        declaring = sorted(
+            path.name
+            for path in PROFILES.glob("*.yaml")
+            for stage in load_profile(path).stages.values()
+            if HOLD_OUTCOME in (stage.outcomes or {})
+        )
+        self.assertEqual(declaring, ["propose.yaml"])
 
     def test_a6_a_legacy_prompt_is_byte_identical_to_the_pre_change_engine(self):
         profile = load_profile(APPLY_PROFILE)
@@ -1486,6 +1768,45 @@ class ChokepointTests(EnvelopeFixture):
                 self.assertEqual(edge["count"], self.edge(before, edge["edge"])["count"])
         self.assertEqual(after["notifications"][-1]["reason"], HOLD_STOP_REASON)
 
+    def test_a7_the_blocking_finding_rule_reaches_every_envelope_stage(self):
+        # Engine-side, so it is profile-independent: it reaches a profile that
+        # declares neither the hold outcome nor any finding vocabulary, and it
+        # reaches no legacy task at all.
+        stage = load_profile(STOP_GATE_CODEX_PROFILE).stage("review")
+        input_text = self.envelope_input("a7.md").read_text(encoding="utf-8")
+        envelope = extract_envelope(input_text)
+
+        composed = Controller._build_prompt(
+            "a7-1", stage, input_text, "/tmp/reports", envelope, None
+        )
+        legacy = Controller._build_prompt(
+            "a7-2", stage, self.legacy_input("a7-legacy.md").read_text(encoding="utf-8"),
+            "/tmp/reports",
+        )
+
+        self.assertIn("Blocking-finding rule:", composed)
+        self.assertIn(HOLD_OUTCOME, composed.split("Allowed typed outcomes:", 1)[1])
+        self.assertNotIn("Blocking-finding rule:", legacy)
+
+        # The counter-example the rule exists for: a finding that is compliant
+        # on the axis it was filed under but whose correction escapes another
+        # axis is still not repairable on the executor's own authority. So the
+        # rule has to bind all five set axes by name, not just the filed one.
+        rule = " ".join(
+            composed.split("Blocking-finding rule:", 1)[1]
+            .split("\nStage instructions:", 1)[0]
+            .split()
+        )
+        for axis in ENVELOPE_SET_AXES:
+            with self.subTest(axis=axis):
+                self.assertIn(axis, rule)
+        self.assertIn("all five set axes", rule)
+        self.assertIn("including one it was", rule)
+        self.assertIn("not filed under", rule)
+        self.assertIn("is not a blocking finding for automatic repair", rule)
+        self.assertIn(HOLD_OUTCOME, rule)
+        self.assertIn("A containment statement you cannot make for all five set axes", rule)
+
     def test_a13_a_legacy_task_still_stops_for_edge_cap(self):
         controller, _runner = self.controller(
             [_output("submit"), _output("block"), _output("submit"), _output("block")]
@@ -1497,6 +1818,305 @@ class ChokepointTests(EnvelopeFixture):
         self.assertEqual(status["task"]["status"], "waiting_user")
         self.assertEqual(status["task"]["stop_reason"], "edge_cap")
         self.assertEqual(self.edge(status, "review.block")["count"], 1)
+
+    #: A gate-reachable loop with generous edge caps, so `max_transitions` is
+    #: the only cap that can bind. Every cycle (fix -> gate -> fix) carries
+    #: both a correction stage and a branching stage, which is exactly what
+    #: `_gate_reachable` proves.
+    GATED_LOOP_PROFILE = """version: 1
+type: demo-loop
+initial_stage: fix
+max_transitions: 2
+stages:
+  fix:
+    owner: claude
+    attempt_cap: 9
+    timeout: 30
+    prompt: "Correction stage."
+    outcomes:
+      fixed: gate
+  gate:
+    owner: codex
+    attempt_cap: 9
+    timeout: 30
+    prompt: "Branching stage."
+    outcomes:
+      back: fix
+      settled: done
+  done:
+    terminal: done
+edge_caps:
+  fix.fixed: 9
+  gate.back: 9
+  gate.settled: 1
+"""
+
+    def gated_loop_profile(self, name: str = "gated-loop.yaml") -> Path:
+        path = self.root / name
+        path.write_text(self.GATED_LOOP_PROFILE, encoding="utf-8")
+        return path
+
+    def test_a3_an_improving_envelope_task_continues_past_both_legacy_caps(self):
+        # claude_apply_codex_review: `delta_review.needs_repair` is capped at 1,
+        # `repair.repaired` at 2 and `max_transitions` is 6. This run crosses
+        # all three and still reaches `done`, because what gates it is the
+        # strictly shrinking identity set, not a number.
+        _controller, _runner, _task_id, status = self.run_task(
+            [
+                _output("applied"),
+                _output("needs_repair", _first_run_record(["a", "b", "c", "d"])),
+                _output("repaired"),
+                _output("needs_repair", _repeat_record(["a", "b", "c"], ["a", "b", "c", "d"], [])),
+                _output("repaired"),
+                _output("needs_repair", _repeat_record(["a", "b"], ["a", "b", "c"], ["d"])),
+                _output("repaired"),
+                _output("needs_repair", _repeat_record(["a"], ["a", "b"], ["c", "d"])),
+                _output("repaired"),
+                _output("ready", _repeat_record([], ["a"], ["b", "c", "d"])),
+            ]
+        )
+
+        self.assertEqual(status["task"]["status"], "done")
+        stops = [row["reason"] for row in status["transitions"]]
+        self.assertNotIn("edge_cap", stops)
+        self.assertNotIn("transition_cap", stops)
+        # The counters counted the whole way past their caps and stay readable.
+        delta = self.edge(status, "delta_review.needs_repair")
+        self.assertEqual((delta["count"], delta["cap"]), (3, 1))
+        repaired = self.edge(status, "repair.repaired")
+        self.assertEqual((repaired["count"], repaired["cap"]), (4, 2))
+        self.assertGreater(status["task"]["transitions_count"], 6)
+
+    def test_a3_a_large_first_identity_set_is_not_a_stop_condition(self):
+        # No number is a ceiling: 33 findings in the first round is converging
+        # work, and the only thing that has to happen is that the set shrinks.
+        first = [f"scenario-{index:02d}" for index in range(33)]
+        _controller, _runner, _task_id, status = self.run_task(
+            [
+                _output("applied"),
+                _output("needs_repair", _first_run_record(first)),
+                _output("repaired"),
+                _output("ready", _repeat_record([], first, [])),
+            ]
+        )
+
+        self.assertEqual(status["task"]["status"], "done")
+        self.assertNotIn("edge_cap", [row["reason"] for row in status["transitions"]])
+
+    def test_a4_a_non_improving_envelope_task_still_stops(self):
+        _controller, _runner, _task_id, status = self.run_task(
+            [
+                _output("applied"),
+                _output("needs_repair", _first_run_record(["a", "b", "c", "d"])),
+                _output("repaired"),
+                _output(
+                    "needs_repair",
+                    _repeat_record(
+                        ["a", "b", "c", "d"], ["a", "b", "c", "d"], [], verdict="stalled"
+                    ),
+                ),
+            ]
+        )
+
+        self.assertEqual(status["task"]["status"], "waiting_user")
+        self.assertEqual(status["task"]["stop_reason"], HOLD_STOP_REASON)
+        self.assertNotEqual(status["task"]["stop_reason"], "edge_cap")
+        # The hold is the last thing that happened: no stage ran after it.
+        self.assertEqual(len(status["stage_runs"]), 4)
+        self.assertEqual(status["transitions"][-1]["reason"], HOLD_STOP_REASON)
+
+    #: The three graph shapes convergence cannot score. Each is a permanent
+    #: loop the moment a cap stops rejecting, so each must keep its caps even
+    #: with an envelope present.
+    UNSCORED_PROFILES = {
+        # (i) a feedback cycle of single-outcome stages: no branching stage is
+        # ever entered, so no convergence record is ever owed.
+        "single_outcome_cycle": """version: 1
+type: demo-loop
+initial_stage: step
+max_transitions: 2
+stages:
+  step:
+    owner: claude
+    attempt_cap: 9
+    timeout: 30
+    prompt: "Correction stage."
+    outcomes:
+      next: back
+  back:
+    owner: codex
+    attempt_cap: 9
+    timeout: 30
+    prompt: "Correction stage."
+    outcomes:
+      again: step
+  done:
+    terminal: done
+edge_caps:
+  step.next: 9
+  back.again: 9
+""",
+        # (ii) a branching self-loop: the gate is reached every time, and no
+        # correction run ever lies between two visits, so no visit is a repeat.
+        "branching_self_loop": """version: 1
+type: demo-loop
+initial_stage: gate
+max_transitions: 2
+stages:
+  gate:
+    owner: codex
+    attempt_cap: 9
+    timeout: 30
+    prompt: "Branching stage."
+    outcomes:
+      again: gate
+      settled: done
+  done:
+    terminal: done
+edge_caps:
+  gate.again: 9
+  gate.settled: 1
+""",
+        # (iii) a branching-only multi-stage cycle: same defect, spread over
+        # two stages so it cannot be recognised by looking at one of them.
+        "branching_only_cycle": """version: 1
+type: demo-loop
+initial_stage: review
+max_transitions: 2
+stages:
+  review:
+    owner: codex
+    attempt_cap: 9
+    timeout: 30
+    prompt: "Branching stage."
+    outcomes:
+      again: triage
+      settled: done
+  triage:
+    owner: claude
+    attempt_cap: 9
+    timeout: 30
+    prompt: "Branching stage."
+    outcomes:
+      again: review
+      settled: done
+  done:
+    terminal: done
+edge_caps:
+  review.again: 9
+  review.settled: 1
+  triage.again: 9
+  triage.settled: 1
+""",
+    }
+
+    def unscored_profile(self, name: str) -> Path:
+        path = self.root / f"unscored-{name}.yaml"
+        path.write_text(self.UNSCORED_PROFILES[name], encoding="utf-8")
+        return path
+
+    def test_a4b_an_unscored_cycle_keeps_its_caps(self):
+        cases = {
+            "single_outcome_cycle": [_output("next"), _output("again")],
+            "branching_self_loop": [
+                _output("again", _first_run_record(["a"])),
+                _output("again", _first_run_record(["a"])),
+            ],
+            "branching_only_cycle": [
+                _output("again", _first_run_record(["a"])),
+                _output("again", _first_run_record(["a"])),
+            ],
+        }
+        for name, outputs in cases.items():
+            with self.subTest(shape=name):
+                profile_path = self.unscored_profile(name)
+                self.assertFalse(
+                    Controller._gate_reachable(
+                        Controller.__new__(Controller), load_profile(profile_path)
+                    )
+                )
+                controller, runner = self.controller(outputs)
+                task_id = controller.submit(
+                    "demo-loop", profile_path, self.envelope_input(f"a4b-{name}.md")
+                )
+
+                status = controller.run_until_stop(task_id)
+
+                self.assertEqual(status["task"]["status"], "waiting_user")
+                self.assertEqual(status["task"]["stop_reason"], "transition_cap")
+                self.assertEqual(status["task"]["transitions_count"], 2)
+                if name != "single_outcome_cycle":
+                    # Why the caps must stay: every visit files a *first-run*
+                    # record, so no strict-subset comparison is ever made and
+                    # convergence never becomes the bound.
+                    for _owner, prompt in runner.prompts:
+                        self.assertIn("Convergence record obligation", prompt)
+                        self.assertNotIn("REPEAT REVIEW", prompt)
+
+    def test_a4b_a_resumed_in_flight_task_meets_the_same_predicate(self):
+        # The predicate is read from the task's own frozen profile snapshot at
+        # every claim, so there is no submit-time gate an in-flight task can
+        # miss and no migration to run. A task started before this release and
+        # resumed after it stops exactly where it stopped before.
+        profile_path = self.unscored_profile("single_outcome_cycle")
+        home = self.root / "resumed-in-flight"
+        controller = Controller(home, runner=ScriptedRunner([]))
+        task_id = controller.submit("demo-loop", profile_path, self.envelope_input("a4b-resume.md"))
+        # One claimed and committed leg, so the row, the frozen snapshots and
+        # the counters all exist before the predicate is ever consulted.
+        run_token, _stage, profile, log_path = controller.claim_stage(task_id)
+        output = _output("next")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(output, encoding="utf-8")
+        controller.commit_run(
+            task_id, run_token, RunResult(0, output, "next", "success", "success"), profile
+        )
+        self.assertEqual(controller.status(task_id)["task"]["transitions_count"], 1)
+        controller.close()
+
+        resumed = Controller(home, runner=ScriptedRunner([_output("again")]))
+        self.addCleanup(resumed.close)
+        status = resumed.run_until_stop(task_id)
+
+        self.assertEqual(status["task"]["status"], "waiting_user")
+        self.assertEqual(status["task"]["stop_reason"], "transition_cap")
+
+    def test_a5_a_legacy_task_still_stops_for_transition_cap(self):
+        # Same gate-reachable profile as the envelope task below, so the only
+        # difference between stopping and continuing is the envelope block.
+        profile_path = self.gated_loop_profile()
+        controller, _runner = self.controller([_output("fixed"), _output("back")])
+        task_id = controller.submit("demo-loop", profile_path, self.legacy_input("a5-legacy.md"))
+
+        status = controller.run_until_stop(task_id)
+
+        self.assertEqual(status["task"]["status"], "waiting_user")
+        self.assertEqual(status["task"]["stop_reason"], "transition_cap")
+        self.assertEqual(status["task"]["transitions_count"], 2)
+
+    def test_a5_the_same_profile_lifts_only_for_the_envelope_task(self):
+        profile_path = self.gated_loop_profile("gated-loop-envelope.yaml")
+        controller, _runner = self.controller(
+            [
+                _output("fixed"),
+                _output("back", _first_run_record(["a", "b"])),
+                _output("fixed"),
+                _output("back", _repeat_record(["a"], ["a", "b"], [])),
+                _output("fixed"),
+                _output("settled", _repeat_record([], ["a"], ["b"])),
+            ]
+        )
+        task_id = controller.submit(
+            "demo-loop", profile_path, self.envelope_input("a5-envelope.md")
+        )
+
+        status = controller.run_until_stop(task_id)
+
+        self.assertEqual(status["task"]["status"], "done")
+        self.assertEqual(status["task"]["transitions_count"], 6)
+        self.assertNotIn(
+            "transition_cap", [row["reason"] for row in status["transitions"]]
+        )
 
     def test_a20_an_in_envelope_correction_takes_the_ordinary_repair_outcome(self):
         _controller, _runner, _task_id, status = self.run_task(
@@ -1979,6 +2599,456 @@ edge_caps:
                     ).read_text(encoding="utf-8")
                 )
                 self.assertIn("convergence_contradictory", wrong_manifest["reason"])
+
+
+#: The two phrases the C5 gate paragraph is delimited by inside a review
+#: prompt. Tests read the gate out of the shipped profile rather than
+#: restating it, so a silent edit to either copy is a failure.
+GATE_BEGIN = "ready additionally requires that the full test suite"
+GATE_END = "If Product/Spec alignment and Platform constraints PASS,"
+FINGERPRINT_BEGIN = "The candidate fingerprint is the output of exactly this command, run in the workspace: "
+FINGERPRINT_END = " — it is path- and content-sensitive"
+
+
+def _gate_paragraph(prompt: str) -> str:
+    return GATE_BEGIN + prompt.split(GATE_BEGIN, 1)[1].split(GATE_END, 1)[0]
+
+
+def _fingerprint_command(prompt: str) -> str:
+    return prompt.split(FINGERPRINT_BEGIN, 1)[1].split(FINGERPRINT_END, 1)[0].strip()
+
+
+class ReceiptRunner(ScriptedRunner):
+    """A scripted runner that also writes what each stage records.
+
+    The engine neither writes nor parses the receipt, so the artifact has to
+    come from the stages themselves — which is exactly the property under
+    test: the gate is a prompt contract on an artifact the review stages
+    already own.
+    """
+
+    def __init__(self, outputs: list[str], receipts: list[str | None], review_file: str):
+        super().__init__(outputs)
+        self.receipts = list(receipts)
+        self.review_file = review_file
+
+    def run(self, owner: str, prompt: str, timeout: int, log_path: Path, **kwargs) -> RunResult:
+        result = super().run(owner, prompt, timeout, log_path, **kwargs)
+        note = self.receipts.pop(0) if self.receipts else None
+        if note:
+            reports = log_path.parent.parent / "reports"
+            reports.mkdir(parents=True, exist_ok=True)
+            with (reports / self.review_file).open("a", encoding="utf-8") as handle:
+                handle.write(note)
+        return result
+
+
+class FinalCandidateEvidenceTests(EnvelopeFixture):
+    """A8 / A8b: one final-candidate gate, on both `ready` paths."""
+
+    def receipt_path(self, controller: Controller, task_id: str, review_file: str) -> Path:
+        artifact_dir = Path(controller.status(task_id)["task"]["artifact_dir"])
+        return artifact_dir / "reports" / review_file
+
+    def test_a8_both_ready_paths_carry_the_same_gate(self):
+        for profile_path, review_file in (
+            (APPLY_PROFILE, "apply-review.md"),
+            (IMPLEMENT_PROFILE, "implement-review.md"),
+        ):
+            with self.subTest(profile=profile_path.name):
+                profile = load_profile(profile_path)
+                repair = profile.stage("repair").prompt
+                review = profile.stage("review").prompt
+                delta = profile.stage("delta_review").prompt
+
+                # Repair stages: focused tests, and the four one-shot classes
+                # explicitly deferred to the final candidate.
+                self.assertIn(
+                    "Run the focused tests covering the symbols you changed and their direct "
+                    "consumers.",
+                    repair,
+                )
+                self.assertIn("Do not run the full test suite, a live-provider check, a "
+                              "deployment check or a repository-hygiene check at this stage", repair)
+                self.assertIn("those belong once to the final ready candidate", repair)
+                self.assertNotIn(GATE_BEGIN, repair)
+                # And the gate is not appended after the outcome sentinel: the
+                # last thing either prompt says is still which token to print.
+                self.assertTrue(repair.endswith("ORCHESTRATOR_OUTCOME: repaired"), repair[-60:])
+                self.assertTrue(review.endswith("ORCHESTRATOR_OUTCOME: needs_repair"), review[-60:])
+                self.assertTrue(delta.endswith("ORCHESTRATOR_OUTCOME: needs_repair"), delta[-60:])
+
+                # A zero-repair run reaches `done` through `review.ready`
+                # without ever entering `delta_review`, so gating only the
+                # delta path would gate nothing on the commonest path.
+                gate = _gate_paragraph(review)
+                self.assertEqual(
+                    gate.encode("utf-8"), _gate_paragraph(delta).encode("utf-8")
+                )
+                self.assertGreater(len(gate), 500)
+
+                for phrase in (
+                    "any live-provider evidence, any deployment evidence and any "
+                    "repository-hygiene evidence have been executed once against this final "
+                    "candidate",
+                    "A mock, a stub or a fixture may not stand in for live-provider or "
+                    "deployment evidence",
+                    "Settle Product/Spec alignment and Platform constraints first",
+                    "never to inspect one you are about to send back",
+                    f"Record each in {review_file} under a '## Final-candidate evidence' heading",
+                    "one line per evidence class carrying the candidate fingerprint, then the "
+                    "command, its result and its owner",
+                    "a line under this candidate's fingerprint is already spent and must not be "
+                    "re-run",
+                    "a line under any other fingerprint is evidence for a different candidate "
+                    "and counts as absent",
+                    "Run only the classes with no line under this fingerprint",
+                    "within your authority: run them here, and never record them DEFERRED",
+                    "ready is not available to you",
+                    "include an outcome reserved for a user decision",
+                    "record Verification evidence DEFERRED with the outstanding command, owner "
+                    "and gate, as today",
+                ):
+                    with self.subTest(phrase=phrase[:48]):
+                        self.assertIn(phrase, gate)
+
+                # The gate names no engine mechanism: no profile outcome is
+                # added, and the reserved hold outcome is never spelled, so
+                # A5's narrowing still holds and the route stays engine-owned.
+                self.assertNotIn(HOLD_OUTCOME, gate)
+                self.assertEqual(
+                    set(profile.stage("review").outcomes), {"ready", "needs_repair"}
+                )
+
+    def test_a8b_the_receipt_survives_the_hold_and_the_resume(self):
+        # Envelope task, no repair round: the commonest path to `done`.
+        fingerprint = "f1a2b3c4d5e6"
+        controller_home = self.root / "a8b-hold"
+        runner = ReceiptRunner(
+            [
+                _output("applied"),
+                _output(HOLD_OUTCOME, _first_run_record([])),
+                _output("ready", _first_run_record([])),
+            ],
+            [
+                None,
+                "## Final-candidate evidence\n"
+                f"- full-suite | {fingerprint} | python3 -m unittest discover -s "
+                "orchestrator/tests -t . | 0 | reviewer\n"
+                f"- hygiene | {fingerprint} | git status --porcelain | clean | reviewer\n"
+                "Outstanding, not mine to run: live-provider `orch doctor` (owner: operator); "
+                "deployment `orch start --task-type propose` round-trip (owner: operator)\n",
+                f"- live-provider | {fingerprint} | orch doctor | exit 0 | operator (recorded)\n",
+            ],
+            "apply-review.md",
+        )
+        controller = Controller(controller_home, runner=runner)
+        self.addCleanup(controller.close)
+        task_id = controller.submit("apply", APPLY_PROFILE, self.envelope_input("a8b.md"))
+
+        held = controller.run_until_stop(task_id)
+
+        self.assertEqual(held["task"]["status"], "waiting_user")
+        self.assertEqual(held["task"]["stop_reason"], HOLD_STOP_REASON)
+        receipt = self.receipt_path(controller, task_id, "apply-review.md")
+        text = receipt.read_text(encoding="utf-8")
+        self.assertIn("## Final-candidate evidence", text)
+        self.assertIn("orch doctor", text)
+        self.assertIn("owner: operator", text)
+
+        # The operator runs the outstanding class and appends its line under
+        # this same fingerprint, then resumes onto this same candidate.
+        with receipt.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"- deployment | {fingerprint} | orch start --task-type propose | done | operator\n"
+            )
+
+        status = controller.resume(task_id)
+
+        self.assertEqual(status["task"]["status"], "done")
+        final = receipt.read_text(encoding="utf-8")
+        for kind in ("full-suite", "hygiene", "live-provider", "deployment"):
+            with self.subTest(kind=kind):
+                lines = [
+                    line
+                    for line in final.splitlines()
+                    if line.startswith(f"- {kind} ") and fingerprint in line
+                ]
+                self.assertEqual(len(lines), 1, final)
+        # `delta_review` never ran: the gate had to be on `review.ready` too.
+        self.assertNotIn("delta_review", [row["stage"] for row in status["stage_runs"]])
+
+    def test_a8b_a_repair_moves_the_fingerprint_so_earlier_lines_read_as_absent(self):
+        # Pre-repair lines are stale by construction: the repair changes the
+        # worktree, so the candidate fingerprint changes, so the final review
+        # must spend each class again under its own fingerprint. That the
+        # fingerprint really moves is executed in
+        # `FinalCandidateFingerprintTests`; what this pins is the receipt's
+        # own reading rule across the repair round.
+        before, after = "aaaaaaaaaaaa", "bbbbbbbbbbbb"
+        runner = ReceiptRunner(
+            [
+                _output("applied"),
+                _output("needs_repair", _first_run_record(["scenario-a"])),
+                _output("repaired"),
+                _output("ready", _repeat_record([], ["scenario-a"], [])),
+            ],
+            [
+                None,
+                "## Final-candidate evidence\n"
+                f"- full-suite | {before} | python3 -m unittest discover | 0 | reviewer\n"
+                f"- hygiene | {before} | git status --porcelain | clean | reviewer\n",
+                None,
+                f"- full-suite | {after} | python3 -m unittest discover | 0 | reviewer\n"
+                f"- hygiene | {after} | git status --porcelain | clean | reviewer\n",
+            ],
+            "apply-review.md",
+        )
+        controller = Controller(self.root / "a8b-repair", runner=runner)
+        self.addCleanup(controller.close)
+        task_id = controller.submit("apply", APPLY_PROFILE, self.envelope_input("a8b-repair.md"))
+
+        status = controller.run_until_stop(task_id)
+
+        self.assertEqual(status["task"]["status"], "done")
+        final = self.receipt_path(controller, task_id, "apply-review.md").read_text(
+            encoding="utf-8"
+        )
+        for kind in ("full-suite", "hygiene"):
+            with self.subTest(kind=kind):
+                # Exactly one line per class under the final candidate, and
+                # the pre-repair lines are still on record as another
+                # candidate's evidence rather than deleted or reused.
+                self.assertEqual(
+                    len([l for l in final.splitlines() if l.startswith(f"- {kind} ") and after in l]),
+                    1,
+                    final,
+                )
+                self.assertEqual(
+                    len([l for l in final.splitlines() if l.startswith(f"- {kind} ") and before in l]),
+                    1,
+                    final,
+                )
+        self.assertIn("delta_review", [row["stage"] for row in status["stage_runs"]])
+
+    def test_a8b_a_legacy_task_keeps_its_deferred_to_ready_route(self):
+        # The user's ruling, adopted verbatim: the final-candidate evidence
+        # hold applies only to tasks carrying an envelope. A legacy task is
+        # never offered the hold outcome, so the gate's own fallback is
+        # today's `PASS or owned DEFERRED -> ready`, with no hold injected
+        # and no receipt required of it.
+        controller, runner = self.controller([_output("applied"), _output("ready")])
+        task_id = controller.submit("apply", APPLY_PROFILE, self.legacy_input("a8b-legacy.md"))
+
+        status = controller.run_until_stop(task_id)
+
+        self.assertEqual(status["task"]["status"], "done")
+        for _owner, prompt in runner.prompts:
+            self.assertNotIn(HOLD_OUTCOME, prompt)
+        self.assertFalse(
+            (Path(status["task"]["artifact_dir"]) / "reports" / "apply-review.md").exists()
+        )
+
+
+class FinalCandidateFingerprintTests(unittest.TestCase):
+    """The mandated correction to C5, executed rather than asserted.
+
+    `git status --porcelain` is not content-sensitive: changing the contents of
+    an already-modified file leaves its text identical, so a fingerprint built
+    from it would let one candidate silently inherit another's final evidence.
+    These tests run the command the shipped gate actually names.
+    """
+
+    GIT = ("git", "-c", "user.email=t@example.invalid", "-c", "user.name=orch-test")
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.repo = Path(directory.name)
+        self.env = {
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": str(self.repo / "no-global-gitconfig"),
+            "GIT_CONFIG_SYSTEM": str(self.repo / "no-system-gitconfig"),
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+        self.git("init", "-q", ".")
+        (self.repo / "tracked.txt").write_text("original\n", encoding="utf-8")
+        (self.repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+        self.git("add", ".")
+        self.git("commit", "-qm", "seed")
+        self.command = _fingerprint_command(load_profile(APPLY_PROFILE).stage("review").prompt)
+
+    def git(self, *args: str) -> str:
+        done = subprocess.run(
+            [*self.GIT, *args], cwd=self.repo, capture_output=True, text=True, env=self.env
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout
+
+    def fingerprint(self) -> str:
+        done = subprocess.run(
+            ["sh", "-c", self.command],
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        value = done.stdout.strip()
+        self.assertRegex(value, r"^[0-9a-f]{12}$")
+        return value
+
+    def fingerprint_run(self) -> subprocess.CompletedProcess:
+        """Run the command without demanding success, for the failure cases."""
+        return subprocess.run(
+            ["sh", "-c", self.command],
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+
+    def porcelain(self) -> str:
+        return self.git("status", "--porcelain")
+
+    def test_the_gate_names_a_content_sensitive_command(self):
+        self.assertIn("git rev-parse HEAD", self.command)
+        self.assertIn("git diff --no-ext-diff --binary HEAD --", self.command)
+        self.assertIn("git ls-files --others --exclude-standard -z", self.command)
+        # And it says, in the prompt, not to fall back to the defective one.
+        prompt = load_profile(APPLY_PROFILE).stage("review").prompt
+        self.assertIn("Never substitute git status --porcelain for it", prompt)
+        # The command is read-only: no index write, no worktree write.
+        self.assertNotIn("hash-object -w", self.command)
+        self.assertNotIn("git add", self.command)
+        self.assertNotIn("git stash", self.command)
+        # Each path reaches a reader only as an operand after an option
+        # terminator, so an option-like name cannot be read as a flag.
+        self.assertIn("readlink -- ", self.command)
+        self.assertIn("cat -- ", self.command)
+        self.assertNotIn("xargs", self.command)
+        # A failing read or hash has to fail the command, not the byte stream
+        # alone: without pipefail the trailing cut would still exit 0.
+        self.assertIn("pipefail", self.command)
+
+    def test_a_modified_file_s_contents_change_the_fingerprint(self):
+        (self.repo / "tracked.txt").write_text("candidate one\n", encoding="utf-8")
+        first_status, first = self.porcelain(), self.fingerprint()
+        (self.repo / "tracked.txt").write_text("candidate two\n", encoding="utf-8")
+        second_status, second = self.porcelain(), self.fingerprint()
+
+        # This is the defect the correction exists for: identical status text.
+        self.assertEqual(first_status, second_status)
+        self.assertNotEqual(first, second)
+
+    def test_an_untracked_file_s_contents_change_the_fingerprint(self):
+        (self.repo / "new.txt").write_text("added one\n", encoding="utf-8")
+        first_status, first = self.porcelain(), self.fingerprint()
+        (self.repo / "new.txt").write_text("added two\n", encoding="utf-8")
+        second_status, second = self.porcelain(), self.fingerprint()
+
+        self.assertEqual(first_status, second_status)
+        self.assertNotEqual(first, second)
+
+    def test_an_option_like_untracked_name_is_hashed_not_parsed(self):
+        """`--preserve` is a valid Git path and must not become a flag.
+
+        The first version of this command piped each path into
+        `shasum -a 256 {}`, which read this name as an option, printed
+        `Unknown option: preserve`, and still let the pipeline exit 0 — so
+        the fingerprint never moved when the file's contents did.
+        """
+        hostile = self.repo / "--preserve"
+        hostile.write_text("one\n", encoding="utf-8")
+        first_status, first = self.porcelain(), self.fingerprint()
+        hostile.write_text("two\n", encoding="utf-8")
+        second_status, second = self.porcelain(), self.fingerprint()
+
+        self.assertEqual(first_status, second_status)
+        self.assertNotEqual(first, second)
+        # And the reader really did see the file, rather than skipping it.
+        self.assertNotIn("Unknown option", self.fingerprint_run().stderr)
+
+    def test_an_untracked_symlink_s_link_text_is_its_content(self):
+        """A symlink's candidate bytes are the link text, not the target's.
+
+        Both targets hold identical bytes here, so a command that followed
+        the link would report the same fingerprint for two different
+        candidates.
+        """
+        (self.repo / "target-a").write_text("same\n", encoding="utf-8")
+        (self.repo / "target-b").write_text("same\n", encoding="utf-8")
+        link = self.repo / "link"
+        link.symlink_to("target-a")
+        first = self.fingerprint()
+        link.unlink()
+        link.symlink_to("target-b")
+        second = self.fingerprint()
+
+        self.assertNotEqual(first, second)
+
+    def test_an_unreadable_untracked_path_fails_the_command(self):
+        """A partial candidate must not yield a fingerprint at all.
+
+        A silently truncated byte stream would still hash to something, and
+        that something would be recorded as this candidate's identity.
+        """
+        if os.geteuid() == 0:
+            self.skipTest("root can read a mode-000 file")
+        blocked = self.repo / "blocked.txt"
+        blocked.write_text("x\n", encoding="utf-8")
+        blocked.chmod(0o000)
+        self.addCleanup(blocked.chmod, 0o600)
+
+        done = self.fingerprint_run()
+
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+
+    def test_staging_renaming_deleting_and_ignoring(self):
+        clean = self.fingerprint()
+        (self.repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+        unstaged = self.fingerprint()
+        self.git("add", "tracked.txt")
+        # Staging is not a different candidate: the same bytes are the same
+        # candidate whether or not the index knows about them.
+        self.assertEqual(unstaged, self.fingerprint())
+        self.assertNotEqual(clean, unstaged)
+
+        self.git("mv", "tracked.txt", "renamed.txt")
+        renamed = self.fingerprint()
+        self.assertNotEqual(unstaged, renamed)
+
+        self.git("rm", "-q", "-f", "renamed.txt")
+        self.assertNotEqual(renamed, self.fingerprint())
+
+        # An ignored file is not part of the candidate.
+        deleted = self.fingerprint()
+        (self.repo / "ignored.txt").write_text("noise\n", encoding="utf-8")
+        self.assertEqual(deleted, self.fingerprint())
+
+    def test_the_command_does_not_mutate_the_index_or_the_worktree(self):
+        (self.repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+        (self.repo / "new.txt").write_text("added\n", encoding="utf-8")
+        before_index = self.git("ls-files", "-s")
+        before_status = self.porcelain()
+        before_bytes = {
+            path.name: path.read_bytes()
+            for path in sorted(self.repo.iterdir())
+            if path.is_file()
+        }
+
+        self.fingerprint()
+
+        self.assertEqual(self.git("ls-files", "-s"), before_index)
+        self.assertEqual(self.porcelain(), before_status)
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in sorted(self.repo.iterdir())
+                if path.is_file()
+            },
+            before_bytes,
+        )
 
 
 class StopGateReuseTests(EnvelopeFixture):

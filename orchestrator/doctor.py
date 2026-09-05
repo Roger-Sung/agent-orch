@@ -97,7 +97,12 @@ def run_doctor(home: Path) -> dict[str, Any]:
     # which is the environment that matters and often not the shell's. A
     # malformed command (broken shell quoting) must land as a failed check,
     # not abort the whole report.
+    # Late import: start pulls in the intake vocabulary, which must not be a
+    # module-level dependency of a read-only wiring report.
+    from .start import RESOLVER_OWNER, resolver_isolation_support
+
     runner = SubprocessRunner()
+    resolver_version = ""
     for owner in ("claude", "codex"):
         try:
             result = runner.preflight(owner)
@@ -107,6 +112,36 @@ def run_doctor(home: Path) -> dict[str, Any]:
         status = "ok" if result.status == "pass" else "fail"
         command = " ".join(result.command)
         checks.append(_check(f"provider_{owner}", status, f"{result.reason}: {command}"))
+        if owner == RESOLVER_OWNER:
+            # The version this check reports is the one the preflight above
+            # already obtained. Re-fetching it would spawn the CLI a second
+            # time to learn something already in hand.
+            lines = (result.output or "").strip().splitlines()
+            resolver_version = lines[0].strip() if lines else ""
+
+    # The intake resolver's isolation flags are an assumption about someone
+    # else's CLI. Nothing else in the engine ever asks whether those four
+    # options still exist, so a rename in a Claude release would surface as a
+    # provider exit code at every intake instead of as a configuration fact
+    # here. One `--help` on the invocation that is already being spawned.
+    support = resolver_isolation_support()
+    version_note = (
+        f"resolver CLI reports {resolver_version}"
+        if resolver_version
+        else "resolver CLI version not reported by its preflight"
+    )
+    if support.missing:
+        kind = "absent from `--help`" if support.verified else "unverified"
+        checks.append(
+            _check(
+                "resolver_isolation",
+                "fail",
+                f"intake resolver isolation option(s) {kind}: {', '.join(support.missing)} "
+                f"({support.detail}); {version_note}",
+            )
+        )
+    else:
+        checks.append(_check("resolver_isolation", "ok", f"{support.detail}; {version_note}"))
 
     # Unattended acknowledgement: only meaningful when a known flag is in use.
     hits: list | None
