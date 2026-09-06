@@ -4,14 +4,16 @@
 
 繁體中文摘要 → [README.zh-TW.md](README.zh-TW.md)
 
-A stateful dispatcher for agent tasks. SQLite-backed state machine, a
-single-writer daemon, caps on every loop, cross-provider stop gates, and a
-sealed evidence trail for every committed stage run.
+Stateful AI agent orchestration for long-running Claude Code and Codex CLI
+workflows. It runs unattended between explicit human-in-the-loop stop points.
+Execution is governed by a SQLite-backed state machine, a single-writer
+daemon, caps on every loop, cross-provider review gates, and a sealed evidence
+trail for every committed stage run.
 
-Built to run long-lived Claude/Codex workflows unattended, where retries and
-side effects must be auditable afterwards. Published to be read, not adopted —
-see [Project status](#project-status). The engine has no third-party Python
-dependencies, and the demo needs no setup.
+Built for durable, resumable execution of long-lived Claude/Codex workflows,
+where retries and side effects must be auditable afterwards. Published to be
+read, not adopted — see [Project status](#project-status). The engine has no
+third-party Python dependencies, and the demo needs no setup.
 
 ---
 
@@ -33,11 +35,12 @@ next stage. Two conflicting outcomes in one run is an `ambiguous_outcome` stop,
 not a coin flip; an outcome the stage was never allowed to produce is an
 `unknown_outcome` stop. The state machine never guesses what the agent meant.
 
-**Caps on every loop.** Stages have attempt caps and every edge of the state
-machine has a transition cap. Two agents that disagree — a reviewer that keeps
-blocking, an implementer that keeps re-submitting — get a bounded number of
-round trips and then stop for a human, instead of burning quota until someone
-notices. The task's whole lifetime is bounded again by `max_transitions`.
+**Caps on every loop.** These bounded-loop guardrails give stages attempt
+caps and every edge of the state machine a transition cap. Two agents that
+disagree — a reviewer that keeps blocking, an implementer that keeps
+re-submitting — get a bounded number of round trips and then stop for a human,
+instead of burning quota until someone notices. The task's whole lifetime is
+bounded again by `max_transitions`.
 
 **Reclaim, not orphan.** Stage runs are leased. If the daemon dies mid-stage,
 startup reconciliation finds the run still marked `running`, blocks it with a
@@ -161,12 +164,13 @@ stop that additionally requires an independent containment review before a
 rerun can be authorised. The full stop-reason table is in
 [`docs/operating.md`](docs/operating.md#stop-reasons).
 
-## Stop gates
+## Cross-provider review gates
 
 For work whose blast radius justifies it, the reviewer comes from a different
-provider family than the executor. A model reviewing its own output shares its
-own blind spots, so a same-family review mostly confirms what the executor
-already believed.
+provider family than the executor. The profiles call these stop gates
+(`stop_gate_claude.yaml`, `stop_gate_codex.yaml`): a review whose `block`
+stops the task. A model reviewing its own output shares its own blind spots,
+so a same-family review mostly confirms what the executor already believed.
 
 - The gate profile is selected from who executed, not configured per task, so
   the reviewer is always the *other* owner slot — no model clears its own

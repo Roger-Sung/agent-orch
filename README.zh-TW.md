@@ -6,7 +6,7 @@
 
 ## 這是什麼
 
-一個有狀態的 agent 任務派工服務：SQLite 狀態機、單一寫入者的常駐 daemon、每個迴圈都有上限、跨供應商的 stop gate，以及每個已提交的階段執行都會封存的證據鏈。
+一個有狀態的 AI agent 任務編排／派工服務，用來執行 Claude Code 與 Codex CLI 長時間運行的多 agent 工作流。它可在明確的人機協作停點之間無人看管地執行，到了停點才交由人裁決（human-in-the-loop）。核心機制包括 SQLite 狀態機、單一寫入者的常駐 daemon、每個迴圈的上限、跨供應商的 review gate，以及每個已提交階段執行的封存證據鏈。
 
 它是為了在無人看管的情況下執行 Claude／Codex 的長流程而建，前提是事後的重試與副作用必須可稽核。公開目的是給人讀，不是給人用——見英文版的 Project status。引擎沒有第三方 Python 依賴，demo 不需要任何設定。
 
