@@ -266,9 +266,16 @@ lease reclaim, sealed manifests, cross-provider gates, git egress guard, L1
 prevention (macOS), L2 detection, the fake-agent demo, and the sanitization
 scanner with its fail-closed pre-commit hook.
 
-Not implemented, and said so in the code rather than left to be discovered: L3
-isolation; enforced cross-family reviewer selection; a generic CLI adapter so
-other agent CLIs can be owners; provider capability discovery; Windows support.
+Not implemented, and said so in the code rather than left to be discovered:
+
+- L3 isolation: a stage can still read anything the user can read, and send it
+  anywhere.
+- Enforced cross-family reviewer selection: the engine trusts that the `claude`
+  and `codex` owner slots really are different families, and does not verify
+  it.
+- A generic CLI adapter, so other agent CLIs can be owners.
+- Discovery of what each provider CLI supports.
+- Windows support.
 
 ## Layout
 

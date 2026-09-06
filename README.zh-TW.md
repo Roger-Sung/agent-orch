@@ -8,29 +8,46 @@
 
 一個有狀態的 AI agent 任務編排／派工服務，用來執行 Claude Code 與 Codex CLI 長時間運行的多 agent 工作流。它可在明確的人機協作停點之間無人看管地執行，到了停點才交由人裁決（human-in-the-loop）。核心機制包括 SQLite 狀態機、單一寫入者的常駐 daemon、每個迴圈的上限、跨供應商的 review gate，以及每個已提交階段執行的封存證據鏈。
 
-它是為了在無人看管的情況下執行 Claude／Codex 的長流程而建，前提是事後的重試與副作用必須可稽核。公開目的是給人讀，不是給人用——見英文版的 Project status。引擎沒有第三方 Python 依賴，demo 不需要任何設定。
+它為 Claude／Codex 長流程的持久、可續跑執行而建，用在事後必須能稽核每次重試與副作用的場合。公開目的是給人讀，不是給人用——見英文版的 Project status。引擎沒有第三方 Python 依賴，demo 不需要任何設定。
 
 ## 為什麼是服務，不是一個迴圈
 
 一個反覆呼叫 agent 的 shell 迴圈，在中途失敗之前都很好用。失敗之後問題就來了，而迴圈答不出任何一題：當時跑到哪個階段、已經燒了幾次嘗試、產出有沒有被審過、現在能不能安全地續跑還是會重做一個副作用已經落地的步驟。
 
-這些答案必須住在只有一個寫入者的持久狀態裡。四個性質由此而來：**型別化的結果**（階段只能印出一行 `ORCHESTRATOR_OUTCOME`，狀態機從不猜 agent 的意思）、**每個迴圈都有上限**（兩個意見不合的 agent 只能來回有限次，然後停下來等人）、**回收而非遺棄**（daemon 中途死掉，重啟時會找到仍標記執行中的 run 並隔離）、**證據封存**（每次已提交的執行都封存 manifest：log hash、輸出 hash、結果、模型、token 用量、lease token）。
+這些答案必須住在只有一個寫入者的持久狀態裡。四個性質由此而來：
+
+- **型別化的結果。** 階段只能印出一行 `ORCHESTRATOR_OUTCOME`，狀態機從不猜 agent 的意思。
+- **每個迴圈都有上限。** 兩個意見不合的 agent 只能來回有限次，然後停下來等人。
+- **回收而非遺棄。** daemon 中途死掉，重啟時會找到仍標記執行中的 run 並隔離。
+- **證據封存。** 每次已提交的執行都封存 manifest，內含 log hash、輸出 hash、結果、模型、token 用量與 lease token。
 
 ## 它怎麼來的
 
-起點是不想守在 agent 旁邊接力：啟動、走開、回來驗收一個可以查證的結果。這裡每一個機制，都是這個承諾在某個具體情境下破掉時加上去的。無法安全續跑的執行，變成單一寫入者的持久狀態；同一家模型的審查只是在確認執行者的假設而不是在檢驗它，變成跨供應商的 gate；一個階段無視自己的工作區、改寫了機器上另一處的正式資料並回報成功——由人讀結果時發現——變成 L1 預防與 L2 偵測。這個系統的形狀是出過什麼事的紀錄，不是預先畫好的設計。
+起點是不想守在 agent 旁邊接力：啟動、走開、回來驗收一個可以查證的結果。這裡每一個機制，都是這個承諾在某個具體情境下破掉時加上去的：
+
+- 執行無法安全續跑，於是有了單一寫入者的持久狀態。
+- 同一家模型的審查只是在確認執行者的假設，而不是在檢驗它，於是有了跨供應商的 review gate。
+- 一個階段無視自己的工作區，改寫了機器上另一處的正式資料還回報成功，是人讀結果時才發現的，於是有了 L1 預防與 L2 偵測。
+
+這個系統的形狀是出過什麼事的紀錄，不是預先畫好的設計。
 
 ## 證據
 
-- 引擎測試由 CI 在 Linux 與 macOS 上執行，涵蓋狀態機與各種上限、lease 回收、intake 風險分類與 interpretation envelope、propose 階段的收斂、runner 生命週期一致性，以及圍堵層的驗收測試（L1 寫入阻擋、L2 逃逸偵測；L1 測試需要 macOS `sandbox-exec`，其他主機會跳過）。去識別化掃描器有自己的 fixture 測試。
+- 引擎測試由 CI 在 Linux 與 macOS 上執行，涵蓋狀態機與各種上限、lease 回收、intake 風險分類與 interpretation envelope、propose 階段的收斂、runner 生命週期一致性，以及圍堵層的驗收測試（L1 寫入阻擋、L2 逃逸偵測）。L1 測試需要 macOS `sandbox-exec`，其他主機會跳過。去識別化掃描器有自己的 fixture 測試。
 - 每個已提交的階段執行都留下封存的 manifest（daemon 中途死掉的執行只會標記 blocked 並補 log，不封存）；`python3 -m orchestrator containment-inspect TASK_ID` 以唯讀連線重新驗證保留的證據。
 - CI 只跑部分去識別化掃描——嚴格規則需要的站點字串刻意不進 repo。綠色 badge 代表測試通過且 repo 端規則沒有發現問題；嚴格掃描是發佈者的責任，見 [`docs/operating.md`](docs/operating.md)。
 
 ## 有做的與沒做的
 
-**有做**：狀態機、單一寫入者 daemon、型別化結果、各種上限、lease 回收、封存 manifest、跨供應商 gate、git 出口封鎖、L1 寫入預防（macOS）、L2 寫入偵測、假 agent demo、去識別化掃描器與 fail-closed 的 pre-commit hook。
+**有做**：狀態機、單一寫入者 daemon、型別化結果、各種上限、lease 回收、封存 manifest、跨供應商 review gate、git 出口封鎖、L1 寫入預防（macOS）、L2 寫入偵測、假 agent demo、去識別化掃描器與 fail-closed 的 pre-commit hook。
 
-**沒做，且在程式與文件裡明說**：L3 隔離（階段仍能讀取使用者讀得到的任何東西）；強制跨供應商 reviewer 的檢查（目前只信任兩個 owner 槽位確實來自不同家）；通用的 CLI adapter；供應商能力探測；Windows。
+**沒做，且在程式碼與文件裡明說，不留給人自己踩到：**
+
+- L3 隔離。階段仍讀得到使用者讀得到的任何東西，也攔不住它往外送。
+- 強制檢查 reviewer 來自不同供應商。目前只信任 `claude`、`codex` 兩個 owner 槽位確實是不同家，引擎本身不驗證。
+- 通用的 CLI adapter，讓其他 agent CLI 也能當 owner。
+- 探測供應商 CLI 支援哪些能力。
+- Windows 支援。
 
 圍堵層的邊界與未解問題寫在 [`docs/threat-model.md`](docs/threat-model.md)。
 
