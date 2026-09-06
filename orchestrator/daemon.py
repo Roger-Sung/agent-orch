@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,11 @@ from .controller import Controller, ControllerError
 from .ipc import IPCError, atomic_write_json, atomic_write_text, hold_daemon_lock
 from .profile import ProfileError
 from .runner import require_unattended_consent
+
+
+# Atomic request writes normally live for milliseconds. Keep a generous grace
+# so startup reconciliation cannot steal a temp file from a concurrent caller.
+STARTUP_TEMP_GRACE_SECONDS = 60.0
 
 
 def run_daemon(home: Path, poll_interval: float = 3.0) -> None:
@@ -154,6 +160,16 @@ def _reconcile_startup_requests(
     for directory, kind in ((inbox, "inbox"), (processing, "processing")):
         for path in sorted(directory.iterdir()):
             if path.name.startswith("."):
+                try:
+                    age_seconds = time.time() - path.stat().st_mtime
+                except FileNotFoundError:
+                    # A concurrent atomic writer already published or removed
+                    # the temp file after iterdir() observed it.
+                    continue
+                if age_seconds < STARTUP_TEMP_GRACE_SECONDS:
+                    # This may be an active atomic write. A later startup can
+                    # quarantine it if its writer died and it becomes stale.
+                    continue
                 controller._quarantine(None, path, None, f"{kind}_partial_temp_file")
                 summary["quarantined"] += 1
                 continue

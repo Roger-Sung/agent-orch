@@ -2022,6 +2022,39 @@ class FailureIntegrationTests(unittest.TestCase):
         self.assertTrue(quarantined)
         self.assertTrue(any(row["reason"].startswith("inbox_corrupt_request") for row in rows))
 
+    def test_daemon_startup_reconciliation_leaves_fresh_atomic_temp_and_quarantines_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            inbox = home / "inbox"
+            processing = home / "processing"
+            processed = home / "processed"
+            inbox.mkdir(parents=True)
+            processing.mkdir()
+            processed.mkdir()
+            fresh = inbox / ".fresh.json.tmp-active-writer"
+            stale = inbox / ".stale.json.tmp-dead-writer"
+            fresh.write_text("partially written", encoding="utf-8")
+            stale.write_text("abandoned", encoding="utf-8")
+            os.utime(stale, (0, 0))
+
+            controller = Controller(home, runner=SequenceRunner([]))
+            try:
+                summary = _reconcile_startup_requests(controller, inbox, processing, processed)
+                quarantined = list((home / "quarantine").glob("*.tmp-dead-writer"))
+                rows = list(controller.conn.execute("SELECT reason,request_path FROM quarantine"))
+                fresh_still_exists = fresh.is_file()
+                stale_still_exists = stale.exists()
+            finally:
+                controller.close()
+
+        self.assertTrue(fresh_still_exists)
+        self.assertFalse(stale_still_exists)
+        self.assertEqual(summary["quarantined"], 1)
+        self.assertTrue(quarantined)
+        self.assertTrue(
+            any(row["reason"] == "inbox_partial_temp_file" for row in rows)
+        )
+
 
 class BrokerIntegrationTests(unittest.TestCase):
     #: A provider shim that satisfies the E-13 convergence obligation.

@@ -1117,6 +1117,52 @@ class LiveFailureContainmentTests(_ParityCase):
         self.assertEqual(len(ends), 1)
         self.assertIs(ends[0]["live_complete"], False)
 
+    def test_c11c2_close_preserves_records_admitted_before_terminal(self):
+        self.require_live_emission()
+        stream_cls = runner_module._LiveStream
+        entered_write = threading.Event()
+        release_write = threading.Event()
+
+        class PausedHandle(FakeHandle):
+            def write(self, payload: bytes) -> int:
+                if self.writes == 0:
+                    entered_write.set()
+                    release_write.wait(timeout=10)
+                return super().write(payload)
+
+        handles: list[PausedHandle] = []
+        with mock.patch.object(
+            stream_cls,
+            "_create_handle",
+            staticmethod(lambda path: handles[-1]),
+        ):
+            handles.append(PausedHandle())
+            stream = stream_cls.open(
+                self.workdir / "c11c2.log", owner="claude", timeout_seconds=30
+            )
+            stream.stage_start(child_pid=os.getpid(), encoding="UTF-8")
+            self.assertTrue(entered_write.wait(timeout=2))
+            stream.fragment(b"x" * runner_module.LIVE_FRAGMENT_MAX_CHARS)
+            closer = threading.Thread(
+                target=lambda: stream.close(process=_ReapedStub(0), timed_out=False)
+            )
+            closer.start()
+            self.assertTrue(stream._closing.wait(timeout=2))
+            release_write.set()
+            closer.join(timeout=2)
+
+        self.assertFalse(closer.is_alive())
+        records = [
+            json.loads(line)
+            for line in bytes(handles[0].data).decode("utf-8").splitlines()
+            if line
+        ]
+        self.assertEqual(
+            [record["event"] for record in records],
+            ["stage_start", "output_fragment", "stage_end"],
+        )
+        self.assertEqual(len(records[1]["text"]), runner_module.LIVE_FRAGMENT_MAX_CHARS)
+
     def test_c11c_integration_bulk_output_keeps_the_drain_running(self):
         self.require_live_emission()
         legacy = self.observe(impl="legacy", child_spec=SPEC_C10, timeout=60)

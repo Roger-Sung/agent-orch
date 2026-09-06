@@ -910,6 +910,9 @@ class _LiveStream:
         if self._thread is None:
             self._incomplete.set()
             return
+        if self._closing.is_set():
+            self._incomplete.set()
+            return
         # The lifecycle thread is the sole producer, so admission needs no
         # lock. Optional records stop one short of the queue's capacity, which
         # keeps the last slot for the terminal record - the same
@@ -932,11 +935,12 @@ class _LiveStream:
                 self._incomplete.set()
             while True:
                 item = self._queue.get()
-                if self._closing.is_set():
-                    # Discard the optional backlog rather than write it, so
-                    # close()'s bounded join is not spent on records that are
-                    # no longer worth having.
-                    if item is not _LIVE_TERMINAL or not self._queue.empty():
+                if item is _LIVE_TERMINAL:
+                    # The lifecycle thread queues the sentinel after every
+                    # admitted optional record. Preserve that order even when
+                    # close() wins the race with this thread; the caller still
+                    # waits no longer than LIVE_CLOSE_JOIN_SECONDS.
+                    if not self._queue.empty():
                         self._incomplete.set()
                     self._finalize()
                     return
