@@ -240,8 +240,8 @@ review seat; swapping the profiles reverses the pairing.
 
 ## Evidence
 
-- 426 engine tests and 13 sanitization-scanner tests, run on Linux and macOS
-  by CI. The engine suite includes the containment acceptance tests; the L1
+- Over 400 engine tests and 13 sanitization-scanner tests, run on Linux and
+  macOS by CI. The engine suite includes the containment acceptance tests; the L1
   tests that need macOS `sandbox-exec` skip on hosts without it.
 - Every committed stage run leaves a sealed manifest — a run cut off by a
   daemon crash is blocked with its log appended, not sealed. `python3 -m
