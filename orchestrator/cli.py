@@ -66,6 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     scope_group.add_argument("--scope-file", type=Path)
     start.add_argument("--worktree", type=Path)
     start.add_argument("--approved-spec", type=Path)
+    start.add_argument("--draft-spec", type=Path, help="opt-in: review an external draft once, without a planner")
+    start.add_argument("--execution-config", type=Path, help="opt-in: versioned request-scoped stage model/effort JSON")
     start.add_argument(
         "--executor",
         choices=["claude", "codex"],
@@ -117,6 +119,20 @@ def build_parser() -> argparse.ArgumentParser:
     # The long-running service: watch the inbox and execute (the only Controller,
     # and the single writer).
     subparsers.add_parser("daemon", help="run the always-on service that watches the inbox")
+    session_register = subparsers.add_parser("review-session-register", help="register a new or explicitly imported same-host Fable session; no model call")
+    session_register.add_argument("series")
+    session_register.add_argument("--cwd", required=True, type=Path)
+    session_register.add_argument("--receipt", type=Path, help="successful Claude JSON receipt for an existing local session")
+    session_status = subparsers.add_parser("review-session-status", help="read a registered review session without invoking it")
+    session_status.add_argument("series")
+    session_reconcile = subparsers.add_parser("review-session-reconcile", help="clear a pending review only against its DB-committed sealed receipt")
+    session_reconcile.add_argument("task_id")
+    session_rehydrate = subparsers.add_parser("review-session-rehydrate", help="explicitly replace a stopped/lost session with checkpoint context; old tasks remain invalid")
+    session_rehydrate.add_argument("series")
+    session_rehydrate.add_argument("--expected-session", required=True)
+    session_rehydrate.add_argument("--cwd", required=True, type=Path)
+    session_rehydrate.add_argument("--reason", required=True)
+    session_rehydrate.add_argument("--checkpoint", required=True, type=Path)
 
     subparsers.add_parser(
         "doctor",
@@ -259,6 +275,24 @@ def main(argv: list[str] | None = None) -> int:
         report = run_doctor(home)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 1 if report["summary"]["fail"] else 0
+
+    if args.command in {"review-session-register", "review-session-status", "review-session-reconcile", "review-session-rehydrate"}:
+        from . import review_session
+        try:
+            if args.command == "review-session-register":
+                result = review_session.register(home, args.series, args.cwd, receipt=args.receipt)
+            elif args.command == "review-session-reconcile":
+                result = review_session.reconcile(home, args.task_id)
+            elif args.command == "review-session-rehydrate":
+                result = review_session.rehydrate(home, args.series, expected_session=args.expected_session,
+                                                  cwd=args.cwd, reason=args.reason, checkpoint=args.checkpoint)
+            else:
+                result = review_session.inspect(home, args.series, allow_pending=True)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"orchestrator: {exc}", file=sys.stderr)
+            return 2
 
     if args.command == "start":
         try:

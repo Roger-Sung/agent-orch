@@ -172,7 +172,7 @@ Which stop reason lands where, and who can move it on:
 | `edge_cap` | `waiting_user` | human |
 | `transition_cap` | `waiting_user` | human |
 | `orphaned_running` (daemon died mid-stage) | `blocked` | human |
-| `rate_limited` | `paused` | automatic backoff |
+| `rate_limited` | `paused` | explicit resume after capacity returns; no automatic backoff scheduler |
 | `missing_outcome` | `blocked` | human |
 | `ambiguous_outcome` | `blocked` | human |
 | `unknown_outcome` | `blocked` | human |

@@ -641,6 +641,7 @@ WHOLE_STREAM_PROTOCOL = "whole_stream"
 #: Selected for a recognised native `codex exec`: the final response comes
 #: from the CLI's own final-message channel, bound to this run's file.
 CODEX_LAST_MESSAGE_PROTOCOL = "codex_output_last_message"
+CLAUDE_JSON_PROTOCOL = "claude_json_result"
 
 #: The flag the engine appends, and the spellings that mean the operator is
 #: already using the channel for their own purpose. The engine never competes
@@ -677,7 +678,7 @@ FINAL_RESPONSE_ERRORS = frozenset(
     {FINAL_RESPONSE_MISSING, FINAL_RESPONSE_EMPTY, FINAL_RESPONSE_UNREADABLE, FINAL_RESPONSE_TOO_LARGE}
 )
 #: The complete set of protocols, for the same reason.
-FINAL_RESPONSE_PROTOCOLS = frozenset({WHOLE_STREAM_PROTOCOL, CODEX_LAST_MESSAGE_PROTOCOL})
+FINAL_RESPONSE_PROTOCOLS = frozenset({WHOLE_STREAM_PROTOCOL, CODEX_LAST_MESSAGE_PROTOCOL, CLAUDE_JSON_PROTOCOL})
 
 #: Stop reason for a native command that already claims the channel.
 PROVIDER_CHANNEL_CONFLICT = "provider_final_response_channel_conflict"
@@ -1025,6 +1026,7 @@ class RunResult:
     #: the controller so it can remove the file *after* sealing the artifact
     #: that contains those bytes. None whenever there is no side channel.
     final_response_capture_path: str | None = None
+    execution_receipt: dict | None = None
 
 
 def classify_result(
@@ -1112,6 +1114,7 @@ def _boundary_fields(source: RunResult | None) -> dict[str, str | None]:
         "final_response_source": source.final_response_source or WHOLE_STREAM_PROTOCOL,
         "final_response_error": source.final_response_error,
         "final_response_capture_path": source.final_response_capture_path,
+        "execution_receipt": source.execution_receipt,
     }
 
 
@@ -1525,6 +1528,12 @@ class SubprocessRunner:
         reports_dir: Path | None = None,
     ) -> RunResult:
         provider_argv = self._command(owner)
+        require_outer_sandbox = getattr(self, "require_outer_sandbox", False)
+        if require_outer_sandbox and (workspace is None or allow_unsandboxed_requested()):
+            return self._containment_stop(
+                log_path, owner, provider_argv, "outer_sandbox_required",
+                "opt-in executor requires a workspace and mandatory orch L1; unsandboxed execution is forbidden",
+            )
         try:
             protocol = final_response_protocol(owner, provider_argv)
         except ProviderChannelConflictError as exc:
@@ -1580,7 +1589,7 @@ class SubprocessRunner:
                 decision = prepare_sandbox(
                     workspace,
                     log_path.with_suffix(".containment"),
-                    allow_unsandboxed=allow_unsandboxed_requested(),
+                    allow_unsandboxed=False if require_outer_sandbox else allow_unsandboxed_requested(),
                     extra_allow=(reports_dir,) if reports_dir is not None else (),
                     protected_roots=protected_roots,
                 )
@@ -1597,7 +1606,7 @@ class SubprocessRunner:
                 return self._containment_stop(
                     log_path, owner, command, "sandbox_setup_failed", str(exc)
                 )
-            if decision.blocks_run:
+            if decision.blocks_run or (require_outer_sandbox and decision.mode != "sandboxed"):
                 return self._containment_stop(
                     log_path,
                     owner,
@@ -1630,7 +1639,7 @@ class SubprocessRunner:
                 stderr=subprocess.STDOUT,
                 text=True,
                 start_new_session=True,
-                cwd=str(workspace) if workspace is not None else None,
+                cwd=str(workspace) if workspace is not None else getattr(self, "working_directory", None),
                 env=containment_env,
             )
             child_pid = process.pid

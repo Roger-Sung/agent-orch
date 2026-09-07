@@ -7,13 +7,33 @@
 Stateful AI agent orchestration for long-running Claude Code and Codex CLI
 workflows. It runs unattended between explicit human-in-the-loop stop points.
 Execution is governed by a SQLite-backed state machine, a single-writer
-daemon, caps on every loop, cross-provider review gates, and a sealed evidence
+daemon, explicit convergence/stop policies, cross-provider review gates, and a sealed evidence
 trail for every committed stage run.
 
 Built for durable, resumable execution of long-lived Claude/Codex workflows,
 where retries and side effects must be auditable afterwards. Published to be
 read, not adopted — see [Project status](#project-status). The engine has no
 third-party Python dependencies, and the demo needs no setup.
+
+## For portfolio reviewers
+
+This project is about **control-plane engineering around fallible agents**, not
+training a model or claiming that two models always produce better code.
+The interesting work is deciding which result is authoritative, who may advance
+state, and what evidence makes a retry safe.
+
+Start with the [offline demo](#30-second-demo--no-credentials-no-network), then
+follow one of these paths from design to implementation and tests:
+
+| Engineering question | Where to look |
+|---|---|
+| Can a crashed worker accidentally replay side effects? | [controller](orchestrator/controller.py), [daemon](orchestrator/daemon.py), [state-machine tests](orchestrator/tests/) |
+| Can display text or an old PASS authorize the next stage? | [output boundary decision](docs/decisions/provider-output-boundary.md), [runner](orchestrator/runner.py), [output tests](orchestrator/tests/test_provider_output.py) |
+| Can one reviewer retain context without inheriting authority? | [opt-in workflow](docs/astra-fable-opt-in.md), [session registry](orchestrator/review_session.py), [flow tests](orchestrator/tests/test_review_flow.py) |
+| What does containment actually prevent? | [threat model](docs/threat-model.md), [L1/L2 acceptance tests](orchestrator/tests/test_containment_layers.py) |
+
+The source is the reference artifact. The private deployment, credentials,
+conversation transcripts and runtime state are intentionally not part of it.
 
 ---
 
@@ -29,18 +49,19 @@ Those answers have to live in durable state that exactly one writer owns. That
 is what this is. Four properties follow, each there because of a specific way
 agent loops fail:
 
-**Typed outcomes, not output parsing.** A stage ends by printing exactly one
+**Typed outcomes, not unstructured output parsing.** A stage ends by printing exactly one
 `ORCHESTRATOR_OUTCOME: <name>` line, and the profile maps outcome names to the
 next stage. Two conflicting outcomes in one run is an `ambiguous_outcome` stop,
 not a coin flip; an outcome the stage was never allowed to produce is an
 `unknown_outcome` stop. The state machine never guesses what the agent meant.
 
-**Caps on every loop.** These bounded-loop guardrails give stages attempt
-caps and every edge of the state machine a transition cap. Two agents that
-disagree — a reviewer that keeps blocking, an implementer that keeps
-re-submitting — get a bounded number of round trips and then stop for a human,
-instead of burning quota until someone notices. The task's whole lifetime is
-bounded again by `max_transitions`.
+**Bounded-loop guardrails and convergence policies.** Legacy profiles retain
+attempt caps, per-edge transition caps and lifetime transition budgets.
+Interpretation-envelope loops whose frozen
+graph supports convergence use evidence of progress, stalling and oscillation
+rather than imposing a new blanket round limit. The opt-in single-review route
+does not automatically dispatch repair after a non-ready review: it stops for
+the coordinator. Timeouts and infrastructure safeguards remain in force.
 
 **Reclaim, not orphan.** Stage runs are leased. If the daemon dies mid-stage,
 startup reconciliation finds the run still marked `running`, blocks it with a
@@ -62,7 +83,12 @@ not be resumed safely became durable state with a single writer. A same-family
 review that confirmed the executor's assumptions instead of testing them became
 the cross-provider gate. A stage that ignored its workspace and rewrote a live
 data store elsewhere — reporting success, caught by a human reading the result —
-became L1 prevention and L2 detection. The shape is the record of what broke.
+became L1 prevention and L2 detection. A later native integration test exposed
+another failure: nesting Codex's sandbox inside the existing macOS sandbox
+prevented even legitimate tool execution. The opt-in executor now requires
+orch's outer write boundary and does not create a second one. That change was
+treated as an explicit permissions decision, not a silent fallback. The shape
+is the record of what broke.
 
 ## 30-second demo — no credentials, no network
 
@@ -141,26 +167,27 @@ stateDiagram-v2
     [*] --> queued
     queued --> running: claim lease
     running --> queued: next stage
-    running --> waiting_user: cap reached ⛔
+    running --> waiting_user: budget / decision required ⛔
     running --> paused: rate limited 🔁
     running --> blocked: guard stop ⛔
     running --> done: terminal stage
     running --> failed: terminal failure
     waiting_user --> queued: human decision 👤
-    paused --> queued: backoff retry 🔁
+    paused --> queued: explicit resume 👤
     blocked --> queued: human decision 👤
     done --> [*]
     failed --> [*]
 ```
 
-Three kinds of stop. A **cap** (`attempt_cap`, `edge_cap`, `transition_cap`)
-parks the task as `waiting_user`: the loop was working, it ran out of rope. A
+Three kinds of stop. A **decision point**, including legacy budget exhaustion
+(`attempt_cap`, `edge_cap`, `transition_cap`), unresolved scope or an opt-in
+non-ready review, parks the task as `waiting_user`. A
 **refusal** (`missing_outcome`, `ambiguous_outcome`, `unknown_outcome`,
 `timeout`, sandbox or containment failures) parks it as `blocked`: a run
-produced something the machine will not act on. A **rate limit** pauses and
-retries on its own. Only a human decision moves a parked task, it waits
-indefinitely, and every artifact is kept. `protected_root_drift` is the one
-stop that additionally requires an independent containment review before a
+produced something the machine will not act on. A **rate limit** pauses until
+an explicit resume; this engine does not schedule automatic backoff retries.
+Parked tasks retain their artifacts. `protected_root_drift` and `workspace_escape`
+additionally require an independent containment review before a
 rerun can be authorised. The full stop-reason table is in
 [`docs/operating.md`](docs/operating.md#stop-reasons).
 
@@ -168,9 +195,10 @@ rerun can be authorised. The full stop-reason table is in
 
 For work whose blast radius justifies it, the reviewer comes from a different
 provider family than the executor. The profiles call these stop gates
-(`stop_gate_claude.yaml`, `stop_gate_codex.yaml`): a review whose `block`
-stops the task. A model reviewing its own output shares its own blind spots,
-so a same-family review mostly confirms what the executor already believed.
+(`stop_gate_claude.yaml`, `stop_gate_codex.yaml`): reviews that recommend
+`allow` or `block`. A model reviewing its own output can share its own blind spots.
+Cross-family review is a design choice to reduce correlated assumptions, not
+a quality guarantee or a published model benchmark.
 
 - The gate profile is selected from who executed, not configured per task, so
   the reviewer is always the *other* owner slot — no model clears its own
@@ -178,40 +206,75 @@ so a same-family review mostly confirms what the executor already believed.
 - Which provider plays which role is a default, not the mechanism. Out of the
   box Claude implements and Codex reviews and gates; swapping the profiles
   reverses it without touching the engine.
-- Only `allow` reaches `done`. There is no path from a gate to terminal
-  success without one.
-- `block` is capped too. A gate cannot loop forever; at the cap the task stops
-  for a human instead of spending more on re-reviews.
+- Both verdicts finish the separate review task as `done`: that means the
+  review completed, not that the parent task was cleared. A separate manual
+  `gate-allow` or `gate-block` records the parent gate decision.
+- The gate profile runs one review stage; it does not automatically loop
+  through repairs and re-reviews.
 - The gate writes its review to a named path with a required schema, and it
   cannot apply its own verdict — recording the decision is a separate,
   human-driven step.
 
 One honest caveat: "cross-provider" means two CLIs from *different provider
 families*, and the engine trusts that the `claude` and `codex` slots really are
-that. It does not verify the commands behind them; an operator who points both
-at one family keeps the machinery and loses the property. Enforcement is
-planned, not implemented.
+that. It does not generally verify arbitrary commands behind those slots; an
+operator who points both at one family keeps the machinery and loses the property.
+The opt-in route below validates native command shapes and the reviewer's
+reported model/session, but is not a generic provider attestation layer.
+
+## Coordinator-led execution, one continuing reviewer
+
+The optional [Astra / Fable workflow](docs/astra-fable-opt-in.md) separates the
+human-facing coordinator from mechanical execution. The original conversation
+is called Astra here (a Codex coordinator session in the reference deployment). It
+owns exploration, the external spec, RD model/effort selection and arbitration.
+The engine can send that external draft to a single Fable reviewer without
+running another proposal author. Apply uses Codex execution and resumes the same
+Fable session for the spec series; technical review does not grant user approval.
+
+Three contracts make this more than a prompt convention:
+
+- **Frozen execution plan:** per-stage requested/resolved model and effort are
+  snapshotted and hashed. A later environment/config edit does not silently
+  reroute an already-submitted task.
+- **Context without write authority:** a tool-less reviewer receives an immutable
+  spec/candidate/evidence packet at a fixed canonical cwd. Its PASS is bound to
+  those hashes; changing the candidate during review invalidates the result.
+- **Crash-visible continuity:** a pending record precedes each provider call.
+  A sealed, database-committed receipt clears it. An unknown interrupted call
+  is not automatically replayed; explicit rehydration retains its predecessor
+  and decisions rather than pretending a new session is the old one.
+
+Non-ready review stops for the original coordinator. Evidence-based rebuttal
+and spec arbitration are operator-driven, not a fully automated model tribunal.
+Session reuse is not a promise of cache hits or lower cost. Existing profiles
+remain available and are not rewritten when this mode is absent.
 
 ## Containment, honestly
 
 Three layers, plus a git egress guard — and the boundaries are the interesting
-part. A mutating stage works inside a git worktree of the target repository and
-commits its changes: git is both the working medium and an escape channel,
+part. A mutating stage works inside a git worktree of the target repository;
+final commit/publication is a separate operator action. Git is both the working medium and an escape channel,
 which is why it gets a row of its own before the layers proper.
 
 | Layer | Mechanism | Stops |
 |---|---|---|
 | Git | worktree; credentials stripped; `GIT_ASKPASS`/`GIT_SSH_COMMAND` → `/usr/bin/false`; unconditional `pre-push` reject | results leaving through git |
-| L1 prevention | `sandbox-exec` write allowlist: workspace, artifact dir, temp dirs, provider CLI state dirs | writes outside the workspace |
+| L1 prevention | `sandbox-exec` write allowlist: workspace, artifact dir, temp dirs, provider CLI state dirs | writes outside that allowlist, not all writes outside the workspace |
 | L2 detection | sentinel snapshot of declared protected roots, before and after each stage | writes that happened anyway |
 | L3 isolation | **not implemented** | a stage reading whatever the user can read, or sending it anywhere |
 
 L1 fails closed: on a host without `sandbox-exec`, a mutating stage refuses to
-run unless `--allow-unsandboxed` is passed. L2 is deliberately independent of
+run unless `--allow-unsandboxed` is passed or `ORCH_ALLOW_UNSANDBOXED` is enabled.
+L2 is deliberately independent of
 L1 — `sandbox-exec` is deprecated by Apple, and a detection layer that only
 works when prevention works is decoration. When L2 fires, the task is blocked
 and quarantined with the offending paths recorded, *including when the stage
 reported success*, which is the case that actually matters.
+
+The opt-in Codex executor is stricter about that escape hatch: it requires L1
+and rejects unsandboxed execution, because its own inner sandbox is disabled to
+avoid nested macOS sandbox failures. This does not add read/network isolation.
 
 L1 and L2 exist because of the incident in [How it came to be](#how-it-came-to-be):
 a stage that wrote outside its workspace and reported success. Their behaviour
@@ -229,6 +292,7 @@ from typed outcomes to next stages, plus per-edge caps.
 |---|---|
 | `propose.yaml` | draft → review, review can send it back |
 | `spec_review.yaml` | two reviewers from different provider families |
+| `external_spec_review.yaml` | opt-in external draft → one continuing Fable reviewer; non-ready stops for the coordinator |
 | `claude_apply_codex_review.yaml` | apply → review → repair → delta review (**the default apply pairing**) |
 | `codex_implement_claude_review.yaml` | the same, executor and reviewer swapped |
 | `stop_gate_claude.yaml` / `stop_gate_codex.yaml` | one gate stage, `allow` or `block` |
@@ -266,13 +330,19 @@ lease reclaim, sealed manifests, cross-provider gates, git egress guard, L1
 prevention (macOS), L2 detection, the fake-agent demo, and the sanitization
 scanner with its fail-closed pre-commit hook.
 
+Also implemented as an opt-in route: immutable per-stage execution choices,
+external draft review, same-series reviewer session registration/resume/recovery,
+three-axis candidate-bound review, and a manual coordinator handoff on non-ready.
+These are source capabilities, not a claim that every deployment is upgraded.
+
 Not implemented, and said so in the code rather than left to be discovered:
 
 - L3 isolation: a stage can still read anything the user can read, and send it
   anywhere.
-- Enforced cross-family reviewer selection: the engine trusts that the `claude`
-  and `codex` owner slots really are different families, and does not verify
-  it.
+- General cross-family attestation: legacy owner slots are trusted; the opt-in
+  native-command/model checks do not authenticate arbitrary CLI wrappers.
+- Fully automatic arbitration, cross-host session sharing, or guaranteed
+  review convergence, cache reuse or cost savings.
 - A generic CLI adapter, so other agent CLIs can be owners.
 - Discovery of what each provider CLI supports.
 - Windows support.
@@ -281,6 +351,7 @@ Not implemented, and said so in the code rather than left to be discovered:
 
 ```
 orchestrator/            engine: controller, daemon, db, ipc, profile, runner, containment, start, cli, config, doctor
+                        opt-in: execution, execution_runner, review_contract, review_session
 orchestrator/profiles/   stage machines
 orchestrator/examples/   fake agent and the demo profile
 orchestrator/tests/      engine suite, including the containment acceptance tests

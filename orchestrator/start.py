@@ -17,6 +17,9 @@ from .containment import extra_write_roots_from_env, protected_roots_from_env, s
 from .ipc import atomic_write_text, daemon_is_running, enqueue_request
 from .profile import ProfileError, load_profile
 from .risk_rules import load_risk_rules
+from .execution import ExecutionConfigError, PLAN_BEGIN, PLAN_END, parse_request, resolve_request, restore_plan, render_plan
+from .execution_runner import configured_command
+from . import review_session
 from .runner import (
     ENVELOPE_AXES,
     ENVELOPE_BEGIN,
@@ -96,6 +99,10 @@ def _tracked_execution_patterns() -> dict[str, dict[str, object]]:
         "spec_review": {
             "type": "spec-review",
             "profile": profiles_dir() / "spec_review.yaml",
+        },
+        "external_spec_review": {
+            "type": "spec-review",
+            "profile": profiles_dir() / "external_spec_review.yaml",
         },
         "codex_implement_claude_review": {
             "type": "apply",
@@ -187,6 +194,8 @@ class StartFlags:
     #: a convention hidden inside free text is exactly what a second operator
     #: misses; the flag states it, and it wins over the keywords.
     executor: str | None = None
+    draft_spec: Path | None = None
+    execution_config: Path | None = None
 
 
 def start_from_args(home: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -201,6 +210,8 @@ def start_from_args(home: Path, args: argparse.Namespace) -> dict[str, Any]:
         effort=args.effort,
         dry_run=args.dry_run,
         executor=getattr(args, "executor", None),
+        draft_spec=getattr(args, "draft_spec", None),
+        execution_config=getattr(args, "execution_config", None),
     )
     return run_start(home, args.description, flags)
 
@@ -262,6 +273,12 @@ def run_start(home: Path, description: str, flags: StartFlags) -> dict[str, Any]
     _notify(home, "queued", "info", f"task-{task_id} queued, pattern TBD", routing_path)
 
     preflight = _preflight(task_record, flags)
+    if preflight["status"] == "pass" and "execution_plan" in task_record:
+        try:
+            record = review_session.inspect(home, task_record["execution_plan"]["spec_series_id"])
+            task_record["review_session"] = review_session.binding(record)
+        except (OSError, ValueError, KeyError) as exc:
+            preflight = {"status": "blocked", "reason": f"review_session_unavailable: {exc}"}
     routing: dict[str, Any]
     if preflight["status"] != "pass":
         task_record["stage"] = preflight["status"]
@@ -1349,8 +1366,8 @@ def _build_task_record(task_id: str, now: str, description: str, flags: StartFla
     scope_ambiguous = _scope_ambiguous(description, flags.scope)
     approved_spec = str(flags.approved_spec) if flags.approved_spec else None
     worktree = str(flags.worktree) if flags.worktree else None
-    signals = _signals(text, task_type, bool(flags.approved_spec), scope_ambiguous)
-    return {
+    signals = _signals(text, task_type, bool(flags.approved_spec or flags.draft_spec), scope_ambiguous)
+    record = {
         "task_id": task_id,
         "created_at": now,
         "task_description": description,
@@ -1367,6 +1384,29 @@ def _build_task_record(task_id: str, now: str, description: str, flags: StartFla
         "signals": signals,
         "stage": "intake",
     }
+    if flags.execution_config is not None:
+        record["execution_request"] = parse_request(flags.execution_config.read_text(encoding="utf-8"))
+        record["execution_config_source"] = str(flags.execution_config.resolve())
+        if task_type == "apply" and flags.executor is None:
+            record["flags"]["executor"] = "codex"
+        if flags.effort is not None:
+            for config in record["execution_request"]["stages"].values():
+                if config.get("role") == "executor":
+                    if config.get("effort", flags.effort) != flags.effort:
+                        raise ExecutionConfigError("--effort conflicts with execution-config stage effort")
+                    config["effort"] = flags.effort
+    if flags.draft_spec is not None:
+        draft = flags.draft_spec.read_text(encoding="utf-8")
+        record["external_draft"] = {"path": str(flags.draft_spec.resolve()), "text": draft,
+                                     "sha256": hashlib.sha256(draft.encode()).hexdigest()}
+    if flags.execution_config is not None:
+        source = flags.draft_spec or flags.approved_spec
+        if source is None:
+            raise ExecutionConfigError("execution config requires an external draft or approved spec")
+        text = source.read_text(encoding="utf-8")
+        record["review_context"] = {"kind": "spec" if flags.draft_spec else "implementation",
+                                    "spec_text": text, "spec_sha256": hashlib.sha256(text.encode()).hexdigest()}
+    return record
 
 
 def _infer_task_type(description: str) -> str:
@@ -1577,6 +1617,8 @@ def _requirement_sources(task_record: dict[str, Any]) -> list[tuple[str, str]]:
     scope = task_record.get("scope")
     if scope:
         sources.append(("scope", str(scope)))
+    if "external_draft" in task_record:
+        sources.append(("external draft", task_record["external_draft"]["text"]))
     approved_spec = (task_record.get("flags") or {}).get("approved_spec")
     if approved_spec:
         path = Path(str(approved_spec)).expanduser()
@@ -2386,6 +2428,22 @@ def _write_target_candidates(task_record: dict[str, Any]) -> list[str]:
 
 
 def _preflight(task_record: dict[str, Any], flags: StartFlags) -> dict[str, str | None]:
+    if "external_draft" in task_record and (task_record["task_type_hint"] != "review" or "execution_request" not in task_record):
+        return {"status": "blocked", "reason": "--draft-spec requires --task-type review and --execution-config"}
+    if "execution_request" in task_record:
+        try:
+            pattern = "external_spec_review" if "external_draft" in task_record else _pattern(
+                task_record["task_type_hint"], task_record["task_description"], task_record["flags"].get("executor"))[0]
+            if pattern not in {"external_spec_review", "codex_implement_claude_review"}:
+                raise ExecutionConfigError("execution config supports only external spec review and Codex apply")
+            profile = load_profile(Path(_tracked_execution_patterns()[pattern]["profile"]))
+            plan = resolve_request(task_record["execution_request"], profile)
+            for choice in plan.stages.values():
+                configured_command(provider_command(choice.provider), choice)
+            task_record["execution_plan"] = plan.to_dict()
+            task_record["execution_plan_digest"] = plan.digest
+        except (ValueError, OSError, ProfileError) as exc:
+            return {"status": "blocked", "reason": f"execution_config_invalid: {exc}"}
     task_type = task_record["task_type_hint"]
     signal_map = _signal_map(task_record)
     if task_record["scope_ambiguous"]:
@@ -2422,6 +2480,8 @@ def _preflight(task_record: dict[str, Any], flags: StartFlags) -> dict[str, str 
     # `_enqueue_for_routing`, so a stop here and a `--dry-run` both cost zero
     # resolver calls.
     for label, text in _requirement_sources(task_record):
+        if PLAN_BEGIN in text or PLAN_END in text:
+            return {"status": "blocked", "reason": f"{label} carries writer-owned execution markers"}
         if ENVELOPE_BEGIN in text or ENVELOPE_END in text:
             return {
                 "status": "waiting_user",
@@ -2439,6 +2499,8 @@ def _route(task_id: str, description: str, task_record: dict[str, Any], prefligh
     text = _combined_text(description, task_record.get("scope"))
     route_source = _route_source(text, task_type)
     pattern, executor, reviewer = _pattern(task_type, text, task_record["flags"].get("executor"))
+    if "external_draft" in task_record:
+        pattern, executor, reviewer = "external_spec_review", None, "claude"
     risk = _risk_from_signals(task_record)
     stop_gate = _stop_gate(text, risk)
     complexity = _complexity(task_type, risk, route_source)
@@ -2458,6 +2520,11 @@ def _route(task_id: str, description: str, task_record: dict[str, Any], prefligh
         rationale=_rationale(task_type, pattern, executor, reviewer, route_source, risk, complexity),
     )
     routing["auto_start"] = _auto_start(preflight["status"], risk, route_source)
+    if "execution_plan" in task_record:
+        routing["execution_plan_digest"] = task_record["execution_plan_digest"]
+        routing["model_policy"] = {"source": "request_scoped", "plan": task_record["execution_plan"]}
+        routing["auto_start"] = False
+        routing["stop_condition"] = "single review recorded; not an approval to apply" if pattern == "external_spec_review" else routing.get("stop_condition")
     return routing
 
 
@@ -2783,6 +2850,14 @@ def _write_execution_input(
         )
         lines.extend([render_envelope_block(payload), ""])
     rendered = "\n".join(lines)
+    if "external_draft" in task_record:
+        # Insert before the final writer-owned interpretation envelope.
+        block = "## External draft (snapshot, not approval)\n" + json.dumps(task_record["external_draft"], ensure_ascii=False) + "\n\n"
+        rendered = block + rendered
+    if "execution_plan" in task_record:
+        profile = load_profile(Path(_tracked_execution_patterns()[routing["pattern"]]["profile"]))
+        plan = restore_plan(task_record["execution_plan"], profile, task_record["execution_plan_digest"])
+        rendered = render_plan(plan, review=task_record.get("review_context"), session=task_record.get("review_session")) + rendered
     if emit_envelope:
         # Read the rendered file back through the same fail-closed extractor
         # every consumer uses, before anything is enqueued (E-20).
@@ -2840,12 +2915,20 @@ def _execution_plan(task_record: dict[str, Any], routing: dict[str, Any]) -> dic
             "model": SubprocessRunner._model_from_command(command) or "unspecified",
         }
 
+    scoped_commands = {}
+    if "execution_plan" in task_record:
+        plan = restore_plan(task_record["execution_plan"], profile, task_record["execution_plan_digest"])
+        for name, choice in plan.stages.items():
+            scoped_commands[name] = {**choice.to_dict(), "argv": configured_command(provider_command(choice.provider), choice)}
+        commands = {}  # Global commands are not the commands this task runs.
+
     approved_spec = flags.get("approved_spec")
     return {
         "pattern": pattern,
         "profile": str(profile_path) if profile_path else None,
         "stages": stages,
         "provider_commands": commands,
+        **({"stage_commands": scoped_commands, "execution_plan_digest": task_record["execution_plan_digest"]} if scoped_commands else {}),
         "workspace": flags.get("worktree"),
         "containment": {
             "sandbox_available": sandbox_available(),

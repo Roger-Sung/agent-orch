@@ -39,6 +39,7 @@ from orchestrator.retained import inspect_retained
 from orchestrator.runner import (
     CODEX_LAST_MESSAGE_FLAG,
     CODEX_LAST_MESSAGE_PROTOCOL,
+    CLAUDE_JSON_PROTOCOL,
     FINAL_RESPONSE_ERRORS,
     FINAL_RESPONSE_PROTOCOLS,
     PROVIDER_CHANNEL_CONFLICT,
@@ -1392,7 +1393,7 @@ class SealedBoundaryMatrixTests(unittest.TestCase):
         )
         self.assertEqual(
             FINAL_RESPONSE_PROTOCOLS,
-            frozenset({WHOLE_STREAM_PROTOCOL, CODEX_LAST_MESSAGE_PROTOCOL}),
+            frozenset({WHOLE_STREAM_PROTOCOL, CODEX_LAST_MESSAGE_PROTOCOL, CLAUDE_JSON_PROTOCOL}),
         )
         for value in ("provider_final_response_weird", "timeout", "runner_nonzero", "", " "):
             with self.subTest(error=value):
