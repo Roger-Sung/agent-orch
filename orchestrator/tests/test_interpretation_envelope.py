@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import orchestrator.start
-from orchestrator.controller import Controller
+from orchestrator.controller import Controller, ControllerError
 from orchestrator.doctor import run_doctor
 from orchestrator.retained import inspect_retained
 from orchestrator.runner import (
@@ -37,6 +37,7 @@ from orchestrator.runner import (
     ENVELOPE_SOURCE_REQUIREMENT,
     HOLD_OUTCOME,
     HOLD_STOP_REASON,
+    ConvergenceError,
     RunResult,
     allowed_outcomes,
     classify_result,
@@ -2250,6 +2251,96 @@ edge_caps:
         self.assertIn('["scenario-a", "scenario-b"]', delta_prompt)
         self.assertIn("Correction runs since then: repair", delta_prompt)
 
+    #: The producer contract. The engine reads the record and the typed outcome
+    #: from the authoritative final response and from nowhere else, so the
+    #: prompt has to say that in terms a reviewer cannot confuse with the
+    #: apply-review.md its own stage instructions ask it to write.
+    PRODUCER_CONTRACT_PHRASES = (
+        "MACHINE OUTPUT",
+        "FINAL ASSISTANT RESPONSE",
+        "from that final response and from",
+        "apply-review.md",
+        "does NOT satisfy this obligation",
+        "two separate",
+        "which remains the very last line of your output",
+    )
+
+    def test_both_branching_prompts_demand_the_record_in_the_final_response(self):
+        """First run and repeat review, over the same task.
+
+        Neither prompt may be readable as "put the record in the review file
+        you were just told to write": that reading is what made a correct run
+        fail closed on a missing record.
+        """
+        _controller, runner, _task_id, _status = self.run_task(
+            [
+                _output("applied"),
+                _output("needs_repair", _first_run_record(["scenario-a"])),
+                _output("repaired"),
+                _output("ready", _repeat_record([], ["scenario-a"], [])),
+            ]
+        )
+        first = runner.prompt_for("codex", 0)
+        repeat = runner.prompt_for("codex", 1)
+        self.assertNotIn("REPEAT REVIEW", first)
+        self.assertIn("REPEAT REVIEW", repeat)
+
+        for name, prompt in (("first", first), ("repeat", repeat)):
+            for phrase in self.PRODUCER_CONTRACT_PHRASES:
+                with self.subTest(prompt=name, phrase=phrase):
+                    self.assertIn(phrase, prompt)
+
+        # Each branch also restates it in its own terms, so neither can be
+        # read in isolation without the obligation.
+        self.assertIn("The complete record still goes in the final", first)
+        self.assertIn("All five keys go in the final assistant response", repeat)
+
+    def test_the_record_is_ordered_before_the_outcome_which_stays_last(self):
+        """Ordering, and the footer that must not move.
+
+        The engine's own footer already says the outcome line is the very last
+        line; the convergence section places the record immediately before it
+        rather than contradicting or duplicating that.
+        """
+        _controller, runner, _task_id, _status = self.run_task(
+            [_output("applied"), _output("needs_repair", _first_run_record(["scenario-a"]))]
+        )
+        prompt = runner.prompt_for("codex", 0)
+
+        self.assertIn("1. the complete convergence record block", prompt)
+        self.assertIn("2. then the ORCHESTRATOR_OUTCOME line", prompt)
+        self.assertLess(
+            prompt.index("1. the complete convergence record block"),
+            prompt.index("2. then the ORCHESTRATOR_OUTCOME line"),
+        )
+        # The unconditional footer is unchanged and still last in the prompt.
+        footer = (
+            "Complete this stage. As the VERY LAST line of your output, print the outcome once:\n"
+            "ORCHESTRATOR_OUTCOME: <typed outcome>\n"
+        )
+        self.assertIn(footer, prompt)
+        self.assertTrue(prompt.rstrip().endswith(
+            "Do not print this line more than once and do not write it into any file."
+        ))
+
+    def test_the_producer_contract_does_not_add_marker_pairs_to_the_prompt(self):
+        """A prompt that showed the delimiters more often would invite a model
+        to echo more than one pair into its final response, which the consumer
+        rejects. First run shows one pair, a repeat shows two: unchanged."""
+        _controller, runner, _task_id, _status = self.run_task(
+            [
+                _output("applied"),
+                _output("needs_repair", _first_run_record(["scenario-a"])),
+                _output("repaired"),
+                _output("ready", _repeat_record([], ["scenario-a"], [])),
+            ]
+        )
+        for index, expected in ((0, 1), (1, 2)):
+            prompt = runner.prompt_for("codex", index)
+            with self.subTest(prompt=index):
+                self.assertEqual(prompt.count(CONVERGENCE_BEGIN), expected)
+                self.assertEqual(prompt.count(CONVERGENCE_END), expected)
+
     def test_a12_a_first_branching_run_gets_no_directive_and_seals_an_empty_resolved_set(self):
         _controller, runner, _task_id, status = self.run_task(
             [_output("applied"), _output("needs_repair", _first_run_record(["scenario-a"]))]
@@ -2376,6 +2467,99 @@ edge_caps:
         delta = [row for row in resumed["stage_runs"] if row["stage"] == "delta_review"][-1]
         delta_manifest = json.loads(Path(delta["manifest_path"]).read_text(encoding="utf-8"))
         self.assertIn("convergence_unverifiable", delta_manifest["reason"])
+
+    def test_a_fresh_valid_review_recovers_a_baseline_after_a_parser_held_run(self):
+        """A branching run held because its record was never established must
+        not make every later review unreadable.
+
+        This is the state the provider output boundary leaves behind: before
+        the boundary existed, a native transcript put the composed prompt's own
+        convergence markers into the stream, so a perfectly good record parsed
+        as duplicated and the run was held with `convergence_record_invalid`.
+        Such a run made no accepted claim. Skipping it lets the next valid
+        review be scored against the last real baseline — and its own seals are
+        never rewritten to make that happen.
+        """
+        duplicated = _output(
+            "ready", _first_run_record(["scenario-a"]), _first_run_record(["scenario-b"])
+        )
+        controller, _runner = self.controller(
+            [
+                _output("applied"),
+                _output("needs_repair", _first_run_record(["scenario-a"])),
+                _output("repaired"),
+                duplicated,
+            ]
+        )
+        task_id = controller.submit("apply", APPLY_PROFILE, self.envelope_input("recovery.md"))
+
+        held = controller.run_until_stop(task_id)
+
+        self.assertEqual(held["task"]["stop_reason"], HOLD_STOP_REASON)
+        held_run = [row for row in held["stage_runs"] if row["stage"] == "delta_review"][-1]
+        held_manifest_path = Path(held_run["manifest_path"])
+        held_manifest = json.loads(held_manifest_path.read_text(encoding="utf-8"))
+        self.assertTrue(held_manifest["reason"].startswith("convergence_record_invalid"))
+        # Exactly the historical evidence that must survive the recovery.
+        before_manifest = held_manifest_path.read_bytes()
+        before_output = Path(held_manifest["output_path"]).read_bytes()
+        before_final = Path(held_manifest["final_response_path"]).read_bytes()
+
+        # The operator resumes and the stage produces a valid repeat record.
+        # prior_live comes from the review run's baseline, not from the run
+        # that was held: the held run contributes nothing in either direction.
+        controller.runner.outputs = [
+            _output("ready", _repeat_record([], ["scenario-a"], []))
+        ]
+        recovered = controller.resume(task_id)
+
+        self.assertEqual(recovered["task"]["status"], "done")
+        runs = [row for row in recovered["stage_runs"] if row["stage"] == "delta_review"]
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[-1]["outcome"], "ready")
+        recovered_manifest = json.loads(
+            Path(runs[-1]["manifest_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(recovered_manifest["reason"], "success")
+        self.assertNotIn("convergence", recovered_manifest["reason"])
+
+        # No seal was rewritten to reach that result.
+        self.assertEqual(held_manifest_path.read_bytes(), before_manifest)
+        self.assertEqual(Path(held_manifest["output_path"]).read_bytes(), before_output)
+        self.assertEqual(Path(held_manifest["final_response_path"]).read_bytes(), before_final)
+
+    def test_a_held_run_is_skipped_but_an_unreadable_accepted_run_is_not(self):
+        """The distinction the recovery rests on, from the other side.
+
+        A run held for `convergence_record_invalid` is skipped. A run that was
+        *accepted* and whose sealed evidence no longer verifies is a hard
+        error — there the claim was real and the evidence for it is gone.
+        """
+        controller, _runner = self.controller(
+            [
+                _output("applied"),
+                _output("needs_repair", _first_run_record(["scenario-a"])),
+                _output("repaired"),
+                _output("ready", _repeat_record([], ["scenario-a"], [])),
+            ]
+        )
+        task_id = controller.submit("apply", APPLY_PROFILE, self.envelope_input("accepted.md"))
+        controller.run_until_stop(task_id)
+        review_run = next(
+            row for row in controller.status(task_id)["stage_runs"] if row["stage"] == "review"
+        )
+        manifest = json.loads(Path(review_run["manifest_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(review_run["outcome"], "needs_repair")
+
+        # That accepted baseline's own final response no longer matches its
+        # sealed hash. Nothing may recover from this quietly.
+        final_path = Path(manifest["final_response_path"])
+        final_path.write_text(
+            final_path.read_text(encoding="utf-8").replace("scenario-a", "scenario-x"),
+            encoding="utf-8",
+        )
+        with self.assertRaises((ControllerError, ConvergenceError, ValueError)):
+            controller._read_sealed_convergence(dict(review_run))
 
     def test_a15_stalled_oscillating_and_bad_records_hold_before_any_cap_binds(self):
         prior_live = ["scenario-a", "scenario-b"]

@@ -8,7 +8,16 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .profile import profile_from_snapshot
-from .runner import allowed_outcomes, classify_result, extract_envelope
+from .runner import (
+    RUN_MANIFEST_SCHEMA_VERSION,
+    SUPPORTED_MANIFEST_VERSIONS,
+    BoundaryMetadataError,
+    RunResult,
+    allowed_outcomes,
+    classify_result,
+    extract_envelope,
+    validate_sealed_boundary,
+)
 
 
 DRIFT_REASONS = frozenset({"protected_root_drift", "workspace_escape"})
@@ -35,7 +44,7 @@ def inspect_retained(task: Mapping[str, Any], run: Mapping[str, Any]) -> dict[st
     if not isinstance(manifest, dict) or type(manifest.get("schema_version")) is not int:
         raise ValueError("retained_manifest_invalid")
     version = manifest["schema_version"]
-    if version not in {1, 2}:
+    if version not in SUPPORTED_MANIFEST_VERSIONS:
         raise ValueError("retained_manifest_version_unsupported")
     for name, expected in {
         "task_id": task["id"], "run_token": run["run_token"], "stage": run["stage"],
@@ -58,7 +67,7 @@ def inspect_retained(task: Mapping[str, Any], run: Mapping[str, Any]) -> dict[st
     profile = profile_from_snapshot(Path(task["profile_snapshot_path"]), task["profile_hash"])
     stage = profile.stage(run["stage"])
     drift = None
-    if version == 2:
+    if version >= 2:
         for name in ("profile_hash", "input_hash"):
             if manifest.get(name) != task[name]:
                 raise ValueError(f"retained_manifest_binding_mismatch:{name}")
@@ -87,12 +96,49 @@ def inspect_retained(task: Mapping[str, Any], run: Mapping[str, Any]) -> dict[st
         output = next((value for value in candidates if hashlib.sha256(value).hexdigest() == manifest["output_hash"]), None)
         if output is None:
             raise ValueError("retained_legacy_output_unverifiable")
+    boundary = None
+    final_response_source = None
+    if version >= RUN_MANIFEST_SCHEMA_VERSION:
+        # The full state matrix, from the same derivation the controller's
+        # sealed reader and the manifest writer use, so the three of them
+        # cannot drift on what a legal schema-3 run looks like. In particular
+        # `native + separate=false + error=null` is refused: accepting it left
+        # this reader with no final response, falling back to the raw display
+        # stream and reporting *that* as verified authoritative text.
+        try:
+            sealed = validate_sealed_boundary(manifest)
+        except BoundaryMetadataError as exc:
+            raise ValueError(f"retained_boundary_invalid:{exc.token}") from exc
+        final_response_source = sealed.protocol
+        # The named artifact gets its own verification. `read` raises on a
+        # missing file and on a hash mismatch alike, which is what stops a
+        # deleted or edited final response from being reported as verified.
+        final_bytes = read(sealed.path, sealed.digest)
+        final_text = None
+        if sealed.has_final_response and sealed.separate:
+            try:
+                final_text = final_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("retained_final_response_undecodable") from exc
+        # For a run that failed at the channel, `final_text` stays None and the
+        # error travels instead: classification then reports that failure
+        # rather than reading an outcome out of the display stream.
+        boundary = RunResult(
+            manifest["exit_code"], output.decode("utf-8"), None, "raw", "raw", manifest["timed_out"],
+            final_response=final_text,
+            final_response_source=sealed.protocol,
+            final_response_error=sealed.error,
+        )
     # Same derivation as the prompt footer and the live classification, from
     # the input snapshot this function already verifies: a drift-blocked
-    # envelope run must not report a spurious unknown_outcome here.
+    # envelope run must not report a spurious unknown_outcome here. From
+    # schema 3 the boundary travels with it, so the candidate is re-derived
+    # from the same authoritative text the live classification used.
     outcomes = set(allowed_outcomes(stage.outcomes, extract_envelope(input_text) is not None))
-    candidate = classify_result(manifest["exit_code"], output.decode("utf-8"), outcomes, manifest["timed_out"])
-    if version == 2:
+    candidate = classify_result(
+        manifest["exit_code"], output.decode("utf-8"), outcomes, manifest["timed_out"], source=boundary
+    )
+    if version >= 2:
         for name in ("outcome", "classification", "reason"):
             if manifest.get(f"candidate_{name}") != getattr(candidate, name):
                 raise ValueError(f"retained_candidate_mismatch:{name}")
@@ -102,6 +148,10 @@ def inspect_retained(task: Mapping[str, Any], run: Mapping[str, Any]) -> dict[st
         "schema_version": version, "original_stop_reason": manifest["reason"],
         "integrity": "verified", "candidate_outcome": candidate.outcome,
         "candidate_classification": candidate.classification, "candidate_reason": candidate.reason,
+        # Which protocol produced the text the candidate was read from. None
+        # for a manifest sealed before the boundary existed, where the answer
+        # is not recorded and must not be invented.
+        "final_response_source": final_response_source,
         "containment_attribution": "unknown", "drift_evidence": drift,
         "source_snapshot_verified": False, "authorised_to_advance": False,
         "disposition": "independent_containment_review_required",

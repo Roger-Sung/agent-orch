@@ -9,13 +9,14 @@ import selectors
 import shlex
 import signal
 import shutil
+import stat as stat_module
 import subprocess
 import threading
 import time
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .containment import ContainmentConfigError, ContainmentError, SandboxSetupError, prepare_sandbox
 
@@ -601,6 +602,377 @@ def _git_identity(env: dict[str, str] | None = None) -> dict[str, str]:
     return {"name": match.group("name"), "email": match.group("email"), "source": "env-literal"}
 
 
+# ---------------------------------------------------------------------------
+# Provider output boundary (docs/decisions/provider-output-boundary.md).
+# ---------------------------------------------------------------------------
+#
+# A provider CLI's stdout is a *display* stream, not one utterance. A native
+# `codex exec` run prints the composed prompt back under `User instructions:`,
+# then reasoning and tool events, and only then the model's final message. The
+# typed outcome and the convergence record are claims the model makes, so
+# reading them from the merged stream lets the engine's own prompt — which
+# names the outcome line and shows the convergence markers twice — or any file
+# a tool event happened to `cat` supply or rescue an outcome.
+#
+# The fix is a dedicated channel, not a better parser: `codex exec` supports
+# `--output-last-message <FILE>`, which writes exactly the final agent message
+# and nothing else. Two properties matter and neither is available from the
+# display stream: the CLI decides where the final message begins and ends, and
+# no prompt echo or tool result can reach the file at all.
+#
+# `--json` was the alternative. It is rejected as the primary channel because
+# it still shares one stream with everything else, and reading it means
+# tracking an event-envelope shape that has changed across Codex releases — a
+# version bump would silently reintroduce the parse this replaces.
+# `--output-last-message` is orthogonal to `--json`, so an operator who sets
+# `--json` for their own reasons keeps a correct final response either way.
+#
+# Which protocol a run uses is decided from the *owner and the resolved
+# command* before the process starts, never from what the stream turns out to
+# contain. Content-based selection would let unknown output choose how it is
+# read, which is the same class of defect as reading the outcome from the
+# prompt echo.
+
+#: Selected when the command is not a recognised native Codex invocation: the
+#: whole stream stays authoritative, exactly as it has always been. This is
+#: what keeps a legacy, fake or custom provider command — anything that simply
+#: prints its result to stdout — classified from byte-for-byte the same text.
+WHOLE_STREAM_PROTOCOL = "whole_stream"
+#: Selected for a recognised native `codex exec`: the final response comes
+#: from the CLI's own final-message channel, bound to this run's file.
+CODEX_LAST_MESSAGE_PROTOCOL = "codex_output_last_message"
+
+#: The flag the engine appends, and the spellings that mean the operator is
+#: already using the channel for their own purpose. The engine never competes
+#: for it and never silently falls back either — see
+#: `ProviderChannelConflictError`.
+CODEX_LAST_MESSAGE_FLAG = "--output-last-message"
+CODEX_LAST_MESSAGE_ALIASES = ("--output-last-message", "-o")
+#: Executable names accepted as the native Codex CLI.
+CODEX_EXECUTABLE_NAMES = frozenset({"codex", "codex.exe"})
+#: The only Codex subcommand this engine ever runs a stage under.
+CODEX_EXEC_SUBCOMMAND = "exec"
+
+#: Name of the run-local side-channel file, inside the run's containment
+#: artifact directory: the one directory a contained child is allowed to write
+#: besides the workspace itself.
+FINAL_RESPONSE_CAPTURE_NAME = "provider-final-response.txt"
+#: Refuse rather than load an implausible final message into memory. A real
+#: final message is a page of text; anything at this scale is a malfunction.
+FINAL_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
+
+#: Fail-closed stop reasons for the native channel. Each is distinct because
+#: the operator's next action differs: no file means the run never reached a
+#: final message, an empty file means the model said nothing, and an
+#: undecodable file means the channel itself is damaged.
+FINAL_RESPONSE_MISSING = "provider_final_response_missing"
+FINAL_RESPONSE_EMPTY = "provider_final_response_empty"
+FINAL_RESPONSE_UNREADABLE = "provider_final_response_unreadable"
+FINAL_RESPONSE_TOO_LARGE = "provider_final_response_too_large"
+
+#: The complete set. A sealed manifest naming anything else is naming a reason
+#: this engine did not produce, so both sealed readers refuse it rather than
+#: treating an unknown string as some kind of failure they can interpret.
+FINAL_RESPONSE_ERRORS = frozenset(
+    {FINAL_RESPONSE_MISSING, FINAL_RESPONSE_EMPTY, FINAL_RESPONSE_UNREADABLE, FINAL_RESPONSE_TOO_LARGE}
+)
+#: The complete set of protocols, for the same reason.
+FINAL_RESPONSE_PROTOCOLS = frozenset({WHOLE_STREAM_PROTOCOL, CODEX_LAST_MESSAGE_PROTOCOL})
+
+#: Stop reason for a native command that already claims the channel.
+PROVIDER_CHANNEL_CONFLICT = "provider_final_response_channel_conflict"
+
+#: Sealed run manifest schema. 3 adds the provider output boundary: the
+#: authoritative final response is named and hashed separately from the display
+#: stream. Both sealed readers accept 1 and 2 as well, so history sealed before
+#: the boundary stays verifiable without being rewritten.
+RUN_MANIFEST_SCHEMA_VERSION = 3
+SUPPORTED_MANIFEST_VERSIONS = frozenset({1, 2, 3})
+
+
+class ProviderChannelConflictError(ValueError):
+    """A recognised native Codex command already claims the final-message channel.
+
+    Failing closed is the only safe answer. Two flags cannot both own one
+    file, so the engine will not overwrite the operator's; and the previous
+    behaviour — quietly treating such a command as whole-stream — reopened the
+    exact contamination this boundary exists to close, by configuration, with
+    nothing in the run to say it had happened.
+    """
+
+
+def final_response_protocol(owner: str, command: list[str]) -> str:
+    """Which final-response protocol one owner and resolved command support.
+
+    Decided from configuration alone, before the process starts, so no stream
+    content can select how that stream will be read.
+
+    Recognition is deliberately narrow — `codex exec ...` — because the
+    consequence of a false positive is a stage that fails closed on every run.
+    Anything unrecognised keeps the whole-stream protocol, which is the
+    behaviour that shipped before this boundary existed.
+
+    Raises `ProviderChannelConflictError` for the one case that is neither: a
+    command this engine *does* recognise as native Codex, which already sets
+    the final-message flag itself. That is a configuration the engine cannot
+    serve, and it must be said out loud rather than downgraded.
+    """
+    if owner != "codex" or not command:
+        return WHOLE_STREAM_PROTOCOL
+    if Path(command[0]).name not in CODEX_EXECUTABLE_NAMES:
+        return WHOLE_STREAM_PROTOCOL
+    arguments = command[1:]
+    if not arguments or arguments[0] != CODEX_EXEC_SUBCOMMAND:
+        return WHOLE_STREAM_PROTOCOL
+    for argument in arguments[1:]:
+        if argument in CODEX_LAST_MESSAGE_ALIASES or argument.startswith(f"{CODEX_LAST_MESSAGE_FLAG}="):
+            raise ProviderChannelConflictError(
+                f"ORCH_CODEX_COMMAND is a native `codex exec` command that already sets "
+                f"{argument.split('=')[0]}. The engine needs that flag to own this run's "
+                "final-response channel and will not overwrite yours, and it will not read the "
+                "typed outcome out of the display stream instead. Remove the flag from the "
+                "configured command."
+            )
+    return CODEX_LAST_MESSAGE_PROTOCOL
+
+
+class BoundaryMetadataError(ValueError):
+    """Sealed boundary metadata that is malformed, unknown or self-contradicting.
+
+    `token` names the field or rule that failed, so a caller can report a
+    stable reason without parsing prose.
+    """
+
+    def __init__(self, token: str, message: str) -> None:
+        super().__init__(f"{token}: {message}")
+        self.token = token
+
+
+@dataclass(frozen=True)
+class SealedBoundary:
+    """One sealed run's validated boundary metadata.
+
+    `path` and `digest` name the artifact holding the authoritative text —
+    which, for a run that produced no final response, is the display stream
+    standing in the manifest's place and is *not* a final response. Ask
+    `has_final_response` before reading it as one.
+    """
+
+    protocol: str
+    separate: bool
+    error: str | None
+    path: str
+    digest: str
+
+    @property
+    def has_final_response(self) -> bool:
+        return self.error is None
+
+
+def validate_sealed_boundary(manifest: Mapping[str, Any]) -> SealedBoundary:
+    """The schema-3 boundary state matrix, enforced identically by both readers.
+
+    Exactly three states are legal, and every one of them is reachable:
+
+    | protocol      | separate | error          | named artifact     |
+    |---------------|----------|----------------|--------------------|
+    | whole_stream  | `False`  | `None`         | the display stream |
+    | native        | `True`   | `None`         | its own file       |
+    | native        | `False`  | a known reason | the display stream |
+
+    Everything else is a contradiction, and one combination in particular is
+    the reason this function exists: *native, not separate, no error* claims a
+    run used the dedicated channel, did not produce a separate artifact, and
+    did not fail. No such run exists. Accepting it made a reader fall back to
+    the display stream and report that as the verified authoritative text —
+    the contamination, laundered through the evidence reader.
+
+    The artifact coupling is checked too: a non-separate row must name the
+    display stream *itself*, by path and by hash, so a manifest cannot point
+    the "display stream" at some third file.
+    """
+
+    def require_hex(field: str) -> str:
+        value = manifest.get(field)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise BoundaryMetadataError(field, f"expected a sha256 hex digest, got {value!r}")
+        return value
+
+    def require_path(field: str) -> str:
+        value = manifest.get(field)
+        if not isinstance(value, str) or not value:
+            raise BoundaryMetadataError(field, f"expected a non-empty path, got {value!r}")
+        return value
+
+    output_path = require_path("output_path")
+    output_hash = require_hex("output_hash")
+    path = require_path("final_response_path")
+    digest = require_hex("final_response_hash")
+
+    protocol = manifest.get("final_response_source")
+    if protocol not in FINAL_RESPONSE_PROTOCOLS:
+        raise BoundaryMetadataError(
+            "final_response_source", f"unknown final-response protocol {protocol!r}"
+        )
+    separate = manifest.get("final_response_separate")
+    if type(separate) is not bool:
+        raise BoundaryMetadataError(
+            "final_response_separate", f"expected a boolean, got {separate!r}"
+        )
+    error = manifest.get("final_response_error")
+    if error is not None and error not in FINAL_RESPONSE_ERRORS:
+        raise BoundaryMetadataError(
+            "final_response_error", f"unknown final-response failure reason {error!r}"
+        )
+
+    if protocol == WHOLE_STREAM_PROTOCOL:
+        if separate or error is not None:
+            raise BoundaryMetadataError(
+                "state_matrix",
+                "the whole-stream protocol has no separate artifact and cannot fail closed, "
+                f"but separate={separate!r} and error={error!r}",
+            )
+    elif separate == (error is not None):
+        raise BoundaryMetadataError(
+            "state_matrix",
+            f"a native run has either a separate final response or a reason it has none, "
+            f"never both and never neither: separate={separate!r}, error={error!r}",
+        )
+
+    if separate:
+        if path == output_path:
+            raise BoundaryMetadataError(
+                "artifact_identity",
+                "a separate final response cannot be the display stream artifact",
+            )
+    elif path != output_path or digest != output_hash:
+        raise BoundaryMetadataError(
+            "artifact_identity",
+            "a non-separate row must name the display stream itself, by path and by hash",
+        )
+    return SealedBoundary(protocol, separate, error, path, digest)
+
+
+@dataclass(frozen=True)
+class FinalResponse:
+    """One run's authoritative final response, or why it does not have one.
+
+    `protocol` is always set. `text` is the authoritative text under the native
+    protocol and None under the whole-stream protocol, where the run's own
+    `output` is authoritative. `error` is a fail-closed stop reason and is set
+    only under the native protocol; `text` and `error` are never both set.
+    """
+
+    protocol: str
+    text: str | None = None
+    error: str | None = None
+
+    @property
+    def native(self) -> bool:
+        return self.protocol != WHOLE_STREAM_PROTOCOL
+
+
+def read_final_response(path: Path, protocol: str) -> FinalResponse:
+    """Read and strictly validate one native final-response capture.
+
+    Every failure is a distinct fail-closed reason rather than a fallback: the
+    one thing this must never do is answer with the display stream, because
+    that is the contamination path the channel exists to close.
+
+    A run killed at its timeout, or one that died before answering, leaves no
+    file at all — the CLI writes this file once, at the end. `missing` is
+    therefore also how truncation presents, and it is never a success.
+
+    One descriptor does all the work, and the reasons are separate:
+
+    *Liveness.* `open(2)` on a FIFO for reading blocks until a writer appears.
+    A capture path that is a FIFO with no writer therefore hung the worker
+    indefinitely — and it hung it *after* the child had already exited, which
+    is past the point where the stage timeout can intervene. `O_NONBLOCK`
+    makes the open return either way, and the file-type check below means a
+    FIFO is never read from at all.
+
+    *File type.* `O_NOFOLLOW` refuses to open a symlink, and `fstat` on the
+    descriptor that was actually opened answers "what did I open" rather than
+    "what was at this path a moment ago". Anything that is not a regular file
+    is a damaged channel.
+
+    This is file-type validation, and that is all it is. It is not a claim of
+    immunity to active tampering by a process running as this same UID: such a
+    process can replace a regular file's contents between any two operations,
+    and nothing here prevents that. Same-UID tampering is outside this
+    engine's threat model — the provider CLI already runs with this account's
+    full authority (see `docs/threat-model.md`).
+    """
+    if protocol == WHOLE_STREAM_PROTOCOL:
+        return FinalResponse(WHOLE_STREAM_PROTOCOL)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return FinalResponse(protocol, error=FINAL_RESPONSE_MISSING)
+    except OSError:
+        # Everything that is not "it is not there" is a damaged channel: ELOOP
+        # or EMLINK because the path is a symlink and O_NOFOLLOW refused it,
+        # ENOTDIR, EACCES, ENXIO — none of them is a final response.
+        return FinalResponse(protocol, error=FINAL_RESPONSE_UNREADABLE)
+    try:
+        info = os.fstat(descriptor)
+        if not stat_module.S_ISREG(info.st_mode):
+            return FinalResponse(protocol, error=FINAL_RESPONSE_UNREADABLE)
+        if info.st_size > FINAL_RESPONSE_MAX_BYTES:
+            return FinalResponse(protocol, error=FINAL_RESPONSE_TOO_LARGE)
+        # limit+1, so a file that grew past the cap between the fstat and the
+        # read is still caught, and no more than that ever reaches memory.
+        raw = _read_at_most(descriptor, FINAL_RESPONSE_MAX_BYTES + 1)
+    except OSError:
+        return FinalResponse(protocol, error=FINAL_RESPONSE_UNREADABLE)
+    finally:
+        # Unconditional: every return above passes through here.
+        os.close(descriptor)
+    if len(raw) > FINAL_RESPONSE_MAX_BYTES:
+        return FinalResponse(protocol, error=FINAL_RESPONSE_TOO_LARGE)
+    try:
+        # Strict: a final response that is not valid UTF-8 is a damaged
+        # channel, and replacement characters in the middle of an outcome line
+        # would be a guess about what the model actually said.
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return FinalResponse(protocol, error=FINAL_RESPONSE_UNREADABLE)
+    if not text.strip():
+        return FinalResponse(protocol, error=FINAL_RESPONSE_EMPTY)
+    return FinalResponse(protocol, text=text)
+
+
+def _read_at_most(descriptor: int, limit: int) -> bytes:
+    """Read up to `limit` bytes from one open descriptor, and never more.
+
+    Loops because a short read is legal, and stops at `limit` rather than at
+    EOF so the caller's cap is a property of this function and not a hope
+    about the file it was pointed at.
+    """
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        chunk = os.read(descriptor, min(remaining, DRAIN_READ_BYTES))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def authoritative_text(result: "RunResult") -> str:
+    """The one text a typed outcome and a convergence record may be read from.
+
+    Bound to the run it came from, so the outcome and the convergence record
+    are always read from the same verified final response rather than each
+    re-deriving one. Under the whole-stream protocol — and for a result built
+    by hand, which is every controller-side stop — this is the run's complete
+    output, which is what it was always parsed from.
+    """
+    return result.output if result.final_response is None else result.final_response
+
+
 @dataclass(frozen=True)
 class ProviderPreflightResult:
     status: str
@@ -640,6 +1012,19 @@ class RunResult:
     candidate_outcome: str | None = None
     candidate_classification: str | None = None
     candidate_reason: str | None = None
+    #: The provider output boundary. `output` above stays the complete display
+    #: stream — the audit evidence — and is never narrowed or rewritten.
+    #: `final_response` is the authoritative text a decision was read from, set
+    #: only under the native protocol; None means the whole stream was
+    #: authoritative. `final_response_error` is a fail-closed stop reason from
+    #: the native channel. `final_response_source` names the protocol.
+    final_response: str | None = None
+    final_response_source: str | None = None
+    final_response_error: str | None = None
+    #: The run-owned side channel the native capture was read from, handed to
+    #: the controller so it can remove the file *after* sealing the artifact
+    #: that contains those bytes. None whenever there is no side channel.
+    final_response_capture_path: str | None = None
 
 
 def classify_result(
@@ -651,6 +1036,11 @@ def classify_result(
     source: RunResult | None = None,
 ) -> RunResult:
     telemetry = _telemetry_from(source)
+    # Carried onto every result below, blocked ones included, so the sealed
+    # manifest always records which protocol produced the text a decision was
+    # — or would have been — read from. A caller with no source run keeps the
+    # whole-stream protocol, which is what it was already getting.
+    fields = {**telemetry, **_boundary_fields(source)}
     if source is not None and source.containment_stop is not None:
         # Containment outranks every other signal: a stage that escaped its
         # workspace, or never got a sandbox, must not be reported as a plain
@@ -673,33 +1063,56 @@ def classify_result(
             candidate_outcome=candidate.outcome if candidate else None,
             candidate_classification=candidate.classification if candidate else None,
             candidate_reason=candidate.reason if candidate else None,
-            **telemetry,
+            **fields,
         )
     if timed_out:
-        return RunResult(exit_code, output, None, "blocked", "timeout", True, **telemetry)
+        return RunResult(exit_code, output, None, "blocked", "timeout", True, **fields)
     if exit_code != 0:
         if any(pattern.search(output) for pattern in RATE_LIMIT_SIGNATURES):
-            return RunResult(exit_code, output, None, "paused", "rate_limited", False, **telemetry)
+            return RunResult(exit_code, output, None, "paused", "rate_limited", False, **fields)
         if any(pattern.search(output) for pattern in SOCKET_SIGNATURES):
-            return RunResult(exit_code, output, None, "blocked", "provider_socket_error", False, **telemetry)
-        return RunResult(exit_code, output, None, "blocked", "runner_nonzero", False, **telemetry)
-    matches = OUTCOME_RE.findall(output)
-    final_outcome = _final_outcome_marker(output)
+            return RunResult(exit_code, output, None, "blocked", "provider_socket_error", False, **fields)
+        return RunResult(exit_code, output, None, "blocked", "runner_nonzero", False, **fields)
+    # Checked after timeout and after a non-zero exit, so those keep their own
+    # specific stop reasons; a run that was killed or that failed has no final
+    # response for reasons already reported.
+    if source is not None and source.final_response_error is not None:
+        return RunResult(exit_code, output, None, "blocked", source.final_response_error, False, **fields)
+    authoritative = source.final_response if source is not None and source.final_response is not None else output
+    matches = OUTCOME_RE.findall(authoritative)
+    final_outcome = _final_outcome_marker(authoritative)
     if final_outcome is not None:
         if final_outcome not in allowed_outcomes:
-            return RunResult(exit_code, output, final_outcome, "blocked", "unknown_outcome", False, **telemetry)
-        return RunResult(exit_code, output, final_outcome, "success", "success", False, **telemetry)
+            return RunResult(exit_code, output, final_outcome, "blocked", "unknown_outcome", False, **fields)
+        return RunResult(exit_code, output, final_outcome, "success", "success", False, **fields)
     distinct = set(matches)
     if not matches:
-        return RunResult(exit_code, output, None, "blocked", "missing_outcome", False, **telemetry)
+        return RunResult(exit_code, output, None, "blocked", "missing_outcome", False, **fields)
     if len(distinct) > 1:
         # Only genuinely conflicting outcomes are ambiguous; a repeated identical
         # value is common from agents, so take the last one.
-        return RunResult(exit_code, output, None, "blocked", "ambiguous_outcome", False, **telemetry)
+        return RunResult(exit_code, output, None, "blocked", "ambiguous_outcome", False, **fields)
     outcome = matches[-1]
     if outcome not in allowed_outcomes:
-        return RunResult(exit_code, output, outcome, "blocked", "unknown_outcome", False, **telemetry)
-    return RunResult(exit_code, output, outcome, "success", "success", False, **telemetry)
+        return RunResult(exit_code, output, outcome, "blocked", "unknown_outcome", False, **fields)
+    return RunResult(exit_code, output, outcome, "success", "success", False, **fields)
+
+
+def _boundary_fields(source: RunResult | None) -> dict[str, str | None]:
+    """The provider output boundary, carried from the raw run to its verdict."""
+    if source is None:
+        return {
+            "final_response": None,
+            "final_response_source": WHOLE_STREAM_PROTOCOL,
+            "final_response_error": None,
+            "final_response_capture_path": None,
+        }
+    return {
+        "final_response": source.final_response,
+        "final_response_source": source.final_response_source or WHOLE_STREAM_PROTOCOL,
+        "final_response_error": source.final_response_error,
+        "final_response_capture_path": source.final_response_capture_path,
+    }
 
 
 def _decode_authoritative(raw: bytes, encoding: str, errors: str) -> str:
@@ -1111,7 +1524,34 @@ class SubprocessRunner:
         protected_roots: tuple[Path, ...] | None = None,
         reports_dir: Path | None = None,
     ) -> RunResult:
-        command = self._command(owner) + [prompt]
+        provider_argv = self._command(owner)
+        try:
+            protocol = final_response_protocol(owner, provider_argv)
+        except ProviderChannelConflictError as exc:
+            # A configuration this engine cannot serve. `_containment_stop` is
+            # the existing "this stage was never allowed to start, and here is
+            # why" path; the reason travels verbatim to the operator.
+            return self._containment_stop(
+                log_path, owner, provider_argv, PROVIDER_CHANNEL_CONFLICT, str(exc)
+            )
+        capture_path: Path | None = None
+        if protocol == CODEX_LAST_MESSAGE_PROTOCOL:
+            # Run-local and inside the containment artifact directory, which
+            # is the one place besides the workspace a contained child may
+            # write. Deriving it from log_path binds the capture to this run,
+            # and clearing it before the spawn means a leftover file can never
+            # be read as this run's answer.
+            capture_path = log_path.with_suffix(".containment") / FINAL_RESPONSE_CAPTURE_NAME
+            try:
+                capture_path.parent.mkdir(parents=True, exist_ok=True)
+                capture_path.unlink(missing_ok=True)
+            except OSError as exc:
+                return self._containment_stop(
+                    log_path, owner, provider_argv, "sandbox_setup_failed",
+                    f"cannot prepare the provider final-response channel: {exc}",
+                )
+            provider_argv = provider_argv + [CODEX_LAST_MESSAGE_FLAG, str(capture_path)]
+        command = provider_argv + [prompt]
         model_command = command
         containment_env = None
         if workspace is not None:
@@ -1234,6 +1674,14 @@ class SubprocessRunner:
             output += error + "\n"
         ended = time.time()
         live.close(process=process, timed_out=timed_out)
+        # Read after the child is reaped, so a file still being written cannot
+        # be read half-way. The capture is deliberately *left in place*: the
+        # runner has no way to know whether sealing will succeed, and deleting
+        # here once cost the only durable copy of the authoritative text
+        # whenever anything between here and the seal failed. The controller
+        # removes it after it has written the sealed artifact that contains
+        # those exact bytes — a handoff, not a hope.
+        final = read_final_response(capture_path, protocol) if capture_path else FinalResponse(protocol)
         self._write_log(log_path, owner, command, started, ended, exit_code, timed_out, output, error, child_pid)
         usage = _extract_usage(output)
         return RunResult(
@@ -1251,6 +1699,10 @@ class SubprocessRunner:
             usage_output_tokens=usage["output_tokens"],
             usage_total_tokens=usage["total_tokens"],
             usage_unavailable_reason=usage["unavailable_reason"],
+            final_response=final.text,
+            final_response_source=final.protocol,
+            final_response_error=final.error,
+            final_response_capture_path=str(capture_path) if capture_path is not None else None,
         )
 
     def _containment_stop(
@@ -1409,6 +1861,14 @@ class SubprocessRunner:
             if base_url and LOCALHOST_SIGNATURE.search(base_url):
                 return "provider_socket_misconfigured"
         if owner == "codex":
+            try:
+                final_response_protocol(owner, provider_command(owner))
+            except ProviderChannelConflictError:
+                return PROVIDER_CHANNEL_CONFLICT
+            except ValueError:
+                # An unusable command is reported by the executable check in
+                # `preflight`, which names the actual binary.
+                pass
             return _codex_config_issue()
         return None
 

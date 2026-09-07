@@ -28,13 +28,19 @@ from .runner import (
     CONVERGENCE_END,
     HOLD_OUTCOME,
     HOLD_STOP_REASON,
+    RUN_MANIFEST_SCHEMA_VERSION,
+    SUPPORTED_MANIFEST_VERSIONS,
+    WHOLE_STREAM_PROTOCOL,
+    BoundaryMetadataError,
     ConvergenceError,
     EnvelopeError,
     ProviderPreflightResult,
     RunResult,
     SubprocessRunner,
     allowed_outcomes,
+    authoritative_text,
     classify_result,
+    validate_sealed_boundary,
     envelope_block_text,
     extract_convergence,
     extract_envelope,
@@ -45,6 +51,11 @@ from .retained import inspect_retained
 
 ACTIVE_STATUSES = {"queued", "running"}
 RESUMABLE_STATUSES = {"waiting_user", "paused", "blocked"}
+
+#: A branching run held because its convergence record was never established.
+#: Such a run made no accepted claim, so baseline recovery may skip it instead
+#: of being permanently unable to read it. Its seal is never rewritten.
+CONVERGENCE_UNESTABLISHED_REASONS = ("convergence_record_invalid", "convergence_unverifiable")
 
 
 def _protected_roots_support(run: Any) -> str:
@@ -1079,13 +1090,16 @@ class Controller:
         )
         return [dict(row) for row in rows]
 
-    def _read_sealed_convergence(self, run: dict[str, Any]) -> dict[str, Any]:
-        """A prior branching run's convergence record, read through its seal.
+    def _read_sealed_run(self, run: dict[str, Any]) -> dict[str, Any]:
+        """A prior run's manifest and authoritative final response, through its seal.
 
-        The record lives in the run's own provider output, which
-        `_seal_run_manifest` already writes as `<log>.output.txt` under
-        `output_hash`; both hashes are re-verified here, so an edited output
+        Every hash on the path is re-verified, so a deleted or edited artifact
         is unreadable rather than quietly authoritative.
+
+        Legacy reader compatibility: a schema-1 or schema-2 manifest names only
+        the display stream, which is exactly what such a run was classified
+        from, so those bytes are its final response. Nothing is rewritten to
+        make old evidence fit the new contract.
         """
         manifest_path = run.get("manifest_path")
         manifest_hash = run.get("manifest_hash")
@@ -1093,13 +1107,55 @@ class Controller:
             raise ConvergenceError(f"run {run['run_token']} is not sealed")
         self._verify_file(Path(manifest_path), manifest_hash, "prior run manifest")
         manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-        output_path = manifest.get("output_path")
-        output_hash = manifest.get("output_hash")
-        if not output_path or not output_hash:
-            raise ConvergenceError(f"run {run['run_token']} manifest names no sealed output")
-        self._verify_file(Path(output_path), output_hash, "prior run output")
-        output = Path(output_path).read_text(encoding="utf-8", errors="replace")
-        return extract_convergence(output)
+        version = manifest.get("schema_version")
+        if type(version) is not int or version not in SUPPORTED_MANIFEST_VERSIONS:
+            raise ConvergenceError(
+                f"run {run['run_token']} manifest schema_version {version!r} is not readable"
+            )
+        if version < RUN_MANIFEST_SCHEMA_VERSION:
+            # Legacy only. Before schema 3 the boundary did not exist, so the
+            # display stream *is* what such a run was classified from and
+            # there is no metadata to check. The fallback is restricted to
+            # these versions deliberately: applied to a schema-3 manifest it
+            # would silently substitute the raw stream for a final response
+            # that the matrix below exists to validate.
+            output_path = manifest.get("output_path")
+            output_hash = manifest.get("output_hash")
+            if not output_path or not output_hash:
+                raise ConvergenceError(f"run {run['run_token']} manifest names no sealed output")
+            self._verify_file(Path(output_path), output_hash, "prior run output")
+            return {
+                "manifest": manifest,
+                "final_response": Path(output_path).read_text(encoding="utf-8", errors="replace"),
+                "final_response_source": WHOLE_STREAM_PROTOCOL,
+            }
+        try:
+            boundary = validate_sealed_boundary(manifest)
+        except BoundaryMetadataError as exc:
+            raise ConvergenceError(
+                f"run {run['run_token']} sealed boundary metadata is invalid: {exc}"
+            ) from exc
+        if not boundary.has_final_response:
+            # The run failed closed at the channel, so it has no final
+            # response and its display stream is not a substitute for one.
+            raise ConvergenceError(
+                f"run {run['run_token']} produced no final response ({boundary.error})"
+            )
+        self._verify_file(Path(boundary.path), boundary.digest, "prior run final response")
+        return {
+            "manifest": manifest,
+            "final_response": Path(boundary.path).read_text(encoding="utf-8", errors="replace"),
+            "final_response_source": boundary.protocol,
+        }
+
+    def _read_sealed_convergence(self, run: dict[str, Any]) -> dict[str, Any]:
+        """A prior branching run's convergence record, read through its seal.
+
+        Read from that run's authoritative final response and never from the
+        surrounding display stream — where the composed prompt's own two marker
+        pairs make every record look duplicated.
+        """
+        return extract_convergence(self._read_sealed_run(run)["final_response"])
 
     def _convergence_context(self, task_id: str, stage: Any, profile: Profile) -> dict[str, Any] | None:
         """What section 1.7 needs about this run, or None if it is not branching."""
@@ -1109,23 +1165,30 @@ class Controller:
         arities = [(run, self._stage_arity(profile, run["stage"])) for run in history]
         branching = [(index, run) for index, (run, arity) in enumerate(arities) if arity == "branching"]
         correction_at = [index for index, (_, arity) in enumerate(arities) if arity == "correction"]
+        records, error = self._sealed_convergence_records(branching)
+        # Only runs whose record could actually be read are a baseline. A run
+        # held because its record was never established made no accepted claim,
+        # so it is skipped rather than trusted — and rather than making every
+        # later review unreadable. `error` is still set for any *other*
+        # unreadable run, which is tampering or corruption, not recovery.
+        usable = [(index, run) for index, run in branching if index in records]
         # A committed branching run qualifies iff at least one committed
         # correction run lies between it and now; the prior branching run is
         # the last qualifying one, whatever the history's shape.
         qualifying = [
-            (index, run) for index, run in branching
+            (index, run) for index, run in usable
             if any(correction > index for correction in correction_at)
         ]
         context: dict[str, Any] = {
-            "repeat": bool(qualifying),
+            "repeat": bool(qualifying) and error is None,
             "prior_live": set(),
             "historical_resolved": set(),
             "prior_stage": None,
             "prior_run_token": None,
             "corrections_between": [],
-            "error": None,
+            "error": error,
         }
-        if not qualifying:
+        if not qualifying or error is not None:
             return context
         prior_index, prior = qualifying[-1]
         context["prior_stage"] = prior["stage"]
@@ -1133,15 +1196,41 @@ class Controller:
         context["corrections_between"] = [
             history[index]["stage"] for index in correction_at if index > prior_index
         ]
-        try:
-            context["prior_live"] = set(self._read_sealed_convergence(prior)["live"])
-            resolved: set[str] = set()
-            for _, run in branching:
-                resolved |= set(self._read_sealed_convergence(run).get("resolved") or [])
-            context["historical_resolved"] = resolved
-        except (ConvergenceError, ControllerError, OSError, ValueError) as exc:
-            context["error"] = f"prior convergence record unreadable: {exc}"
+        context["prior_live"] = set(records[prior_index]["live"])
+        resolved: set[str] = set()
+        for index, _ in usable:
+            resolved |= set(records[index].get("resolved") or [])
+        context["historical_resolved"] = resolved
         return context
+
+    def _sealed_convergence_records(
+        self, branching: list[tuple[int, dict[str, Any]]]
+    ) -> tuple[dict[int, dict[str, Any]], str | None]:
+        """Every readable prior branching record, and the first hard read failure.
+
+        The distinction the return type carries is the whole point. A run that
+        was itself held because its convergence record was never established
+        has nothing to contribute and never did: skipping it lets a fresh valid
+        review establish a baseline, which is otherwise impossible once such a
+        run is in the history. Any other unreadable record — a deleted
+        artifact, an edited one, a hash that no longer matches — is a hard
+        error, because there the run *did* make an accepted claim and the
+        evidence for it is gone.
+        """
+        records: dict[int, dict[str, Any]] = {}
+        for index, run in branching:
+            try:
+                sealed = self._read_sealed_run(run)
+            except (ConvergenceError, ControllerError, OSError, ValueError) as exc:
+                return records, f"prior convergence record unreadable: {exc}"
+            try:
+                records[index] = extract_convergence(sealed["final_response"])
+            except ConvergenceError as exc:
+                reason = str(sealed["manifest"].get("reason") or "")
+                if reason.startswith(CONVERGENCE_UNESTABLISHED_REASONS):
+                    continue
+                return records, f"prior convergence record unreadable: {exc}"
+        return records, None
 
     def _apply_convergence(self, result: RunResult, convergence: dict[str, Any]) -> RunResult:
         """Validate the convergence record before the typed outcome is accepted.
@@ -1166,7 +1255,10 @@ class Controller:
         if convergence["error"]:
             return hold(f"convergence_unverifiable: {convergence['error']}")
         try:
-            record = extract_convergence(result.output, repeat=convergence["repeat"])
+            # The same authoritative final response the typed outcome was read
+            # from, bound to the same run: one verified text, two claims, so a
+            # marker in the prompt echo or a tool result cannot supply either.
+            record = extract_convergence(authoritative_text(result), repeat=convergence["repeat"])
         except ConvergenceError as exc:
             return hold(f"convergence_record_invalid: {exc}")
         if not convergence["repeat"]:
@@ -1399,7 +1491,7 @@ class Controller:
         log_hash = hashlib.sha256(log_path.read_bytes()).hexdigest()
         output_hash = hashlib.sha256(result.output.encode("utf-8", errors="replace")).hexdigest()
         payload = {
-            "schema_version": 2,
+            "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
             "task_id": task["id"],
             "run_token": run["run_token"],
             "lease_token": run["lease_token"],
@@ -1424,6 +1516,36 @@ class Controller:
         output_path = log_path.with_suffix(".output.txt")
         self._atomic_write(output_path, result.output.encode("utf-8", errors="replace"))
         payload["output_path"] = str(output_path)
+        # The complete display stream is sealed above, unchanged, as the audit
+        # evidence. Beside it the schema-3 manifest names and hashes the
+        # authoritative final response a decision was actually read from, so
+        # "what did the provider emit" and "what did the engine decide on" are
+        # two separately verifiable questions. Under the whole-stream protocol
+        # those are the same bytes and the manifest says so by naming the same
+        # path; under the native protocol the final response is its own file.
+        separate = result.final_response is not None
+        if separate:
+            final_bytes = result.final_response.encode("utf-8", errors="replace")
+            final_path = log_path.with_suffix(".final-response.txt")
+            self._atomic_write(final_path, final_bytes)
+            payload["final_response_path"] = str(final_path)
+            payload["final_response_hash"] = hashlib.sha256(final_bytes).hexdigest()
+        else:
+            payload["final_response_path"] = str(output_path)
+            payload["final_response_hash"] = output_hash
+        # Self-describing rather than inferred: `separate` is the one bit a
+        # reader needs to know whether the named artifact is a dedicated final
+        # response or the display stream standing in for one.
+        payload["final_response_separate"] = separate
+        payload["final_response_source"] = result.final_response_source or WHOLE_STREAM_PROTOCOL
+        payload["final_response_error"] = result.final_response_error
+        # The writer is held to the same matrix as the two readers, so a
+        # contradictory result can never become a sealed manifest that no
+        # reader will accept. Refusing to seal is the honest failure here.
+        try:
+            validate_sealed_boundary(payload)
+        except BoundaryMetadataError as exc:
+            raise ControllerError(f"refusing to seal contradictory boundary metadata: {exc}") from exc
         drift_path = log_path.with_suffix(".containment-drift.json")
         if drift_path.is_file():
             payload["containment_evidence_path"] = str(drift_path)
@@ -1432,7 +1554,33 @@ class Controller:
         encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
         self._atomic_write(manifest_path, encoded)
         manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        self._release_final_response_capture(result, separate)
         return manifest_path, manifest_hash
+
+    @staticmethod
+    def _release_final_response_capture(result: RunResult, separate: bool) -> None:
+        """Complete the runner's handoff, once and only once it is safe.
+
+        The runner leaves its side-channel capture in place precisely because
+        it cannot know whether sealing will succeed. By here the sealed
+        artifact and the manifest naming it are both on disk, so the capture is
+        a duplicate of sealed bytes and removing it leaves nothing unrecorded.
+
+        `separate` is the condition, not a convenience: only then does the
+        sealed artifact contain the captured bytes. A run that failed at the
+        channel sealed its *display stream*, so its capture — an empty or
+        undecodable file — is the only copy of what actually went wrong and is
+        left for the operator to look at.
+        """
+        capture = result.final_response_capture_path
+        if not capture or not separate:
+            return
+        try:
+            Path(capture).unlink(missing_ok=True)
+        except OSError:
+            # The seal is already durable. Failing a committed run over an
+            # undeletable duplicate would turn finished work into a stop.
+            pass
 
     def _quarantine(
         self,
@@ -1571,15 +1719,50 @@ class Controller:
 
     @staticmethod
     def _convergence_section(convergence: dict[str, Any]) -> list[str]:
-        """The E-13 record obligation, plus the repeat-review directive when due."""
+        """The E-13 record obligation, plus the repeat-review directive when due.
+
+        This is the *producer* half of the provider output boundary, and it has
+        to be explicit about one thing the consumer half made load-bearing: the
+        engine reads the record and the typed outcome from the authoritative
+        final response and from nowhere else. A record in a report file, in a
+        tool result, or anywhere earlier in a transcript does not exist as far
+        as the engine is concerned.
+
+        Saying "your output" was not enough. A reviewer stage's own
+        instructions tell it to write its findings into `apply-review.md`, so
+        "put the record in your output" reads naturally as "put it in the
+        review I was just told to write" — and that run then fails closed on a
+        missing record having done the work correctly. The obligation is
+        therefore stated as machine output, up front, and the report is named
+        as the thing it is *not*.
+        """
         parts = [
-            "Convergence record obligation: this is a branching stage, so your output must carry",
-            "exactly one convergence record, delimited exactly like this and parsed from your own",
-            "output:",
+            "Convergence record obligation — MACHINE OUTPUT, read before you start work:",
+            "",
+            "This is a branching stage. The FINAL ASSISTANT RESPONSE of this run — the last message",
+            "you emit, in the response body itself — must carry exactly one convergence record,",
+            "delimited exactly like this:",
             "",
             CONVERGENCE_BEGIN,
             '{ "live": [...], "resolved": [...] }',
             CONVERGENCE_END,
+            "",
+            "The engine reads this record, and your typed outcome, from that final response and from",
+            "nowhere else. A record written into apply-review.md, apply-report.md, any other file, or",
+            "any tool result does NOT satisfy this obligation — not even when the stage instructions",
+            "below tell you to write that file, and they may well. Those are two separate",
+            "deliverables, and you owe both:",
+            "",
+            "  - the report or review artifact the stage instructions ask for, in the file they name;",
+            "  - AND, separately, this record inside your final assistant response.",
+            "",
+            "Writing the first does not discharge the second. Only the final response is machine",
+            "output; everything else you produce is read by people, not by the engine.",
+            "",
+            "Order inside that final response, with nothing after it:",
+            "",
+            "  1. the complete convergence record block, exactly as delimited above;",
+            "  2. then the ORCHESTRATOR_OUTCOME line, which remains the very last line of your output.",
             "",
             "`live` lists the failure-scenario identities of your current blocking findings: short",
             "strings you choose, reused verbatim whenever the same scenario recurs. Comparison is",
@@ -1590,7 +1773,9 @@ class Controller:
             parts.extend(
                 [
                     "This is the first branching run of this task, so record `live` and `resolved` only,",
-                    "with `resolved` empty, and no verdict.",
+                    "with `resolved` empty, and no verdict. The complete record still goes in the final",
+                    "assistant response, immediately before the typed outcome, whether or not you also",
+                    "write a separate review artifact.",
                     "",
                 ]
             )
@@ -1620,6 +1805,10 @@ class Controller:
                 "and the verdict from this total rule, in order: live ∩ historical_resolved non-empty →",
                 "oscillating; otherwise live a strict subset of prior_live with new empty → improved;",
                 "otherwise stalled.",
+                "",
+                "All five keys go in the final assistant response, in the one record block, immediately",
+                "before the ORCHESTRATOR_OUTCOME line — the same obligation as above, and it still is",
+                "not discharged by writing them into a review artifact you were separately asked for.",
                 "",
                 "The engine recomputes all four before accepting your typed outcome. A missing, malformed",
                 f"or contradicting record, and a verdict of stalled or oscillating, all end this run at",

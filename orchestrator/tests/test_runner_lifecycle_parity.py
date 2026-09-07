@@ -34,7 +34,14 @@ from pathlib import Path
 from unittest import mock
 
 from orchestrator import runner as runner_module
-from orchestrator.runner import RunResult, SubprocessRunner, _extract_usage, classify_result
+from orchestrator.controller import RUN_MANIFEST_SCHEMA_VERSION
+from orchestrator.runner import (
+    WHOLE_STREAM_PROTOCOL,
+    RunResult,
+    SubprocessRunner,
+    _extract_usage,
+    classify_result,
+)
 
 # One definition, used by every timing assertion (spec section 7). 150 ms is
 # 15% of LIVE_POLL_SECONDS, so neither a poll-sized drift (1000 ms) nor a full
@@ -1249,7 +1256,9 @@ class _ReapedStub:
 class SealedManifestShapeTests(_ParityCase):
     # Frozen key set of the integrated controller._seal_run_manifest payload.
     # H2 may add live evidence beside the sealed artifacts, but must not add
-    # the live-file path to this schema_version 2 manifest.
+    # the live-file path to this manifest. The `final_response_*` group is the
+    # schema-3 provider output boundary: the authoritative final response is
+    # named and hashed separately from the display stream.
     FROZEN_MANIFEST_KEYS = (
         "candidate_classification",
         "candidate_outcome",
@@ -1257,6 +1266,11 @@ class SealedManifestShapeTests(_ParityCase):
         "classification",
         "ended_at",
         "exit_code",
+        "final_response_error",
+        "final_response_hash",
+        "final_response_path",
+        "final_response_separate",
+        "final_response_source",
         "input_hash",
         "lease_token",
         "log_hash",
@@ -1301,8 +1315,14 @@ class SealedManifestShapeTests(_ParityCase):
                 controller.close()
         manifest = json.loads(manifest_text)
         self.assertEqual(tuple(sorted(manifest.keys())), self.FROZEN_MANIFEST_KEYS)
-        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["schema_version"], RUN_MANIFEST_SCHEMA_VERSION)
         self.assertNotIn(".live.jsonl", manifest_text)
+        # A fake provider command keeps the whole-stream protocol, so the
+        # authoritative final response is the display stream and the manifest
+        # names it rather than duplicating it into a second artifact.
+        self.assertEqual(manifest["final_response_source"], WHOLE_STREAM_PROTOCOL)
+        self.assertFalse(manifest["final_response_separate"])
+        self.assertEqual(manifest["final_response_path"], manifest["output_path"])
         evidence = (log_path.parent.parent / "evidence.json")
         if evidence.is_file():
             self.assertNotIn(".live.jsonl", evidence.read_text(encoding="utf-8"))

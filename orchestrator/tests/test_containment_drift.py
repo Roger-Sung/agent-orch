@@ -15,9 +15,14 @@ import uuid
 
 from orchestrator.cli import build_parser, _enqueue
 from orchestrator.containment import Sentinel, sandbox_available, write_allowlist
-from orchestrator.controller import Controller, ControllerError
+from orchestrator.controller import RUN_MANIFEST_SCHEMA_VERSION, Controller, ControllerError
 from orchestrator.ipc import enqueue_request, wait_for_result
-from orchestrator.runner import RunResult, SubprocessRunner, classify_result
+from orchestrator.runner import (
+    WHOLE_STREAM_PROTOCOL,
+    RunResult,
+    SubprocessRunner,
+    classify_result,
+)
 from orchestrator.tests import test_containment_layers as fixtures
 from orchestrator.tests.test_containment_layers import EscapingRunner
 
@@ -47,6 +52,10 @@ class RetainedOutputTest(DriftFixture):
             inspected = controller.containment_inspect(task_id)
             self.assertEqual(inspected["candidate_outcome"], "pass")
             self.assertEqual(inspected["integrity"], "verified")
+            self.assertEqual(inspected["schema_version"], RUN_MANIFEST_SCHEMA_VERSION)
+            # This runner is not a recognised native Codex command, so the
+            # whole stream stays authoritative and the reader says so.
+            self.assertEqual(inspected["final_response_source"], WHOLE_STREAM_PROTOCOL)
             self.assertFalse(inspected["authorised_to_advance"])
             self.assertFalse(inspected["source_snapshot_verified"])
             self.assertEqual(inspected["drift_evidence"]["attribution"], "unknown")
@@ -102,7 +111,13 @@ class RetainedOutputTest(DriftFixture):
         try:
             run = controller.status(task_id)["stage_runs"][0]
             manifest = json.loads(Path(run["manifest_path"]).read_bytes())
-            for path in (run["manifest_path"], run["log_path"], manifest["output_path"], manifest["containment_evidence_path"]):
+            for path in (
+                run["manifest_path"],
+                run["log_path"],
+                manifest["output_path"],
+                manifest["final_response_path"],
+                manifest["containment_evidence_path"],
+            ):
                 with self.subTest(path=path):
                     target = Path(path)
                     original = target.read_bytes()
@@ -124,13 +139,24 @@ class RetainedOutputTest(DriftFixture):
             path = Path(run["manifest_path"])
             manifest = json.loads(path.read_bytes())
             manifest.update(schema_version=1, reason="workspace_escape", log_hash=hashlib.sha256(log.read_bytes()).hexdigest())
-            for key in ("output_path", "containment_evidence_hash", "containment_evidence_path", "candidate_outcome", "candidate_classification", "candidate_reason", "profile_hash", "input_hash"):
+            for key in (
+                "output_path", "containment_evidence_hash", "containment_evidence_path",
+                "candidate_outcome", "candidate_classification", "candidate_reason",
+                "profile_hash", "input_hash",
+                # The provider output boundary did not exist at schema 1.
+                "final_response_path", "final_response_hash", "final_response_separate",
+                "final_response_source", "final_response_error",
+            ):
                 manifest.pop(key)
             path.write_text(json.dumps(manifest))
             controller.conn.execute("UPDATE stage_runs SET manifest_hash=? WHERE run_token=?", (hashlib.sha256(path.read_bytes()).hexdigest(), run["run_token"]))
             controller.conn.execute("UPDATE tasks SET stop_reason='workspace_escape' WHERE id=?", (task_id,))
             result = controller.containment_inspect(task_id)
             self.assertEqual(result["candidate_outcome"], "pass")
+            self.assertEqual(result["schema_version"], 1)
+            # Legacy reader compatibility: a manifest sealed before the
+            # boundary records no protocol, and none is invented for it.
+            self.assertIsNone(result["final_response_source"])
             self.assertIsNone(result["drift_evidence"])
             self.assertFalse(result["authorised_to_advance"])
             with self.assertRaisesRegex(ControllerError, "containment_review_required"):
