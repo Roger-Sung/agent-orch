@@ -156,4 +156,18 @@ Local tests and reviewer approval alone do not authorize deployment. Record
 native isolated-daemon model/session/permission evidence, recovery/serialization
 evidence, final candidate regression, and independent stop-gate separately.
 The main Fable session cannot serve as its own independent stop-gate.
+
+For `external_spec_review` with a required stop-gate, the executor stays null.
+`gate-run` selects the opposite provider family from the original reviewer
+(Claude review → Codex gate; Codex review → Claude gate if such a route is
+supported). This does not add a new external-review provider: the current
+external-review route remains Claude. Apply routes still select against their
+executor. Unknown families, missing executors on other routes and inconsistent
+reviewer provenance fail closed. The gate execution record retains
+`subject_role` / `subject_provider` separately from `executor`.
+
+The independent gate checks the draft and review evidence, not an unrequested
+implementation. `start-sync` → `gate-run` → `gate-sync` only records a
+recommendation; an explicit `gate-allow` / `gate-block` decision is still needed.
+A successful reviewer/controller result alone is not full lifecycle completion.
 Do not push, restart production or claim cache savings based on session reuse.

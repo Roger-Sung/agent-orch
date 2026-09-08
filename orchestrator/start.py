@@ -605,9 +605,21 @@ def run_gate_run(home: Path, task_id: str) -> dict[str, Any]:
 
     gate, execution_result = _require_pending_stop_gate(task_id, task_record, routing)
     executor = routing.get("executor") or gate.get("executor")
-    reviewer = _stop_gate_reviewer_profiles().get(str(executor))
+    # Review-only routes intentionally have no executor. Gate the family that
+    # performed the review without inventing execution authority or weakening
+    # the missing-executor check for implementation/unknown routes.
+    subject_role = "executor"
+    subject_provider = executor
+    if executor is None and routing.get("pattern") == "external_spec_review":
+        subject_role = "reviewer"
+        subject_provider = routing.get("reviewer")
+        if gate.get("reviewer") != subject_provider:
+            raise ValueError("inconsistent stop-gate reviewer provenance")
+    reviewer = _stop_gate_reviewer_profiles().get(str(subject_provider))
     if reviewer is None:
-        raise ValueError(f"unsupported stop-gate executor for cross-provider review: {executor!r}")
+        raise ValueError(
+            f"unsupported stop-gate {subject_role} for cross-provider review: {subject_provider!r}"
+        )
     if not daemon_is_running(home):
         raise ValueError(
             "orchestrator daemon is not running; gate-run only enqueues a daemon inbox request "
@@ -652,6 +664,8 @@ def run_gate_run(home: Path, task_id: str) -> dict[str, Any]:
         "processed_result_path": execution_result.get("processed_result_path"),
         "pattern": routing.get("pattern"),
         "executor": executor,
+        "subject_role": subject_role,
+        "subject_provider": subject_provider,
         "reviewer": routing.get("reviewer"),
         "route_source": routing.get("route_source"),
     }
@@ -1049,6 +1063,12 @@ def _write_gate_review_input(
         "",
         "Review whether the original pending stop-gate task is ready for a later manual ALLOW/BLOCK decision.",
         "Do not apply a stop-gate decision from this review. Write the review artifact only.",
+        *([
+            "This is a review-only task: the original reviewer, not an executor, is the subject of this independent gate.",
+            "Verify the immutable draft, review result and sealed execution evidence under the original read-only scope.",
+            "No implementation was requested: implementation-only fingerprint/receipt requirements are not applicable.",
+            "Do not implement the draft or treat this gate as approval to apply, publish or deploy it.",
+        ] if routing.get("pattern") == "external_spec_review" and routing.get("executor") is None else []),
         "",
         "## Provenance",
         "",

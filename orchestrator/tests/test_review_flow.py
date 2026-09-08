@@ -18,7 +18,9 @@ from orchestrator.execution import ExecutionConfigError, resolve_request, render
 from orchestrator.profile import load_profile
 from orchestrator.review_contract import REVIEW_BEGIN, REVIEW_END, build_packet, validate_review
 from orchestrator.runner import CONVERGENCE_BEGIN, CONVERGENCE_END, extract_envelope
-from orchestrator.start import StartFlags, run_start, run_start_go
+from orchestrator.start import (StartFlags, run_start, run_start_go, run_start_sync,
+                                run_gate_run, run_gate_sync, run_gate_decision,
+                                _read_yaml, _write_yaml)
 from orchestrator.tests.test_interpretation_envelope import EnvelopeFixture, _axis, _reply
 
 PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "external_spec_review.yaml"
@@ -167,10 +169,12 @@ print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "r
         self.assertEqual(result["plan"]["provider_commands"], {})
         self.assertEqual(result["routing"]["auto_start"], False)
 
-    def intake_review(self, draft_text, *, write_axis=None, other_axis=None):
+    def intake_review(self, draft_text, *, write_axis=None, other_axis=None, gated=False):
         draft = self.root / "draft.md"; draft.write_text(draft_text)
         config = self.root / "execution.json"; config.write_text(json.dumps(self.request))
         scope = "Review the draft and read scripts/example.py without modifying any project files"
+        if gated:
+            scope += "; review daemon routing only, do not deploy"
         flags = StartFlags("review", scope, None, None, None, False, draft_spec=draft, execution_config=config)
         intake = run_start(self.home, "Review the provided spec", flags)
         self.assertEqual(intake["status"], "waiting_user", intake)
@@ -182,6 +186,84 @@ print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "r
         self.assertNotIn(draft_text, resolver.call_args.args[0])
         self.assertIn("engine-validated tool-less external spec review", resolver.call_args.args[0])
         return result
+
+    def pending_review_gate(self):
+        from orchestrator.daemon import _handle
+        result = self.intake_review("Read-only spec: inspect scripts/example.py", gated=True)
+        execution = result["routing"]["execution"]
+        processed = self.home / "processed"; processed.mkdir(exist_ok=True)
+        _handle(self.engine, Path(execution["request_path"]), processed)
+        result = run_start_sync(self.home, result["task_id"])
+        self.assertEqual(result["status"], "waiting_user", result)
+        self.assertTrue(result["routing"]["stop_gate"])
+        self.assertIsNone(result["routing"]["executor"])
+        self.assertEqual(result["routing"]["gate"]["status"], "pending")
+        return result
+
+    def test_review_only_full_gate_lifecycle_allow_and_block(self):
+        from orchestrator.daemon import _handle
+        provider = self.root / "fake-gate"
+        provider.write_text(f'''#!{sys.executable}
+import os, sys
+if "--version" in sys.argv:
+    print("fake-gate-version"); raise SystemExit(0)
+prompt = sys.argv[-1]
+assert "review-only task" in prompt
+assert "implementation-only fingerprint/receipt requirements are not applicable" in prompt
+print({CONVERGENCE_BEGIN!r} + '\\n{{"live": [], "resolved": []}}\\n' + {CONVERGENCE_END!r})
+print("ORCHESTRATOR_OUTCOME: " + os.environ["FAKE_GATE_OUTCOME"])
+''')
+        provider.chmod(0o755)
+        for outcome, final in (("allow", "done"), ("block", "blocked")):
+            with self.subTest(outcome=outcome), patch.dict(os.environ, {
+                "ORCH_CODEX_COMMAND": str(provider), "FAKE_GATE_OUTCOME": outcome,
+            }), patch("orchestrator.start.daemon_is_running", return_value=True):
+                pending = self.pending_review_gate()
+                task_id = pending["task_id"]
+                enqueued = run_gate_run(self.home, task_id)
+                gate_run = enqueued["routing"]["gate_review_execution"]
+                self.assertEqual(gate_run["owner"], "codex")
+                self.assertEqual(gate_run["subject_role"], "reviewer")
+                self.assertEqual(gate_run["subject_provider"], "claude")
+                self.assertIsNone(gate_run["executor"])
+                text = Path(gate_run["input_path"]).read_text()
+                original = Path(pending["routing"]["execution"]["input"]).read_text()
+                self.assertEqual(extract_envelope(text), extract_envelope(original))
+                _handle(self.engine, Path(gate_run["request_path"]), self.home / "processed")
+                synced = run_gate_sync(self.home, task_id)
+                self.assertEqual(synced["status"], "waiting_user")
+                self.assertEqual(synced["routing"]["gate_review_result"]["outcome"], outcome)
+                self.assertEqual(synced["routing"]["gate"]["status"], "pending")
+                self.assertNotIn("gate_decision", synced["routing"])
+                decided = run_gate_decision(self.home, task_id, outcome.upper(), "Synthetic test decision")
+                self.assertEqual(decided["status"], final)
+                self.assertIsNone(decided["routing"]["executor"])
+
+    def test_review_gate_invalid_provenance_fails_before_enqueue(self):
+        with patch("orchestrator.start.daemon_is_running", return_value=True):
+            pending = self.pending_review_gate()
+        task_id = pending["task_id"]
+        path = self.home / "tasks" / f"{task_id}-routing.yaml"
+        original = _read_yaml(path)
+        before = sorted((self.home / "inbox").glob("*.json"))
+        for pattern, provider, gate_provider, error in (
+            ("external_spec_review", None, None, "unsupported stop-gate reviewer"),
+            ("external_spec_review", "unknown", "unknown", "unsupported stop-gate reviewer"),
+            ("external_spec_review", "claude", "codex", "inconsistent stop-gate reviewer"),
+            ("claude_apply_codex_review", "claude", "claude", "unsupported stop-gate executor"),
+        ):
+            with self.subTest(pattern=pattern, provider=provider, gate_provider=gate_provider):
+                routing = json.loads(json.dumps(original))
+                routing.update(pattern=pattern, reviewer=provider)
+                routing["gate"]["reviewer"] = gate_provider
+                # Both persisted gate snapshots must represent the same fixture.
+                task_path = self.home / "tasks" / f"{task_id}.yaml"
+                task = _read_yaml(task_path); task["gate"] = routing["gate"]
+                _write_yaml(task_path, task); _write_yaml(path, routing)
+                with self.assertRaisesRegex(ValueError, error):
+                    run_gate_run(self.home, task_id)
+                self.assertEqual(sorted((self.home / "inbox").glob("*.json")), before)
+                self.assertFalse((self.home / "tasks" / f"{task_id}-gate-review-input.md").exists())
 
     def test_start_go_daemon_review_keeps_draft_paths_out_of_write_authority(self):
         from orchestrator.daemon import _handle
