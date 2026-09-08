@@ -53,10 +53,14 @@
 文中的 Astra 指原協調對話串，在參考部署裡是 Codex session。
 
 - 每階段模型／effort 解析後封存並綁定 digest，不靠改全域環境變數派工。
-- Reviewer 沒有工具，只讀傳入的 spec／candidate／evidence；PASS 綁定精確 hash，candidate 變動就失效。
+- Opt-in Fable reviewer 沒有工具，只讀傳入的 spec／candidate／evidence；PASS 綁定精確 hash，candidate 變動就失效。
 - 呼叫前留下 pending；只有資料庫已提交的封存結果能清除。未知中斷不盲目重播；重建 context 保留 predecessor 與決策，不假裝仍是原 session。
 
 非 ready 先停給原協調者；反駁與規格仲裁仍由人／原對話串協調，不是全自動法庭。跨家族是減少共同盲點的設計選擇，不是模型品質 benchmark；session 延續也不保證 cache 命中或省費。
+
+起草、實作與 review 共用「**必要且安全的最小方案優先**」規則：先問必要嗎，再問最小方案夠用且安全嗎，最後才問值得改善嗎。必要安全、資料完整性與驗證缺口仍會阻擋；可選改善只列收益、成本、啟用條件，不成為必做依賴，也不讓已合格的任務繼續 repair。範圍內技術仲裁由 coordinator 處理；使用者選定的擴充仍沿既有 spec／核准與範圍更新程序。這是共用 prompt 指令，不是確定性的必要性分類器或另一套 workflow；既有結構檢查與驗收 gate 不變。
+
+必要的獨立 stop-gate 另算：apply 依 executor 選對家；純 `external_spec_review` 沒有 executor，改依原 reviewer 選對家（Fable review → Codex gate）。gate 只提出建議，仍需明確 `gate-allow`／`gate-block` 決策；它沿用既有 provider 設定，不繼承 opt-in Fable reviewer 的無工具限制。
 
 ## 證據
 
@@ -81,7 +85,7 @@
 
 圍堵層的邊界與未解問題寫在 [`docs/threat-model.md`](docs/threat-model.md)。
 
-L1 限制的是寫入 allowlist，不是只准寫工作區：CLI state 與 temp 也在其中；讀取和網路不限。舊流程可用 `--allow-unsandboxed` 或 `ORCH_ALLOW_UNSANDBOXED` 明確接受無 L1 執行；opt-in Codex 則拒絕這兩種繞過方式，必須有外層 L1。Reviewer 維持無工具模式。
+L1 限制的是寫入 allowlist，不是只准寫工作區：CLI state 與 temp 也在其中；讀取和網路不限。舊流程可用 `--allow-unsandboxed` 或 `ORCH_ALLOW_UNSANDBOXED` 明確接受無 L1 執行；opt-in Codex 則拒絕這兩種繞過方式，必須有外層 L1。Opt-in Fable reviewer 維持無工具模式，獨立 stop-gate 不在此限。
 
 ## 三十秒 demo
 

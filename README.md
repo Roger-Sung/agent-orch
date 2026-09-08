@@ -193,16 +193,18 @@ rerun can be authorised. The full stop-reason table is in
 
 ## Cross-provider review gates
 
-For work whose blast radius justifies it, the reviewer comes from a different
-provider family than the executor. The profiles call these stop gates
+For work whose blast radius justifies it, the gate reviewer comes from a different
+provider family than the executor, or, for review-only work, than the original
+reviewer. The profiles call these stop gates
 (`stop_gate_claude.yaml`, `stop_gate_codex.yaml`): reviews that recommend
 `allow` or `block`. A model reviewing its own output can share its own blind spots.
 Cross-family review is a design choice to reduce correlated assumptions, not
 a quality guarantee or a published model benchmark.
 
-- The gate profile is selected from who executed, not configured per task, so
-  the reviewer is always the *other* owner slot — no model clears its own
-  output.
+- Apply gates select the other owner slot from the executor. For
+  `external_spec_review`, where the executor stays null, a required gate selects
+  the other slot from the original reviewer: Fable review → Codex gate.
+  Neither route lets a model clear its own output.
 - Which provider plays which role is a default, not the mechanism. Out of the
   box Claude implements and Codex reviews and gates; swapping the profiles
   reverses it without touching the engine.
@@ -249,6 +251,21 @@ Non-ready review stops for the original coordinator. Evidence-based rebuttal
 and spec arbitration are operator-driven, not a fully automated model tribunal.
 Session reuse is not a promise of cache hits or lower cost. Existing profiles
 remain available and are not rewritten when this mode is absent.
+
+Drafting, implementation and review share a **minimum safe scope** rule:
+first ask whether a mechanism is necessary, then whether the smallest solution
+is sufficient and safe, and only then whether improvement is worthwhile.
+Required safety, data integrity and verification still block when missing.
+Optional improvements stay separate, with benefit, cost and activation condition;
+they do not become required dependencies or keep an otherwise acceptable task
+in a repair loop. The coordinator handles in-scope technical arbitration;
+user-selected expansion follows the existing spec/approval and scope-update path.
+This is a shared prompt instruction, not a deterministic necessity classifier
+or a new workflow; existing structural checks and acceptance gates remain.
+
+Tool-less review here means the opt-in Fable spec/implementation reviewer.
+The separate stop-gate uses its existing provider configuration and does not
+inherit that tool-less restriction.
 
 ## Containment, honestly
 

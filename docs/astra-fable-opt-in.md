@@ -1,6 +1,8 @@
 # Astra / Fable opt-in execution
 
-Status: implementation candidate, not deployed or release-approved.
+Status: implemented and deployed in the reference installation; still opt-in.
+Other installations require their own deployment verification. This is not a
+supported-product or universal deployment claim.
 
 The original Astra conversation owns exploration, the spec, RD assignment,
 progress and arbitration. The controller does not create another Astra planner.
@@ -167,7 +169,7 @@ unknown pending work, remains retained. Old task bindings fail closed; intake
 must explicitly bind a new task after the operator resolves the old task's
 disposition. This is `context_rehydrated`, not continuity of the old session.
 
-## Release gates still outstanding
+## Deployment verification requirements
 
 Local tests and reviewer approval alone do not authorize deployment. Record
 native isolated-daemon model/session/permission evidence, recovery/serialization
