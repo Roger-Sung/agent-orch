@@ -45,6 +45,25 @@ intake classification; it is not a proposal author or an extra spec reviewer.
 The external draft route executes only `external_spec_review`. Deployments
 overriding `ORCH_PROFILES_DIR` must install that profile before enabling it.
 
+At `start-go`, this route validates that its frozen plan has exactly one
+tool-less reviewer stage. The external draft remains the reviewer's immutable
+evidence, but is not a source of authority for this invocation's intake resolver.
+Only the caller's task and scope are resolved. Read-only references to paths do
+not imply repository writes: the reviewer write set must be empty, while the
+engine still adds its own report artifacts. Proposed writes, scope that the
+resolver marks unresolved, malformed output and other failed axes still stop
+intake. Mixed natural-language intent is judged by the resolver, not a lexical
+deny-list; this route never gains implementation capability. Combining
+`--draft-spec` with `--approved-spec` or `--executor` is rejected. Apply
+and legacy routes retain their source-grounded write-target checks.
+
+Each enqueue attempt retains a private, content-free resolver receipt referenced
+by `execution.resolver_receipt`: resolver status (not enqueue success), elapsed milliseconds, reply hash/length
+when available, and structural missing-key/unknown-key counts. Unknown key names,
+values and raw replies are not retained there. Model and usage are explicitly
+unavailable with the current resolver text transport. A receipt cannot recover
+the semantic content of an old malformed reply; failure to save it blocks enqueue.
+
 For apply, use the existing approved-spec/worktree entry with execution config.
 The first version supports only `codex_implement_claude_review`: configure
 `implement`, `review`, `repair`, `delta_review`. RD stages use role `executor`,

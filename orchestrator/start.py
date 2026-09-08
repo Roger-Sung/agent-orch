@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1670,7 +1671,7 @@ def _sources_name_any_path(sources: list[tuple[str, str]]) -> bool:
     for _, text in sources:
         for match in _SOURCE_PATH_TOKEN.finditer(text):
             token = match.group(0)
-            if token.count("/") >= 2 or re.search(r"\.[A-Za-z0-9]{1,8}$", token):
+            if token.count("/") >= 2 or re.search(r"\.[A-Za-z0-9]{1,8}$", token.rstrip(".,;")):
                 return True
     return False
 
@@ -1699,7 +1700,7 @@ def _normalise_write_target(raw: str, worktree: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _resolver_prompt(sources: list[tuple[str, str]]) -> str:
+def _resolver_prompt(sources: list[tuple[str, str]], *, read_only_review: bool = False) -> str:
     """The one question the resolver is asked.
 
     It carries the immutable sources and nothing else: no worktree, no routing
@@ -1762,11 +1763,19 @@ def _resolver_prompt(sources: list[tuple[str, str]]) -> str:
             "does not belong in \"declared\".\n"
             "- \"unresolved\" costs the operator one restatement. A wrong \"declared\" freezes "
             "authority the sources never granted. They are not comparable; choose the stop.",
-            "Special rules:\n"
+            "Special rules:\n" + (
+            "- This invocation is an engine-validated tool-less external spec review. The "
+            "external draft is review evidence, not a requirement source for this invocation. "
+            "Its repository write set is empty even when the caller names read-only paths. "
+            "Return task_owned_write_targets as declared with value [] and evidence []. "
+            "If the caller also asks for implementation or other side effects, report the "
+            "conflicting scope as unresolved; do not grant writes. Other axes still require "
+            "normal grounding and validation.\n"
+            if read_only_review else
             "- task_owned_write_targets has no default: if the sources do not determine the set, "
             "its state is \"unresolved\". An empty declared set means the sources determine that "
             "this task writes no repository path at all; if the sources mention any path, or the "
-            "task is one that changes the repository, the set is not empty but \"unresolved\".\n"
+            "task is one that changes the repository, the set is not empty but \"unresolved\".\n") +
             "- If semantic_change_surface is \"semantically_silent\", its value is the behaviours "
             "the task's own scope names, quoted verbatim from the scope and not expanded. If you "
             "cannot read that behaviour set off the scope, the axis is \"unresolved\".\n"
@@ -1975,9 +1984,8 @@ def _invoke_resolver(prompt: str) -> str:
                 f"intake resolver timed out after {RESOLVER_TIMEOUT_SECONDS}s"
             ) from exc
     if completed.returncode != 0:
-        tail = (completed.stdout or "").strip()[-400:]
         raise EnvelopeResolverError(
-            f"intake resolver exited {completed.returncode}: {tail or '(no output)'}"
+            f"intake resolver exited {completed.returncode}; provider output withheld"
         )
     return completed.stdout or ""
 
@@ -2249,14 +2257,20 @@ def _proposed_candidates(payload: dict[str, Any], axes: dict[str, EnvelopeAxis])
 
 
 def _parse_resolver_reply(
-    reply: str, sources: list[tuple[str, str]], task_record: dict[str, Any]
+    reply: str, sources: list[tuple[str, str]], task_record: dict[str, Any], *, read_only_review: bool = False
 ) -> tuple[dict[str, EnvelopeAxis], list[str]]:
     payload = _resolver_payload(reply)
     blob = _normalise_for_grounding("\n".join(text for _, text in sources))
     scope_blob = _normalise_for_grounding(_scope_text(sources))
     worktree = (task_record.get("flags") or {}).get("worktree")
     apply_shaped = str(task_record.get("task_type_hint") or "") == "apply"
-    sources_name_paths = _sources_name_any_path(sources)
+    sources_name_paths = _sources_name_any_path(sources) and not read_only_review
+    if read_only_review:
+        # Validate the proposal, never silently erase a proposed grant. The
+        # engine's tool-less capability can only narrow repository authority.
+        entry = payload[ENVELOPE_WRITE_AXIS]
+        if isinstance(entry, dict) and entry.get("value"):
+            raise EnvelopeResolverError("tool-less external review cannot grant repository writes")
     axes = {
         axis: _axis_from_proposal(
             axis,
@@ -2272,7 +2286,41 @@ def _parse_resolver_reply(
     return axes, _proposed_candidates(payload, axes)
 
 
-def _resolve_envelope(task_record: dict[str, Any]) -> EnvelopeResolution:
+def _resolver_shape(reply: str | None) -> dict[str, Any]:
+    """Content-free diagnostics: unknown keys/values may themselves be secrets."""
+    if reply is None:
+        return {"reply_available": False}
+    result: dict[str, Any] = {
+        "reply_available": True, "reply_chars": len(reply),
+        "reply_sha256": hashlib.sha256(reply.encode()).hexdigest(),
+    }
+    if len(reply) > RESOLVER_REPLY_MAX_CHARS:
+        result["shape"] = "oversized"
+        return result
+    try:
+        if reply.count(RESOLVER_BEGIN) != 1 or reply.count(RESOLVER_END) != 1:
+            raise ValueError
+        raw = reply.split(RESOLVER_BEGIN, 1)[1].split(RESOLVER_END, 1)[0]
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError
+    except (ValueError, IndexError):
+        result["shape"] = "invalid_framing_or_json_object"
+        return result
+    allowed = {"schema_version", "candidates", *ENVELOPE_AXES}
+    result["missing_axes"] = sorted(set(ENVELOPE_AXES) - payload.keys())
+    result["unexpected_axis_count"] = len(payload.keys() - allowed)
+    result["axes"] = {
+        axis: ({"object": True, "missing_keys": sorted(RESOLVER_AXIS_KEYS - entry.keys()),
+                "unexpected_key_count": len(entry.keys() - RESOLVER_AXIS_KEYS)}
+               if isinstance(entry, dict) else {"object": False})
+        for axis in ENVELOPE_AXES if (entry := payload.get(axis)) is not None
+    }
+    return result
+
+
+def _resolve_envelope(task_record: dict[str, Any], *, read_only_review: bool = False,
+                      receipt_path: Path | None = None) -> EnvelopeResolution:
     """One resolver call, then the accepted envelope or the fail-closed stop.
 
     The routing decision is not an input: the resolver owner is fixed
@@ -2280,15 +2328,34 @@ def _resolve_envelope(task_record: dict[str, Any]) -> EnvelopeResolution:
     requirement text. Routing still decides who executes and who reviews.
     """
     sources = _requirement_sources(task_record)
+    if read_only_review:
+        sources = [(label, text) for label, text in sources if label == "task text" or label == "scope"]
+    reply = None
+    started = time.monotonic()
+    status = "unresolved"
     try:
-        reply = _invoke_resolver(_resolver_prompt(sources))
-        axes, candidates = _parse_resolver_reply(reply, sources, task_record)
+        reply = _invoke_resolver(_resolver_prompt(sources, read_only_review=read_only_review))
+        axes, candidates = _parse_resolver_reply(reply, sources, task_record, read_only_review=read_only_review)
+        status = "unresolved" if _unresolved_axes(axes) else "accepted"
     except EnvelopeResolverError as exc:
         return EnvelopeResolution(
             None,
             "interpretation envelope unresolved before any provider runs; the intake resolver "
             f"produced nothing the engine may act on: {exc}",
         )
+    finally:
+        if receipt_path is not None:
+            receipt = {"schema_version": 1, "status": status,
+                       "duration_ms": round((time.monotonic() - started) * 1000),
+                       "authority_policy": "tool-less-external-review-v1" if read_only_review else "source-grounded-v1",
+                       "provider_reported_model": None, "provider_usage": None,
+                       "identity_unavailable_reason": "resolver text transport does not report model or usage",
+                       "raw_reply_retained": False, **_resolver_shape(reply)}
+            # Unique per attempt, private, no raw values or exception text.
+            fd = os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(receipt, handle, sort_keys=True)
+                handle.write("\n")
     if _unresolved_axes(axes):
         return EnvelopeResolution(
             None, _envelope_stop_reason(axes, task_record, candidates), tuple(candidates)
@@ -2430,6 +2497,8 @@ def _write_target_candidates(task_record: dict[str, Any]) -> list[str]:
 def _preflight(task_record: dict[str, Any], flags: StartFlags) -> dict[str, str | None]:
     if "external_draft" in task_record and (task_record["task_type_hint"] != "review" or "execution_request" not in task_record):
         return {"status": "blocked", "reason": "--draft-spec requires --task-type review and --execution-config"}
+    if "external_draft" in task_record and (flags.approved_spec is not None or flags.executor is not None):
+        return {"status": "blocked", "reason": "--draft-spec is review-only; --approved-spec and --executor are not accepted"}
     if "execution_request" in task_record:
         try:
             pattern = "external_spec_review" if "external_draft" in task_record else _pattern(
@@ -2758,12 +2827,28 @@ def _enqueue_for_routing(
     # input-write timing and request-id generation are all unchanged, and an
     # unresolved result stops here — before the daemon, and therefore before
     # any task executor, task reviewer or stop-gate provider runs.
-    resolution = _resolve_envelope(task_record)
+    read_only_review = pattern == "external_spec_review"
+    if read_only_review:
+        try:
+            profile = load_profile(Path(tracked["profile"]))
+            plan = restore_plan(task_record["execution_plan"], profile, task_record["execution_plan_digest"])
+            if (task_record.get("task_type_hint") != "review" or "external_draft" not in task_record
+                    or profile.initial_stage != "review" or set(plan.stages) != {"review"}
+                    or plan.stages["review"].role != "reviewer"):
+                raise ExecutionConfigError("external review requires one tool-less reviewer stage")
+        except (OSError, ValueError, KeyError) as exc:
+            return {"status": "blocked", "reason": f"external review capability invalid: {exc}", "pattern": pattern}
+    receipt_path = home / "tasks" / f"{task_id}-resolver-{request_id}.json"
+    try:
+        resolution = _resolve_envelope(task_record, read_only_review=read_only_review, receipt_path=receipt_path)
+    except OSError:
+        return {"status": "blocked", "reason": "resolver_receipt_unavailable; no request enqueued", "pattern": pattern}
     if resolution.axes is None:
         return {
             "status": "waiting_user",
             "reason": resolution.stop_reason,
             "pattern": pattern,
+            "resolver_receipt": str(receipt_path),
         }
     try:
         input_path = _write_execution_input(
@@ -2790,6 +2875,7 @@ def _enqueue_for_routing(
     request_path = enqueue_request(home, request)
     return {
         "status": "enqueued",
+        "resolver_receipt": str(receipt_path),
         "reason": reason,
         "request_id": request_id,
         "request_path": str(request_path),
