@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import orchestrator.start
-from orchestrator.controller import Controller, ControllerError
+from orchestrator.controller import Controller, ControllerError, MINIMUM_SAFE_SCOPE_RULE
 from orchestrator.doctor import run_doctor
 from orchestrator.retained import inspect_retained
 from orchestrator.runner import (
@@ -1644,7 +1644,7 @@ class ChokepointTests(EnvelopeFixture):
         )
         self.assertEqual(declaring, ["propose.yaml"])
 
-    def test_a6_a_legacy_prompt_is_byte_identical_to_the_pre_change_engine(self):
+    def test_a6_legacy_has_only_shared_scope_rule_added_not_envelope_contract(self):
         profile = load_profile(APPLY_PROFILE)
         stage = profile.stage("review")
         input_text = self.legacy_input().read_text(encoding="utf-8")
@@ -1663,7 +1663,8 @@ class ChokepointTests(EnvelopeFixture):
 
         composed = Controller._build_prompt("legacy-1", stage, input_text, "/tmp/reports")
 
-        self.assertEqual(composed.encode("utf-8"), expected.encode("utf-8"))
+        self.assertEqual(composed.count(MINIMUM_SAFE_SCOPE_RULE), 1)
+        self.assertEqual(composed.replace(MINIMUM_SAFE_SCOPE_RULE + "\n", "").encode("utf-8"), expected.encode("utf-8"))
         self.assertEqual(allowed_outcomes(stage.outcomes, False), list(stage.outcomes))
 
     def test_a7_the_hold_outcome_is_accepted_on_a_profile_that_never_declared_it(self):

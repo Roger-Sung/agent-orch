@@ -62,6 +62,17 @@ RESUMABLE_STATUSES = {"waiting_user", "paused", "blocked"}
 #: of being permanently unable to read it. Its seal is never rewritten.
 CONVERGENCE_UNESTABLISHED_REASONS = ("convergence_record_invalid", "convergence_unverifiable")
 
+# One shared instruction, not another workflow, classifier or review stage.
+MINIMUM_SAFE_SCOPE_RULE = """Minimum safe scope — drafting, implementation, review and arbitration:
+Ask in order: Is it necessary? Is the smallest solution sufficient and safe? Only then: Is an improvement worthwhile?
+Required work consists of the user's requested outcomes plus risk-proportionate safety, data integrity and necessary verification. Minimum does not mean omitting these obligations or weakening existing acceptance/evidence requirements.
+Keep optional improvements separate from required work, using the existing Advisory/report prose. For each, give only benefit, cost and activation condition. Until selected by the user, do not elaborate its implementation, add it as a required dependency, or let it block acceptance. Flag optional work smuggled into a required dependency; prefer removing that dependency, not implementing the option.
+Before adding config, a lock, journal, abstraction, tool or test framework, name the concrete requirement/failure scenario it addresses and why existing mechanisms are insufficient. Reviewers should first suggest deletion, reuse or simplification, not merely complete an overbuilt design.
+A blocker must cite a requirement violation, concrete safety/data-integrity risk, or necessary verification gap in the existing evidence/source fields. Preference, hypothetical future expansion and optional improvement alone are advisory, not blockers or reasons to auto-implement. Never relabel an in-scope defect or necessary safety measure as optional to avoid fixing it.
+Only justified current blockers belong in convergence live/new/repeated sets; keep optional ideas in Advisory, outside those sets and required remaining-evidence lists. Preserve existing finding identities and resolution evidence; do not hide defects by dropping or renaming them. Once required work passes the existing stage acceptance, use its successful outcome despite remaining optional ideas; optional ideas alone must not trigger repair, simplification, a user-decision hold or another round.
+The coordinator arbitrates in-scope technical disputes. Genuine scope/authority expansion, including a user-selected improvement, follows the existing user-decision and scope-update process: record the selection, update the spec and acceptance/dependencies as needed, and obtain the required approval/new intake before execution. A reviewer suggestion or technical PASS is not user authorization. Never mutate frozen scope, bypass required safety, or create a new gate to apply this rule. If necessary safety cannot fit the authorized scope, stop through the existing decision mechanism rather than omit it.
+"""
+
 
 def _protected_roots_support(run: Any) -> str:
     """How a runner's run() can receive protected_roots: explicit, var_keyword, or none.
@@ -1688,10 +1699,8 @@ class Controller:
     ) -> str:
         """The single prompt-composition site, and so the single injection site.
 
-        Everything the envelope adds is inside the `envelope is not None`
-        branch: a legacy task composes byte-for-byte the prompt it composed
-        before this existed, which is the only way E-8 can be checked rather
-        than asserted.
+        Envelope additions remain conditional. The minimum-safe scope rule is
+        shared by legacy and envelope tasks; it adds no transitions or calls.
         """
         outcomes = ", ".join(allowed_outcomes(stage.outcomes, envelope is not None))
         reports_line = (
@@ -1708,6 +1717,7 @@ class Controller:
             f"You are executing agent-orch task {task_id}, stage {stage.name}.\n"
             f"{reports_line}"
             f"{envelope_section}"
+            f"{MINIMUM_SAFE_SCOPE_RULE}\n"
             f"Stage instructions: {stage.prompt}\n\n"
             f"Task input:\n---\n{input_text}\n---\n\n"
             f"Allowed typed outcomes: {outcomes}.\n"

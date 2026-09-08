@@ -106,6 +106,23 @@ evidence, minimal correction and evidence that would reverse the finding.
 
 ## Stops and manual arbitration
 
+Drafting and review follow the shared minimum-safe-scope instruction composed
+by `Controller._build_prompt`, including legacy profiles. First establish
+necessity, then the smallest sufficient safe solution, then consider optional
+improvements. Keep optional benefit/cost/activation notes in existing Advisory
+prose, out of required dependencies, blocking evidence and convergence live
+sets until the user selects them. Required safety/data-integrity/verification
+gaps still block; they cannot be relabelled optional. Prefer deletion/reuse
+over completing unsupported new machinery. Once required acceptance passes,
+optional ideas do not justify another round or a user-decision hold.
+
+Use the existing evidence fields to justify blockers and the existing user
+decision/spec update/new-intake path for selected scope changes; frozen input
+is never edited in place. The coordinator arbitrates technical disputes within
+scope; only the user authorizes expansion. No new schema, stage, provider call
+or gate is introduced. This is a prompt-level semantic rule, not a deterministic
+classifier of necessity; existing structural checks and evidence gates remain.
+
 An opt-in non-ready review stops for Astra, without dispatching repair. Existing
 timeouts, infrastructure failure handling and legacy convergence stay in place;
 no new round budget is added. A transport failure is not semantic disagreement.
