@@ -59,6 +59,15 @@ class RulesFileTest(unittest.TestCase):
         self.assertTrue(regex_ids, "no regex-backed rules parsed")
         self.assertTrue(secret_ids, "no requires_secrets rules declared")
 
+    def test_required_rules_keep_secret_coverage(self) -> None:
+        # Keep this contract independent of the rules file: deriving the expected
+        # IDs from that file would let a deleted rule silently remove its test.
+        _, secret_ids = load_rule_ids()
+        missing = sorted({"person_name", "company_domain"} - set(secret_ids))
+        self.assertEqual(
+            missing, [], f"required rules missing or no longer require secrets: {missing}"
+        )
+
 
 class GoldenDirectionTest(unittest.TestCase):
     def test_golden_fixture_exits_nonzero(self) -> None:
@@ -139,6 +148,13 @@ class SecretCoverageTest(unittest.TestCase):
         result = run_lint(str(CLEAN), "--no-strict-secrets")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("partial scan", result.stderr)
+
+    def test_partial_scan_still_rejects_regex_violations(self) -> None:
+        result = run_lint(str(GOLDEN), "--no-strict-secrets", "--json")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        counts = json.loads(result.stdout)["counts"]
+        self.assertIn("local_home_path", counts)
+        self.assertIn("private_memory_path", counts)
 
     def test_strict_secrets_passes_with_coverage(self) -> None:
         result = run_lint(str(CLEAN), "--secrets-file", str(SECRETS), "--strict-secrets")
