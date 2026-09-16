@@ -15,3 +15,11 @@ __pycache__/
 /openspec/
 .containment-test-*/
 .sbtest-*/
+
+# Real target packages are not tracked here: a target names another project's
+# paths and vocabulary, and keeping those out is what lets the engine stay
+# target-agnostic (D-2026-09-15-01). `_fixture_min` is the exception on purpose
+# - it belongs to no project and exists to prove that independence, so it ships
+# with the engine and its tests. Engine tests skip when a target is absent.
+/targets/*
+!/targets/_fixture_min/

@@ -58,6 +58,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    pack_status = subparsers.add_parser("pack-status", help="show one pack-v1 pack's state")
+    pack_status.add_argument("pack_id")
+    pack_status.add_argument("--json", action="store_true", help="machine-readable projection")
+
+    pack_list = subparsers.add_parser("pack-list", help="list pack-v1 packs and their states")
+    pack_list.add_argument("--json", action="store_true")
+
     start = subparsers.add_parser("start", help="intake, preflight, and route a stateful lifecycle task")
     start.add_argument("description")
     start.add_argument("--task-type", choices=["propose", "apply", "review", "provider-smoke"])
@@ -270,6 +277,38 @@ def main(argv: list[str] | None = None) -> int:
             "A daemon configured with a different ORCH_HOME will never see this state.",
             file=sys.stderr,
         )
+
+    if args.command in {"pack-status", "pack-list"}:
+        from .db import connect
+        from .pack.policy import pack_status as pack_status_projection, render_status
+        from .pack.store import PackStore
+
+        # Read-only: inspecting a pack must never be able to change one.
+        conn = connect(home / "orch.db", read_only=True)
+        try:
+            store = PackStore(conn, create=False)
+            if args.command == "pack-list":
+                rows = [dict(row) for row in conn.execute(
+                    "SELECT pack_id,state,hold_reason,review_round FROM pack_packs"
+                    " ORDER BY pack_id")]
+                if args.json:
+                    print(json.dumps(rows, ensure_ascii=False, indent=2))
+                else:
+                    for row in rows:
+                        suffix = f"  hold={row['hold_reason']}" if row["hold_reason"] else ""
+                        print(f"{row['pack_id']:<24} {row['state']:<28}"
+                              f" round={row['review_round']}{suffix}")
+                return 0
+            try:
+                status = pack_status_projection(store, args.pack_id)
+            except KeyError:
+                print(f"orchestrator: unknown pack {args.pack_id!r}", file=sys.stderr)
+                return 2
+            print(json.dumps(status, ensure_ascii=False, indent=2) if args.json
+                  else render_status(status))
+            return 0
+        finally:
+            conn.close()
 
     if args.command == "doctor":
         report = run_doctor(home)

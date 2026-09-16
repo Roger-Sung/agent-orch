@@ -21,7 +21,24 @@ SCHEMA_VERSION = 1
 EFFORTS = frozenset({"low", "medium", "high"})
 TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}\Z")
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
-ROLE_PROVIDERS = {"executor": "codex", "reviewer": "claude"}
+# Versioned policies (D-2026-09-14-09).  A request without `policy_version` is
+# execution-v1 and must resolve byte-identically to before this table existed -
+# including its digest - so the default branch reads the same values it always
+# did rather than being reconstructed from the table.
+POLICIES: dict[str, dict[str, Any]] = {
+    "execution-v1": {
+        "roles": {"executor": "codex", "reviewer": "claude"},
+        "model_locks": {"reviewer": "claude-fable-5-1"},
+    },
+    # pack-v1 reverses the pairing: the producer is Claude and both reviewer
+    # stages are Codex, so a model never reviews its own output (D-2026-09-14-05).
+    "pack-v1": {
+        "roles": {"producer": "claude", "contract_review": "codex", "reviewer": "codex"},
+        "model_locks": {},
+    },
+}
+DEFAULT_POLICY = "execution-v1"
+ROLE_PROVIDERS = POLICIES[DEFAULT_POLICY]["roles"]
 PLAN_BEGIN = "<!-- orch-execution-plan:v1 -->"
 PLAN_END = "<!-- /orch-execution-plan -->"
 
@@ -90,15 +107,21 @@ class ExecutionPlan:
     spec_series_id: str
     stages: Mapping[str, ExecutionChoice]
     defaults_digest: str | None = None
+    policy_version: str | None = None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "schema_version": SCHEMA_VERSION,
             "logical_work_id": self.logical_work_id,
             "spec_series_id": self.spec_series_id,
             "defaults_digest": self.defaults_digest,
             "stages": {key: value.to_dict() for key, value in self.stages.items()},
         }
+        # Omitted, not null, for execution-v1: adding a key would change every
+        # existing plan digest and invalidate sealed snapshots (P-1).
+        if self.policy_version is not None:
+            payload["policy_version"] = self.policy_version
+        return payload
 
     @property
     def digest(self) -> str:
@@ -113,7 +136,14 @@ def resolve_request(
     Require coverage of every nonterminal stage. This prevents an omitted
     repair/review silently falling back to a different global model.
     """
-    _keys(request, {"schema_version", "logical_work_id", "spec_series_id", "stages"}, set(), "execution")
+    _keys(request, {"schema_version", "logical_work_id", "spec_series_id", "stages"},
+          {"policy_version"}, "execution")
+    policy_version = request.get("policy_version", DEFAULT_POLICY)
+    if policy_version not in POLICIES:
+        raise ExecutionConfigError(f"unsupported policy_version {policy_version!r}")
+    policy = POLICIES[policy_version]
+    role_providers = policy["roles"]
+    model_locks = policy["model_locks"]
     if type(request["schema_version"]) is not int or request["schema_version"] != SCHEMA_VERSION:
         raise ExecutionConfigError("unsupported execution schema_version")
     work = _token(request["logical_work_id"], "logical_work_id")
@@ -127,9 +157,9 @@ def resolve_request(
     for name, config in stages.items():
         _keys(config, {"role", "provider"}, {"model", "effort"}, f"stage {name}")
         role, provider = config["role"], config["provider"]
-        if not isinstance(role, str) or role not in ROLE_PROVIDERS:
+        if not isinstance(role, str) or role not in role_providers:
             raise ExecutionConfigError(f"stage {name}: unsupported role")
-        if provider != ROLE_PROVIDERS[role] or provider != profile.stage(name).owner:
+        if provider != role_providers[role] or provider != profile.stage(name).owner:
             raise ExecutionConfigError(f"stage {name}: role/provider disagrees with supported pairing or profile")
         fallback = (defaults or {}).get(role, {})
         # null is not omission: it is an invalid explicit value.
@@ -137,17 +167,22 @@ def resolve_request(
         effort = config.get("effort", fallback.get("effort"))
         if not isinstance(effort, str) or effort not in EFFORTS:
             raise ExecutionConfigError(f"stage {name}: unsupported effort {effort!r}")
-        if role == "reviewer" and model != "claude-fable-5-1":
-            raise ExecutionConfigError(f"stage {name}: opt-in reviewer must be claude-fable-5-1")
+        locked = model_locks.get(role)
+        if locked is not None and model != locked:
+            raise ExecutionConfigError(f"stage {name}: opt-in {role} must be {locked}")
         resolved[name] = ExecutionChoice(role, provider, config.get("model"), config.get("effort"), model, effort)
     used_default = any(c.requested_model is None or c.requested_effort is None for c in resolved.values())
     defaults_digest = hashlib.sha256(canonical_json(dict(defaults or {}))).hexdigest() if used_default else None
-    return ExecutionPlan(work, series, MappingProxyType(resolved), defaults_digest)
+    # The plan only carries a policy for non-default values, so an execution-v1
+    # plan serialises - and therefore digests - exactly as it did before.
+    return ExecutionPlan(work, series, MappingProxyType(resolved), defaults_digest,
+                         None if policy_version == DEFAULT_POLICY else policy_version)
 
 
 def restore_plan(data: Any, profile: Profile, expected_digest: str) -> ExecutionPlan:
     """Read a sealed plan without re-resolving defaults or current environment."""
-    _keys(data, {"schema_version", "logical_work_id", "spec_series_id", "stages", "defaults_digest"}, set(), "snapshot")
+    _keys(data, {"schema_version", "logical_work_id", "spec_series_id", "stages", "defaults_digest"},
+          {"policy_version"}, "snapshot")
     if not isinstance(data["stages"], dict):
         raise ExecutionConfigError("snapshot stages must be an object")
     request = {key: value for key, value in data.items() if key not in {"stages", "defaults_digest"}}
@@ -170,7 +205,8 @@ def restore_plan(data: Any, profile: Profile, expected_digest: str) -> Execution
     used_default = any(c.requested_model is None or c.requested_effort is None for c in restored.values())
     if (used_default and (not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None)) or (not used_default and digest is not None):
         raise ExecutionConfigError("inconsistent defaults digest")
-    plan = ExecutionPlan(checked.logical_work_id, checked.spec_series_id, MappingProxyType(restored), digest)
+    plan = ExecutionPlan(checked.logical_work_id, checked.spec_series_id, MappingProxyType(restored),
+                         digest, checked.policy_version)
     if plan.digest != expected_digest:
         raise ExecutionConfigError("execution snapshot hash mismatch")
     return plan

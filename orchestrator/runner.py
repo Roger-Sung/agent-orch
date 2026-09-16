@@ -1526,7 +1526,28 @@ class SubprocessRunner:
         workspace: Path | None = None,
         protected_roots: tuple[Path, ...] | None = None,
         reports_dir: Path | None = None,
+        stdin_payload: str | None = None,
+        capture_stderr_separately: bool = False,
+        env_override: dict[str, str] | None = None,
+        redact_values: tuple[str, ...] = (),
     ) -> RunResult:
+        """The four keyword arguments below default to the previous behaviour.
+
+        pack-v1 needs all four and legacy needs none of them, so each one is a
+        default-valued addition rather than a change: an existing caller that
+        passes none of them produces the same argv, the same env and the same
+        stream handling as before (IMPLEMENTATION-PLAN P-1).
+
+        * ``stdin_payload`` - both pack providers take the prompt on stdin;
+          the legacy path must keep ``DEVNULL`` because ``claude -p`` waits on
+          stdin EOF until the timeout otherwise.
+        * ``capture_stderr_separately`` - Codex prints its session id on stderr
+          while Claude's JSON result is on stdout; merged, the JSON parse would
+          have to tolerate arbitrary diagnostics.
+        * ``env_override`` - zero inheritance (IDENTITIES §2.4).
+        * ``redact_values`` - secrets are masked *before the first write*, which
+          includes the live stream, not only the final log (joint-r3 R2-H2).
+        """
         provider_argv = self._command(owner)
         require_outer_sandbox = getattr(self, "require_outer_sandbox", False)
         if require_outer_sandbox and (workspace is None or allow_unsandboxed_requested()):
@@ -1634,14 +1655,24 @@ class SubprocessRunner:
         try:
             process = subprocess.Popen(
                 command,
-                stdin=subprocess.DEVNULL,  # without this, claude -p waits on stdin EOF until the timeout
+                # without this, claude -p waits on stdin EOF until the timeout
+                stdin=subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE if capture_stderr_separately else subprocess.STDOUT,
                 text=True,
                 start_new_session=True,
                 cwd=str(workspace) if workspace is not None else getattr(self, "working_directory", None),
-                env=containment_env,
+                env=env_override if env_override is not None else containment_env,
             )
+            if stdin_payload is not None:
+                try:
+                    process.stdin.write(stdin_payload)
+                    process.stdin.close()
+                except (BrokenPipeError, OSError):
+                    # The child exited before reading its prompt; the normal
+                    # exit-code path below reports that far more usefully than
+                    # an exception from the write would.
+                    pass
             child_pid = process.pid
             containment_line = f"containment_workspace={workspace}\n" if workspace is not None else ""
             self._append_live_status(

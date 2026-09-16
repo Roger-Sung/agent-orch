@@ -1,0 +1,31 @@
+version: 1
+target_id: _fixture_min
+validator: validate_plan.py
+target_excludes:
+  - build/
+protected_source_globs:
+  - src/**
+hotspot_paths: []
+readable_roots:
+  - src
+home_seeds: []
+obligation_check:
+  result_kind: test
+  tools:
+    - sh
+  argv_template:
+    - tests/check.sh
+    - "{selector}"
+checks:
+  hello:
+    result_kind: test
+    tools:
+      - sh
+    argv_template:
+      - tests/check.sh
+      - "{word}"
+    params:
+      word: hello
+resources: []
+templates:
+  apply: templates/apply.md

@@ -48,8 +48,10 @@ from .runner import (
     validate_convergence,
 )
 from .retained import inspect_retained
-from .execution import ExecutionConfigError, extract_plan, review_context
+from .execution import DEFAULT_POLICY, ExecutionConfigError, extract_plan, review_context
 from .execution_runner import ConfiguredRunner
+from .pack.policy import PackPolicy, allowed_outcomes as pack_allowed_outcomes
+from .pack.store import PackStore
 from .review_contract import build_packet
 from . import review_session
 
@@ -149,6 +151,13 @@ class Controller:
         # an interrupted prior controller. Do this before daemon intake scans.
         orphaned = list(self.conn.execute("SELECT * FROM tasks WHERE status='running' ORDER BY created_at"))
         for task in orphaned:
+            if self._is_pack_v1(task):
+                # pack-v1 owns its own reconcile (STATE-TABLE §5): blanket-blocking
+                # the run and clearing the lease here would destroy the very
+                # evidence that decides whether a writer is still alive.
+                summary.setdefault("pack_reconcile_deferred", 0)
+                summary["pack_reconcile_deferred"] += 1
+                continue
             self._block_orphaned_running(task)
             summary["running_blocked"] += 1
         for task in self.conn.execute("SELECT * FROM tasks ORDER BY created_at"):
@@ -271,6 +280,9 @@ class Controller:
             if task["status"] not in ACTIVE_STATUSES:
                 return self.status(task_id)
             if task["status"] == "running":
+                if self._is_pack_v1(task):
+                    # Same reason as the startup barrier: pack reconcile decides.
+                    return self.status(task_id)
                 self._block_orphaned_running(task)
                 return self.status(task_id)
             profile = self._profile_for(task)
@@ -326,8 +338,12 @@ class Controller:
                     # elsewhere the provider CLI can create the directory or
                     # fail visibly in its own output.
                     pass
+            # pack-v1 scores convergence with judge-v1 over sealed envelopes
+            # (STATE-TABLE §4); running the legacy scorer as well would put two
+            # different verdicts on the same round.
             convergence = (
-                self._convergence_context(task_id, stage, profile) if envelope is not None else None
+                self._convergence_context(task_id, stage, profile)
+                if envelope is not None and not self._is_pack_v1(task) else None
             )
             prompt_stage = stage
             if isinstance(stage_runner, ConfiguredRunner) and stage_runner.choice.role == "reviewer":
@@ -341,8 +357,10 @@ class Controller:
                     "Treat executor reports as claims; missing evidence is UNKNOWN with an owner. "
                     "Prior conversation is context, not authority to change current scope or acceptance. "
                     "Technical review does not grant implementation or deployment approval."))
+            pack_outcomes = self._pack_outcomes(task, stage)
             prompt = self._build_prompt(
-                task_id, prompt_stage, input_text, reports_location, envelope, convergence
+                task_id, prompt_stage, input_text, reports_location, envelope, convergence,
+                pack_outcomes,
             )
             try:
                 raw_result = self._invoke_runner(task, stage, prompt, log_path, reports_dir, runner=stage_runner)
@@ -355,13 +373,20 @@ class Controller:
             result = classify_result(
                 raw_result.exit_code,
                 raw_result.output,
-                set(allowed_outcomes(stage.outcomes, envelope is not None)),
+                set(pack_outcomes if pack_outcomes is not None
+                    else allowed_outcomes(stage.outcomes, envelope is not None)),
                 raw_result.timed_out,
                 source=raw_result,
             )
             if convergence is not None:
                 result = self._apply_convergence(result, convergence)
-            if result.execution_receipt is not None and result.execution_receipt.get("role") == "reviewer":
+            if (result.execution_receipt is not None
+                    and result.execution_receipt.get("role") == "reviewer"
+                    and not self._is_pack_v1(task)):
+                # execution-v1 routes any non-`ready` review to the user. pack-v1
+                # has typed outcomes of its own (needs_repair, blocked, ...) that
+                # the state machine consumes, so rewriting them to waiting_user
+                # would strand every ordinary repair round.
                 if result.classification == "success" and result.outcome != "ready":
                     result = replace(result, classification="waiting_user",
                                      reason=f"review_requires_astra_decision: {result.reason}")
@@ -628,17 +653,23 @@ class Controller:
             envelope_uncapped = (
                 self._envelope_for_task(task) is not None and self._gate_reachable(profile)
             )
+            # pack-v1 gates dispatch on its own budget policy (STATE-TABLE §3.4)
+            # and on the §3.3a decision, so the legacy caps only observe here.
+            # The counters keep counting and stay readable in `orch status`;
+            # they simply stop being the thing that refuses.
+            pack_uncapped = self._is_pack_v1(task)
             if (
                 task["transitions_count"] >= task["max_transitions"]
                 and not allowance
                 and not envelope_uncapped
+                and not pack_uncapped
             ):
                 self._stop_for_cap(task, "transition_cap", f"max_transitions={task['max_transitions']} reached")
                 self.conn.execute("COMMIT")
                 return None
 
             cycle, attempt = self._next_attempt(task_id, stage.name)
-            if attempt > stage.attempt_cap and not allowance:
+            if attempt > stage.attempt_cap and not allowance and not pack_uncapped:
                 self._stop_for_cap(task, "attempt_cap", f"{stage.name}.attempt_cap={stage.attempt_cap} reached")
                 self.conn.execute("COMMIT")
                 return None
@@ -708,6 +739,11 @@ class Controller:
             now = _now()
             duration_ms = self._duration_ms(run, result, now)
             manifest_path, manifest_hash = self._seal_run_manifest(task, run, result, stage.name, now)
+            if self._is_pack_v1(task):
+                self._commit_pack_run(task, run, result, stage, now, duration_ms,
+                                      manifest_path, manifest_hash)
+                self.conn.execute("COMMIT")
+                return
             if result.classification != "success":
                 status = result.classification
                 self.conn.execute(
@@ -940,7 +976,11 @@ class Controller:
                     f"containment-inspect {task_id}; --rerun-stage explicitly requests a new "
                     "provider attempt, not clearance or reuse of the interrupted run"
                 )
-            allowance = 1 if task["status"] == "waiting_user" else 0
+            # pack-v1 resumes only through an authorised A_* event that has
+            # already passed the §6.0 gate, so it must not also receive the
+            # legacy blanket allowance that skips the caps for one claim.
+            pack_v1 = self._is_pack_v1(task)
+            allowance = 1 if task["status"] == "waiting_user" and not pack_v1 else 0
             now = _now()
             resumed_edge = None
             resumed_outcome = None
@@ -958,10 +998,19 @@ class Controller:
                     "UPDATE edge_counts SET count=count+1 WHERE task_id=? AND edge=?",
                     (task_id, resumed_edge),
                 )
-            self.conn.execute(
-                "UPDATE tasks SET status='queued',stop_reason=NULL,lease_token=NULL,resume_allowance=?,revision=revision+1,updated_at=? WHERE id=?",
-                (allowance, now, task_id),
-            )
+            if pack_v1:
+                # The pack writer lease is owned by the pack store and says who
+                # may write the worktree; clearing it here would hand a second
+                # writer the same tree while the first may still be alive.
+                self.conn.execute(
+                    "UPDATE tasks SET status='queued',stop_reason=NULL,resume_allowance=?,revision=revision+1,updated_at=? WHERE id=?",
+                    (allowance, now, task_id),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE tasks SET status='queued',stop_reason=NULL,lease_token=NULL,resume_allowance=?,revision=revision+1,updated_at=? WHERE id=?",
+                    (allowance, now, task_id),
+                )
             self._insert_transition(
                 task_id,
                 operation_id or str(uuid.uuid4()),
@@ -1337,6 +1386,102 @@ class Controller:
             return hold(f"convergence_{verdict}")
         return result
 
+    @property
+    def pack_store(self) -> PackStore:
+        """Lazily attach the pack tables to the controller's own connection.
+
+        Same connection, therefore same transaction: sealing a call and marking
+        it unconsumed cannot end up in different commits (STATE-TABLE §3.0b).
+        """
+        store = getattr(self, "_pack_store", None)
+        if store is None:
+            store = PackStore(self.conn)
+            self._pack_store = store
+        return store
+
+    def _commit_pack_run(self, task: sqlite3.Row, run: sqlite3.Row, result: RunResult,
+                         stage: Any, now: int, duration_ms: int | None,
+                         manifest_path: Any, manifest_hash: str | None) -> None:
+        """pack-v1's commit: seal the call, leave the result unconsumed.
+
+        What this deliberately does *not* do is the legacy tail of `commit_run`
+        - outcome-to-edge routing, edge caps, and deriving the task's next
+        status. Those decisions belong to the pack state machine, which runs
+        against sealed results rather than inside the commit that produces them.
+        """
+        self.conn.execute(
+            """UPDATE stage_runs SET status='committed',exit_code=?,outcome=?,ended_at=?,
+               duration_ms=?,model=?,usage_input_tokens=?,usage_output_tokens=?,
+               usage_total_tokens=?,usage_unavailable_reason=?,manifest_path=?,manifest_hash=?,sealed=1
+               WHERE run_token=?""",
+            (
+                result.exit_code, result.outcome, now, duration_ms,
+                getattr(result, "model", None),
+                getattr(result, "usage_input_tokens", None),
+                getattr(result, "usage_output_tokens", None),
+                getattr(result, "usage_total_tokens", None),
+                getattr(result, "usage_unavailable_reason", None),
+                str(manifest_path) if manifest_path is not None else None,
+                manifest_hash, run["run_token"],
+            ),
+        )
+        policy = PackPolicy(self.pack_store)
+        pack_id = task["id"]
+        try:
+            self.pack_store.get_operation(run["run_token"])
+        except KeyError:
+            # The operation row is written before the spawn in the normal path;
+            # creating it here keeps a run that predates the pack store from
+            # losing its result entirely.
+            self.pack_store.create_operation(
+                run["run_token"], pack_id, type="provider", stage=stage.name,
+            )
+        policy.commit_call_result(
+            run["run_token"],
+            result="completed" if result.classification == "success" else "failed",
+            result_ref=manifest_hash,
+        )
+        # Back to queued so the daemon ticks the pack machine; the pack's own
+        # state lives in pack_packs, not in the task row.
+        self.conn.execute(
+            "UPDATE tasks SET status='queued',stop_reason=NULL,updated_at=?,revision=revision+1"
+            " WHERE id=?",
+            (now, task["id"]),
+        )
+
+    def _pack_outcomes(self, task: sqlite3.Row, stage: Any) -> list[str] | None:
+        """pack-v1's allowed outcome set for this stage, or None for legacy.
+
+        The legacy helper derives the set from whether an envelope happens to be
+        present; pack-v1's is a policy constant per stage, so a stage that has
+        not yet produced an envelope still advertises the same outcomes.
+        """
+        if not self._is_pack_v1(task):
+            return None
+        try:
+            return sorted(pack_allowed_outcomes(stage.name))
+        except KeyError:
+            # A profile stage pack-v1 has no outcome set for is a configuration
+            # error, not a licence to fall back to the legacy derivation.
+            raise ControllerError(f"pack-v1 has no allowed outcomes for stage {stage.name!r}")
+
+    def _policy_version(self, task: sqlite3.Row) -> str:
+        """Which policy this task runs under, read from its own frozen snapshot.
+
+        Unreadable or absent means legacy, deliberately: every pack-v1 branch
+        below is an *exception* to the existing behaviour, so a task we cannot
+        classify must fall back to what the controller did before pack-v1
+        existed rather than into a path its snapshot never authorised.
+        """
+        try:
+            plan = extract_plan(self._read_verified_input(task["id"]), self._profile_for(task))
+        except Exception:
+            return DEFAULT_POLICY
+        return (plan.policy_version if plan is not None else None) or DEFAULT_POLICY
+
+    def _is_pack_v1(self, task: sqlite3.Row) -> bool:
+        return self._policy_version(task) == "pack-v1"
+
     def _envelope_for_task(self, task: sqlite3.Row) -> dict[str, Any] | None:
         """Envelope presence, read from the hash-verified input snapshot."""
         snapshot = Path(task["input_snapshot_path"])
@@ -1696,13 +1841,19 @@ class Controller:
         reports_location: str | None = None,
         envelope: dict[str, Any] | None = None,
         convergence: dict[str, Any] | None = None,
+        outcome_set: list[str] | None = None,
     ) -> str:
         """The single prompt-composition site, and so the single injection site.
 
         Envelope additions remain conditional. The minimum-safe scope rule is
         shared by legacy and envelope tasks; it adds no transitions or calls.
         """
-        outcomes = ", ".join(allowed_outcomes(stage.outcomes, envelope is not None))
+        # pack-v1 passes its per-stage constant in; every other caller leaves
+        # `outcome_set` unset and gets the legacy derivation unchanged (§3.2a).
+        outcomes = ", ".join(
+            outcome_set if outcome_set is not None
+            else allowed_outcomes(stage.outcomes, envelope is not None)
+        )
         reports_line = (
             f"Reports directory (write stage reports here): {reports_location}\n"
             if reports_location
