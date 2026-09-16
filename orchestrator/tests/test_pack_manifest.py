@@ -105,6 +105,27 @@ class ManifestValidationTest(unittest.TestCase):
     def test_em002_empty_tasks(self) -> None:
         self.expect("EM-002", lambda m: m["packs"][0].update(tasks=[]))
 
+    # EM-002's key set is exact *except* for `tier_basis_ref`, which the
+    # underlying schema requires only where a low tier has to justify itself.
+    # Listing it unconditionally rejects every manifest a real validator emits,
+    # since it omits the key entirely above that tier.
+    def test_em002_tier_basis_ref_may_be_absent_above_low(self) -> None:
+        manifest = copy.deepcopy(self.manifest)
+        manifest["packs"][0].pop("tier_basis_ref")
+        validate_manifest(manifest)
+
+    def test_em002_low_tier_must_justify_itself(self) -> None:
+        def mutate(m):
+            m["packs"][0].update(tier="low")
+            m["packs"][0].pop("tier_basis_ref")
+        self.expect("EM-002", mutate)
+
+    def test_em002_low_tier_basis_must_be_non_empty(self) -> None:
+        self.expect("EM-002", lambda m: m["packs"][0].update(tier="low", tier_basis_ref=""))
+
+    def test_em002_other_extra_keys_are_still_refused(self) -> None:
+        self.expect("EM-002", lambda m: m["packs"][0].update(notes="x"))
+
     def test_em003_unknown_disposition(self) -> None:
         self.expect("EM-003", lambda m: m["packs"][0]["obligations"][0].update(disposition="maybe"))
 

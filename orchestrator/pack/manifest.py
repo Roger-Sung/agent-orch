@@ -28,10 +28,9 @@ PACK_KEYS = frozenset({
 })
 # Conditional, not absent from the schema: PACK_MANIFEST_SCHEMA requires
 # `tier_basis_ref` only for a `low` tier pack, where the six justifying lines
-# have to point somewhere.  ENVELOPES EM-002 lists it inside the exact key set,
-# which no real manifest can satisfy - so it is enforced here on the condition
-# the underlying schema actually states, and the discrepancy is flagged to the
-# spec owner rather than worked around silently.
+# have to point somewhere, and a real validator omits the key entirely above
+# that tier.  ENVELOPES EM-002 listed it inside the exact key set until the
+# implementation step corrected it (CLOSURE §12a).
 CONDITIONAL_PACK_KEYS = frozenset({"tier_basis_ref"})
 TIERS_REQUIRING_BASIS = frozenset({"low"})
 OBLIGATION_KEYS = frozenset({
