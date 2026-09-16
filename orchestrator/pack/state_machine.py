@@ -21,7 +21,7 @@ import hashlib
 import json
 from typing import Any, Callable, Sequence
 
-from . import budgets
+from . import budgets, revocation
 from .judge import Decision, judge_v1
 from .store import PackStore
 
@@ -53,7 +53,7 @@ INVALIDATING_HOLDS = {
     "workspace_dirty", "contract_invalid", "containment_stop",
 }
 
-STOP_EVIDENCE_KINDS = ("process_group_absent", "host_rebooted")
+STOP_EVIDENCE_KINDS = (revocation.KIND, "host_rebooted")
 
 
 class PackStateError(Exception):
@@ -317,18 +317,51 @@ class PackMachine:
     # reconcile (§5)
     # ------------------------------------------------------------------
 
-    def stop_evidence(self, op: dict[str, Any], *, current_boot_id: str | None,
-                      op_boot_id: str | None,
-                      process_group_absent: Callable[[dict[str, Any]], bool] | None = None) -> str | None:
-        """Return the evidence kind that proves the writer stopped, or None.
+    STOP_EVIDENCE = "stop_evidence"
 
-        Absence of proof is not proof of absence: with no `process_identity`, no
-        recoverable process group and an unchanged boot id, the answer is None
-        and the operation stays unknown for as long as that takes (joint-r4).
+    def revoke_write_capability(self, op_id: str, *, roots: Sequence[Any],
+                                quarantine: Any, record_id: str,
+                                holders: Callable[[Any], list[str] | None] | None = None,
+                                ) -> dict[str, Any]:
+        """E-1 - take the operation's write capability away, then verify it.
+
+        The result is recorded whether or not it succeeded: a refusal is the
+        operator's only account of why the operation is still unknown, and
+        without it the next attempt looks like the first.
         """
-        identity = op.get("process_identity")
-        if identity and process_group_absent is not None and process_group_absent(op):
-            return "process_group_absent"
+        op = self.store.get_operation(op_id)
+        result = revocation.revoke(
+            roots, quarantine=quarantine,
+            **({"holders": holders} if holders is not None else {}))
+        self.store.add_record(record_id, self.STOP_EVIDENCE, {"op_id": op_id, **result},
+                              pack_id=op["pack_id"])
+        return result
+
+    def revocation_evidence(self, op: dict[str, Any]) -> dict[str, Any] | None:
+        """The successful revocation recorded for this operation, if any."""
+        for record in self.store.records_of_kind(self.STOP_EVIDENCE, op["pack_id"]):
+            payload = record["payload"]
+            if (not record["revoked"] and payload.get("op_id") == op["op_id"]
+                    and payload.get("ok")):
+                return payload
+        return None
+
+    def stop_evidence(self, op: dict[str, Any], *, current_boot_id: str | None,
+                      op_boot_id: str | None) -> str | None:
+        """Return the evidence kind that proves the tree is safe, or None.
+
+        Absence of proof is not proof of absence: with no recorded revocation
+        and an unchanged boot id the answer is None, and the operation stays
+        unknown for as long as that takes (joint-r4).
+
+        E-1 no longer asks whether the writer died.  A provider can move its
+        helpers into process groups of their own, so an empty original group is
+        not the conclusion it was being read as (D-2026-09-16-01); what is
+        checked instead is that the engine took the write capability away and
+        confirmed nothing still holds it.
+        """
+        if self.revocation_evidence(op) is not None:
+            return revocation.KIND
         if current_boot_id and op_boot_id and current_boot_id != op_boot_id:
             return "host_rebooted"
         return None

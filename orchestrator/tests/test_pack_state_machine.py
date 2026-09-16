@@ -1,9 +1,12 @@
 """STATE-TABLE §10 fixtures driven by the stub (IMPLEMENTATION-PLAN step 1)."""
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
-from orchestrator.pack import budgets
+from orchestrator.pack import budgets, revocation
 from orchestrator.pack.state_machine import (
     ALREADY_CONSUMED,
     CONSUME,
@@ -270,8 +273,8 @@ class UnknownRecoveryTest(unittest.TestCase):
             "still_unknown",
         )
 
-    # ST24h-2c: the leader exited but the process group still has members.
-    def test_st24h2c_leader_gone_group_alive_stays_unknown(self) -> None:
+    # ST24h-2c: the leader exited and nothing was revoked - still unknown.
+    def test_st24h2c_leader_gone_without_revocation_stays_unknown(self) -> None:
         op = self.pack.produce()
         self.pack.machine.startup_scan(self.pack.pack_id, alive=lambda o: False)
         self.hold_unknown(op)
@@ -279,23 +282,125 @@ class UnknownRecoveryTest(unittest.TestCase):
             self.pack.machine.resolve_operation(
                 self.pack.pack_id, op, "recovery_run",
                 current_boot_id=BOOT_A, op_boot_id=BOOT_A,
-                process_group_absent=lambda o: False,
             ),
             "refused_no_stop_evidence",
         )
 
-    # ST24h-3 (E-1): the whole process group is verifiably gone.
-    def test_st24h3_process_group_absent_releases_recovery(self) -> None:
+    # An empty original process group is no longer evidence of anything: a
+    # provider can setsid its helpers out of the group, so the group emptying is
+    # compatible with a live writer (D-2026-09-16-01).
+    def test_an_empty_process_group_is_not_stop_evidence(self) -> None:
         op = self.pack.produce()
         self.pack.machine.startup_scan(self.pack.pack_id, alive=lambda o: False)
         self.hold_unknown(op)
+        operation = self.pack.store.get_operation(op)
+        self.assertIsNone(
+            self.pack.machine.stop_evidence(operation, current_boot_id=BOOT_A,
+                                            op_boot_id=BOOT_A))
+
+    # ST24h-3 (E-1): the write roots were renamed aside and nothing holds them.
+    def test_st24h3_revoked_write_capability_releases_recovery(self) -> None:
+        op = self.pack.produce()
+        self.pack.machine.startup_scan(self.pack.pack_id, alive=lambda o: False)
+        self.hold_unknown(op)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "ws"
+        (root / "src").mkdir(parents=True)
+        (root / "src" / "A.java").write_text("class A {}\n")
+
+        result = self.pack.machine.revoke_write_capability(
+            op, roots=[root], quarantine=Path(tmp.name) / "quarantine",
+            record_id="EV-1")
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(root.exists(), "the root the sandbox allowed is gone")
+        # §5 requires the operation to record how the evidence was obtained.
+        self.assertEqual(result["moved"][0]["root"], str(root))
+        self.assertTrue(Path(result["moved"][0]["moved_to"]).is_dir())
+
         self.assertEqual(
             self.pack.machine.resolve_operation(
                 self.pack.pack_id, op, "recovery_run",
                 current_boot_id=BOOT_A, op_boot_id=BOOT_A,
-                process_group_absent=lambda o: True,
             ),
             "allowed:recovery_run",
+        )
+
+    def test_a_held_descriptor_refuses_the_evidence(self) -> None:
+        """A survivor with the tree already open is the case renaming misses."""
+        op = self.pack.produce()
+        self.pack.machine.startup_scan(self.pack.pack_id, alive=lambda o: False)
+        self.hold_unknown(op)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "ws"
+        root.mkdir(parents=True)
+
+        result = self.pack.machine.revoke_write_capability(
+            op, roots=[root], quarantine=Path(tmp.name) / "q", record_id="EV-2",
+            holders=lambda paths: ["p4242"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], revocation.OPEN_DESCRIPTORS)
+        self.assertEqual(
+            self.pack.machine.resolve_operation(
+                self.pack.pack_id, op, "recovery_run",
+                current_boot_id=BOOT_A, op_boot_id=BOOT_A,
+            ),
+            "refused_no_stop_evidence",
+        )
+
+    def test_the_probe_runs_after_the_rename_not_before(self) -> None:
+        """Order is the mechanism, not an implementation detail.
+
+        Probing first leaves a window between "the probe came back empty" and
+        "the rename happened" in which a survivor can open the tree by its old
+        path.  Renaming first closes it, so the probe only has to cover
+        descriptors that were already open.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "ws"
+        root.mkdir(parents=True)
+        seen: list[bool] = []
+
+        def holders(paths):
+            seen.append(root.exists())
+            return []
+
+        result = revocation.revoke([root], quarantine=Path(tmp.name) / "q",
+                                   holders=holders)
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen, [False],
+                         "the probe ran while the old path was still reachable")
+
+    def test_revoking_nothing_is_refused_rather_than_reported_clean(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        result = revocation.revoke([], quarantine=Path(tmp.name) / "q")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], revocation.NO_ROOTS)
+
+    def test_an_incomplete_enumeration_refuses_the_evidence(self) -> None:
+        """Not being able to look is not the same as looking and seeing none."""
+        op = self.pack.produce()
+        self.pack.machine.startup_scan(self.pack.pack_id, alive=lambda o: False)
+        self.hold_unknown(op)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "ws"
+        root.mkdir(parents=True)
+
+        result = self.pack.machine.revoke_write_capability(
+            op, roots=[root], quarantine=Path(tmp.name) / "q", record_id="EV-3",
+            holders=lambda paths: None)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], revocation.ENUMERATION_INCOMPLETE)
+        self.assertEqual(
+            self.pack.machine.resolve_operation(
+                self.pack.pack_id, op, "recovery_run",
+                current_boot_id=BOOT_A, op_boot_id=BOOT_A,
+            ),
+            "refused_no_stop_evidence",
         )
 
     # ST24h-3 (E-3): the host rebooted, so no old process can have survived.
@@ -818,3 +923,38 @@ class BudgetGateTest(unittest.TestCase):
     def test_an_unknown_counter_is_refused_not_silently_created(self) -> None:
         with self.assertRaises(budgets.BudgetError):
             self.pack.machine.raise_cap(self.pack.pack_id, "made_up", 1, record_id="CAP-z")
+
+
+@unittest.skipUnless(os.path.exists(revocation.LSOF), "lsof is not installed")
+class RevocationProbeTest(unittest.TestCase):
+    """The real probe, not an injected one.
+
+    `lsof` exits 1 both for "nothing holds this" and for "I could not look", so
+    everything here turns on telling those apart: reading the first as the
+    second would make every failed enumeration look like clean evidence.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def test_nothing_holding_a_directory_reports_no_holders(self) -> None:
+        quiet = self.root / "quiet"
+        quiet.mkdir()
+        (quiet / "a.txt").write_text("x")
+        self.assertEqual(revocation.lsof_holders([quiet]), [])
+
+    def test_a_path_that_cannot_be_examined_reports_unknown(self) -> None:
+        self.assertIsNone(revocation.lsof_holders([self.root / "gone"]))
+
+    def test_an_open_descriptor_is_reported(self) -> None:
+        busy = self.root / "busy"
+        busy.mkdir()
+        target = busy / "held.txt"
+        target.write_text("x")
+        handle = open(target, "a")
+        self.addCleanup(handle.close)
+        holders = revocation.lsof_holders([busy])
+        self.assertIsNotNone(holders)
+        self.assertIn(f"p{os.getpid()}", holders)
