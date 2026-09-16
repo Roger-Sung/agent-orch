@@ -391,6 +391,29 @@ def validate_convergence(
     return verdict
 
 
+def _child_env(containment_env: dict[str, str] | None,
+               env_override: dict[str, str] | None) -> dict[str, str] | None:
+    """Combine the engine's containment env with an explicit replacement.
+
+    The containment env starts from the ambient environment, which pack-v1 must
+    not inherit (IDENTITIES §2.4). But the keys containment *itself* set - the
+    git push blocks, the sandbox mode, the reports dir - are engine-supplied,
+    not inherited, and dropping them would silently remove the confinement the
+    same call is relying on.
+
+    A key whose value differs from the ambient environment is one the engine
+    set; those survive, everything inherited does not, and the override wins
+    over both.
+    """
+    if env_override is None:
+        return containment_env
+    engine_set = {
+        key: value for key, value in (containment_env or {}).items()
+        if os.environ.get(key) != value
+    }
+    return {**engine_set, **env_override}
+
+
 def prepare_containment(workspace: Path, log_path: Path) -> dict[str, str]:
     """Prepare worktree + git containment for one stage run; return the child env.
 
@@ -1527,9 +1550,10 @@ class SubprocessRunner:
         protected_roots: tuple[Path, ...] | None = None,
         reports_dir: Path | None = None,
         stdin_payload: str | None = None,
-        capture_stderr_separately: bool = False,
+        stderr_path: Path | None = None,
         env_override: dict[str, str] | None = None,
         redact_values: tuple[str, ...] = (),
+        extra_write_roots: tuple[Path, ...] = (),
     ) -> RunResult:
         """The four keyword arguments below default to the previous behaviour.
 
@@ -1541,12 +1565,19 @@ class SubprocessRunner:
         * ``stdin_payload`` - both pack providers take the prompt on stdin;
           the legacy path must keep ``DEVNULL`` because ``claude -p`` waits on
           stdin EOF until the timeout otherwise.
-        * ``capture_stderr_separately`` - Codex prints its session id on stderr
-          while Claude's JSON result is on stdout; merged, the JSON parse would
-          have to tolerate arbitrary diagnostics.
+        * ``stderr_path`` - Codex prints its session id on stderr while
+          Claude's JSON result is on stdout; merged, the JSON parse would have
+          to tolerate arbitrary diagnostics.  It is a *file*, never a second
+          pipe: only stdout is drained, so a pipe here deadlocks the provider
+          the moment its diagnostics exceed the 64 KiB buffer - which Codex
+          reaches on any real review.
         * ``env_override`` - zero inheritance (IDENTITIES §2.4).
         * ``redact_values`` - secrets are masked *before the first write*, which
           includes the live stream, not only the final log (joint-r3 R2-H2).
+        * ``extra_write_roots`` - per-role writable roots beyond the workspace
+          (IMPLEMENTATION-PLAN §3.1): an operation's temp and home directories,
+          and the artifacts root. They widen the L1 allowlist and nothing else;
+          a root overlapping a protected one is still refused by containment.
         """
         provider_argv = self._command(owner)
         require_outer_sandbox = getattr(self, "require_outer_sandbox", False)
@@ -1581,7 +1612,10 @@ class SubprocessRunner:
                     f"cannot prepare the provider final-response channel: {exc}",
                 )
             provider_argv = provider_argv + [CODEX_LAST_MESSAGE_FLAG, str(capture_path)]
-        command = provider_argv + [prompt]
+        # The prompt goes on the command line or on stdin, never both: passing
+        # it twice would have the provider read one copy and ignore the other,
+        # and which one wins is not something the engine should be guessing at.
+        command = provider_argv if stdin_payload is not None else provider_argv + [prompt]
         model_command = command
         containment_env = None
         if workspace is not None:
@@ -1611,7 +1645,10 @@ class SubprocessRunner:
                     workspace,
                     log_path.with_suffix(".containment"),
                     allow_unsandboxed=False if require_outer_sandbox else allow_unsandboxed_requested(),
-                    extra_allow=(reports_dir,) if reports_dir is not None else (),
+                    extra_allow=(
+                        ((reports_dir,) if reports_dir is not None else ())
+                        + tuple(extra_write_roots)
+                    ),
                     protected_roots=protected_roots,
                 )
             except ContainmentConfigError as exc:
@@ -1652,17 +1689,21 @@ class SubprocessRunner:
         error: str | None = None
         child_pid: int | None = None
         process: subprocess.Popen[str] | None = None
+        stderr_handle = None
         try:
+            if stderr_path is not None:
+                stderr_path.parent.mkdir(parents=True, exist_ok=True)
+                stderr_handle = open(stderr_path, "wb")
             process = subprocess.Popen(
                 command,
                 # without this, claude -p waits on stdin EOF until the timeout
                 stdin=subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE if capture_stderr_separately else subprocess.STDOUT,
+                stderr=stderr_handle if stderr_handle is not None else subprocess.STDOUT,
                 text=True,
                 start_new_session=True,
                 cwd=str(workspace) if workspace is not None else getattr(self, "working_directory", None),
-                env=env_override if env_override is not None else containment_env,
+                env=_child_env(containment_env, env_override),
             )
             if stdin_payload is not None:
                 try:
@@ -1712,6 +1753,9 @@ class SubprocessRunner:
                 exit_code = process.returncode
             error = f"runner interrupted: {type(exc).__name__}: {exc}"
             output += error + "\n"
+        finally:
+            if stderr_handle is not None:
+                stderr_handle.close()
         ended = time.time()
         live.close(process=process, timed_out=timed_out)
         # Read after the child is reaped, so a file still being written cannot

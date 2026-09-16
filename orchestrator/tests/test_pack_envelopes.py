@@ -510,3 +510,53 @@ class VerifyEnvelopeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContractReviewOutcomeVocabularyTest(unittest.TestCase):
+    """STATE-TABLE §406: a contract review answers contract_pass / contract_findings.
+
+    `contract_hold` is the hold reason those findings produce downstream, not the
+    token the reviewer prints.  Deriving the review-stage vocabulary here makes
+    the stage unpassable, because every token it can derive lies outside the set
+    `allowed_outcomes("contract_review")` admits - which is how a real reviewer
+    round was rejected whichever token it printed.
+    """
+
+    def _envelope(self, contract_findings):
+        envelope = {k: v for k, v in HEADER.items()}
+        envelope.update({
+            "review_round": None,
+            "candidate_fingerprint": None,
+            "verdict": "needs_repair" if contract_findings else "accepted",
+            "blocked_reason": None,
+            "obligations": {},
+            "findings": [],
+            "contract_findings": contract_findings,
+            "improvements": [],
+            "prior_round": None,
+            "remaining": [],
+        })
+        return envelope
+
+    def _validate(self, envelope, printed):
+        echo = {k: envelope[k] for k in (
+            "target_id", "change", "pack", "contract_hash", "bundle_hash",
+            "plan_fingerprint", "requirement_fingerprint")}
+        validate_review(envelope, printed, expected_header=echo,
+                        active_obligations=[], bundle_observations={},
+                        stage="contract_review")
+
+    def test_clean_contract_review_passes_with_contract_pass(self) -> None:
+        self._validate(self._envelope([]), "contract_pass")
+
+    def test_findings_are_reported_as_contract_findings(self) -> None:
+        finding = {"id": "C1-1", "kind": "missing_source",
+                   "obligation_refs": [], "source_ref": "proposal.md",
+                   "claim": "no source for the deliverable",
+                   "requested_revision": "cite one"}
+        self._validate(self._envelope([finding]), "contract_findings")
+
+    def test_hold_reason_is_not_an_outcome_token(self) -> None:
+        with self.assertRaises(EnvelopeInvalid) as raised:
+            self._validate(self._envelope([]), "accepted")
+        self.assertEqual(raised.exception.code, "EV-R-001")

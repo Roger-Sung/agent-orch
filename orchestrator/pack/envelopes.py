@@ -103,8 +103,18 @@ def parse_framing(text: str) -> tuple[dict[str, Any], str]:
     return envelope, outcome
 
 
-def derive_outcome(envelope: dict[str, Any]) -> str:
-    """The outcome the engine derives; the printed line is redundancy, not input."""
+def derive_outcome(envelope: dict[str, Any], stage: str = "review") -> str:
+    """The outcome the engine derives; the printed line is redundancy, not input.
+
+    The two review stages do not share a vocabulary (STATE-TABLE §406, §411).
+    A contract review answers `contract_pass` / `contract_findings`; `contract_hold`
+    is the *hold reason* those findings produce downstream, never the outcome
+    token itself.  Deriving review's vocabulary for a contract review makes the
+    stage unpassable: every token it can derive is outside the set
+    `allowed_outcomes("contract_review")` admits.
+    """
+    if stage == "contract_review":
+        return "contract_findings" if envelope.get("contract_findings") else "contract_pass"
     if envelope.get("contract_findings"):
         return "contract_hold"
     return str(envelope.get("verdict"))
@@ -160,7 +170,7 @@ def validate_review(
             _reject("G-5", f"{field}: echoed {envelope.get(field)!r} != sent {expected!r}")
 
     # EV-R-001: the printed outcome must agree with what the envelope means.
-    derived = derive_outcome(envelope)
+    derived = derive_outcome(envelope, stage)
     if outcome != derived:
         _reject("EV-R-001", f"printed {outcome!r} != derived {derived!r}")
 
