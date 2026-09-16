@@ -398,6 +398,12 @@ class PackStore:
              _json(sorted(lineage_set)), _now()),
         )
 
+    def count_dispatch_records(self, pack_id: str) -> int:
+        """`chargeable_rounds` is defined as the dispatch record count (§3.4)."""
+        return self.conn.execute(
+            "SELECT COUNT(*) AS n FROM pack_dispatch_records WHERE pack_id=?", (pack_id,)
+        ).fetchone()["n"]
+
     def last_dispatch_record(self, pack_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT * FROM pack_dispatch_records WHERE pack_id=? ORDER BY source_review_seq DESC,"

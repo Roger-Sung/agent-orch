@@ -21,6 +21,7 @@ import hashlib
 import json
 from typing import Any, Callable, Sequence
 
+from . import budgets
 from .judge import Decision, judge_v1
 from .store import PackStore
 
@@ -376,6 +377,71 @@ class PackMachine:
             elif outcome == DEFER:
                 counts["deferred"] += 1
         return counts
+
+    # ------------------------------------------------------------------
+    # budgets (§3.4)
+    # ------------------------------------------------------------------
+
+    CAP_RAISE = "cap_raise"
+    RETRY_USED = "reviewer_retry_used"
+
+    def budget_caps(self, pack_id: str,
+                    budget_policy: dict[str, Any] | None = None) -> dict[str, int]:
+        raises = [r["payload"] for r in self.store.records_of_kind(self.CAP_RAISE, pack_id)
+                  if not r["revoked"]]
+        return budgets.caps(budget_policy, raises)
+
+    def raise_cap(self, pack_id: str, kind: str, extra: int, *, record_id: str) -> None:
+        """`A_raise_cap` - a validity record, not a reset (§3.4)."""
+        kind = budgets.normalise_kind(kind)
+        budgets.caps(None, [{"kind": kind, "extra": extra}])  # rejects a bad kind/extra here
+        self.store.add_record(record_id, self.CAP_RAISE, {"kind": kind, "extra": extra},
+                              pack_id=pack_id)
+
+    def reserve_dispatch(self, pack_id: str, *, budget_policy: dict[str, Any] | None = None,
+                         counts_round: bool = False) -> str | None:
+        """Pre-deduct a provider call, and a round when one is being dispatched.
+
+        Returns the hold reason when the reservation is refused, else None and
+        the counters have moved.  Refusing *before* spending is the whole point:
+        the deduction is never refunded, because the cost is already real by the
+        time a call fails.
+        """
+        caps = self.budget_caps(pack_id, budget_policy)
+        pack = self.store.get_pack(pack_id)
+        if counts_round and budgets.exhausted(
+                "round_cap", self.store.count_dispatch_records(pack_id), caps["round_cap"]):
+            return budgets.hold_reason("round_cap")
+        if budgets.exhausted("call_budget", pack["calls_reserved"], caps["call_budget"]):
+            return budgets.hold_reason("call_budget")
+        self.store.bump(pack_id, "calls_reserved", 1)
+        return None
+
+    def reviewer_retry_used(self, pack_id: str, *, stage: str, output_id: int | None) -> int:
+        return sum(1 for r in self.store.records_of_kind(self.RETRY_USED, pack_id)
+                   if not r["revoked"]
+                   and r["payload"].get("stage") == stage
+                   and r["payload"].get("output_id") == output_id)
+
+    def use_reviewer_retry(self, pack_id: str, *, stage: str, output_id: int | None,
+                           cause: str, record_id: str,
+                           budget_policy: dict[str, Any] | None = None) -> str | None:
+        """Spend one reviewer redispatch for this `(stage, output_id)` group.
+
+        Returns the hold reason when the allowance is gone.  The reason is the
+        cause rather than a generic budget hold, because the operator's exit is
+        the matching `A_redispatch`, which raises this same counter (§3.4).
+        """
+        if cause not in budgets.REVIEWER_CAUSES:
+            raise budgets.BudgetError(f"unknown reviewer retry cause {cause!r}")
+        caps = self.budget_caps(pack_id, budget_policy)
+        used = self.reviewer_retry_used(pack_id, stage=stage, output_id=output_id)
+        if budgets.exhausted("reviewer_retry", used, caps["reviewer_retry"]):
+            return budgets.hold_reason("reviewer_retry", cause=cause)
+        self.store.add_record(record_id, self.RETRY_USED,
+                              {"stage": stage, "output_id": output_id, "cause": cause},
+                              pack_id=pack_id)
+        return None
 
     # ------------------------------------------------------------------
     # dispatch gate (§3.3a)

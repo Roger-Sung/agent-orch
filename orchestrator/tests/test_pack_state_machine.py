@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import unittest
 
+from orchestrator.pack import budgets
 from orchestrator.pack.state_machine import (
     ALREADY_CONSUMED,
     CONSUME,
@@ -14,6 +15,7 @@ from orchestrator.pack.state_machine import (
 )
 from orchestrator.tests.pack_stub import (
     BOOT_A,
+    BudgetRefused,
     BOOT_B,
     CONTRACT_H1,
     StubPack,
@@ -645,6 +647,7 @@ class CoverageMapTest(unittest.TestCase):
         "ST24c": "RemainingFixtureTest", "ST24d": "RemainingFixtureTest",
         "ST24g": "RemainingFixtureTest", "ST24k": "RemainingFixtureTest",
         "ST25b": "RemainingFixtureTest",
+        "ST5": "BudgetGateTest", "ST25": "BudgetGateTest",
         "ST24h-1": "UnknownRecoveryTest", "ST24h-2": "UnknownRecoveryTest",
         "ST24h-2b": "UnknownRecoveryTest", "ST24h-2c": "UnknownRecoveryTest",
         "ST24h-2d": "UnknownRecoveryTest", "ST24h-3": "UnknownRecoveryTest",
@@ -659,11 +662,9 @@ class CoverageMapTest(unittest.TestCase):
     # Still open, with the step that owns them.  Listing them is the point:
     # an unlisted gap is indistinguishable from no gap.
     DEFERRED = {
-        "ST5": "step 5 - reviewer retry budgets",
         "ST14": "step 7 - needs a real sealed receipt",
         "ST14b": "step 7 - needs a real provider session",
         "ST24e": "step 5 - restore_tree against a real blob store",
-        "ST25": "step 5 - budget caps and A_raise_cap",
     }
 
     def test_no_fixture_is_both_covered_and_deferred(self) -> None:
@@ -687,3 +688,133 @@ class CoverageMapTest(unittest.TestCase):
                 hasattr(module, class_name),
                 f"{fixture} claims to live in {location}, which does not exist",
             )
+
+
+class BudgetGateTest(unittest.TestCase):
+    """STATE-TABLE §3.4 - the only thing that refuses a pack-v1 dispatch.
+
+    Legacy's claim and edge caps are bypassed for pack-v1 by design, so a
+    missing gate here is not a missing limit among several: it is no limit at
+    all.  ST5 and ST25 are the two fixtures that say so.
+    """
+
+    POLICY = {"round_cap": 4, "call_budget": 12, "reviewer_retry": 2}
+
+    def setUp(self) -> None:
+        self.pack = StubPack()
+        self.pack.contract_review(passes=True)
+        self.pack.claim()
+
+    def _dispatch_records(self, n: int) -> None:
+        for i in range(n):
+            self.pack.store.create_dispatch_record(
+                f"D-{i}", self.pack.pack_id, source_review_seq=i + 1,
+                repair_op_id=f"OP-r{i}", target_output_id=1, lineage_set=["H1"])
+
+    def _calls_reserved(self) -> int:
+        return self.pack.pack()["calls_reserved"]
+
+    # ST5: allowance 2 with 1 already used - one more redispatch, then the hold.
+    def test_st5_reviewer_allowance_runs_out_and_holds(self) -> None:
+        first = self.pack.machine.use_reviewer_retry(
+            self.pack.pack_id, stage="review", output_id=1, cause="envelope_invalid",
+            record_id="RT-0", budget_policy=self.POLICY)
+        self.assertIsNone(first, "the first of two retries must be allowed")
+
+        second = self.pack.machine.use_reviewer_retry(
+            self.pack.pack_id, stage="review", output_id=1, cause="envelope_invalid",
+            record_id="RT-1", budget_policy=self.POLICY)
+        self.assertIsNone(second, "the allowance is 2, so the second is the last one")
+
+        third = self.pack.machine.use_reviewer_retry(
+            self.pack.pack_id, stage="review", output_id=1, cause="envelope_invalid",
+            record_id="RT-2", budget_policy=self.POLICY)
+        self.assertEqual(third, "envelope_invalid")
+        # Refused, not merely reported: a spent-out group must not keep a record.
+        self.assertEqual(
+            self.pack.machine.reviewer_retry_used(self.pack.pack_id, stage="review", output_id=1),
+            2)
+
+    def test_st5_allowance_is_scoped_to_its_group(self) -> None:
+        for i in range(2):
+            self.pack.machine.use_reviewer_retry(
+                self.pack.pack_id, stage="review", output_id=1, cause="envelope_invalid",
+                record_id=f"RT-{i}", budget_policy=self.POLICY)
+        # A different output is a different `(stage, output_id)` group (§3.4).
+        other = self.pack.machine.use_reviewer_retry(
+            self.pack.pack_id, stage="review", output_id=2, cause="reviewer_failed",
+            record_id="RT-other", budget_policy=self.POLICY)
+        self.assertIsNone(other)
+        # The contract review stage keeps its own count, per the same rule.
+        contract = self.pack.machine.use_reviewer_retry(
+            self.pack.pack_id, stage="contract_review", output_id=None, cause="reviewer_failed",
+            record_id="RT-contract", budget_policy=self.POLICY)
+        self.assertIsNone(contract)
+
+    def test_exhausted_allowance_reports_the_cause_not_a_budget_hold(self) -> None:
+        for i in range(2):
+            self.pack.machine.use_reviewer_retry(
+                self.pack.pack_id, stage="review", output_id=1, cause="reviewer_failed",
+                record_id=f"RF-{i}", budget_policy=self.POLICY)
+        self.assertEqual(
+            self.pack.machine.use_reviewer_retry(
+                self.pack.pack_id, stage="review", output_id=1, cause="reviewer_failed",
+                record_id="RF-2", budget_policy=self.POLICY),
+            "reviewer_failed")
+
+    # ST25: rounds at the cap, raised by 2, with 3 calls left.
+    def test_st25_raised_cap_lets_the_fifth_round_through(self) -> None:
+        self._dispatch_records(4)
+        self.pack.store.update_pack(self.pack.pack_id,
+                                    calls_reserved=self.POLICY["call_budget"] - 3)
+
+        refused = self.pack.machine.reserve_dispatch(
+            self.pack.pack_id, budget_policy=self.POLICY, counts_round=True)
+        self.assertEqual(refused, "budget_exhausted(round)")
+        self.assertEqual(self._calls_reserved(), self.POLICY["call_budget"] - 3,
+                         "a refused reservation must not spend a call")
+
+        # `A_raise_cap(round, 2)` - the spelling the hold reason gave the operator.
+        self.pack.machine.raise_cap(self.pack.pack_id, "round", 2, record_id="CAP-1")
+        self.assertEqual(
+            self.pack.machine.budget_caps(self.pack.pack_id, self.POLICY)["round_cap"], 6)
+
+        allowed = self.pack.machine.reserve_dispatch(
+            self.pack.pack_id, budget_policy=self.POLICY, counts_round=True)
+        self.assertIsNone(allowed)
+        self.assertEqual(self._calls_reserved(), self.POLICY["call_budget"] - 2)
+
+    def test_st25_call_budget_refuses_even_when_rounds_are_free(self) -> None:
+        self.pack.store.update_pack(self.pack.pack_id,
+                                    calls_reserved=self.POLICY["call_budget"])
+        self.assertEqual(
+            self.pack.machine.reserve_dispatch(self.pack.pack_id, budget_policy=self.POLICY),
+            "budget_exhausted(call)")
+
+    def test_raises_accumulate_rather_than_replace(self) -> None:
+        self.pack.machine.raise_cap(self.pack.pack_id, "round_cap", 1, record_id="CAP-a")
+        self.pack.machine.raise_cap(self.pack.pack_id, "round_cap", 1, record_id="CAP-b")
+        self.assertEqual(
+            self.pack.machine.budget_caps(self.pack.pack_id, self.POLICY)["round_cap"], 6)
+
+    def test_a_revoked_raise_stops_counting(self) -> None:
+        self.pack.machine.raise_cap(self.pack.pack_id, "round_cap", 2, record_id="CAP-x")
+        self.pack.store.revoke_record("CAP-x")
+        self.assertEqual(
+            self.pack.machine.budget_caps(self.pack.pack_id, self.POLICY)["round_cap"], 4)
+
+    def test_the_gate_actually_refuses_a_dispatch(self) -> None:
+        """The counters are worthless if nothing consults them before spawning.
+
+        This is the property a gate with no caller would still pass every other
+        test in this class while providing no limit at all.
+        """
+        self.pack.store.update_pack(self.pack.pack_id,
+                                    calls_reserved=budgets.DEFAULTS["call_budget"])
+        with self.assertRaises(BudgetRefused) as raised:
+            self.pack.next_op("producer", stage="apply")
+        self.assertEqual(str(raised.exception), "budget_exhausted(call)")
+
+    def test_an_unknown_counter_is_refused_not_silently_created(self) -> None:
+        with self.assertRaises(budgets.BudgetError):
+            self.pack.machine.raise_cap(self.pack.pack_id, "made_up", 1, record_id="CAP-z")

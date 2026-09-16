@@ -24,6 +24,10 @@ def new_store() -> PackStore:
     return PackStore(conn)
 
 
+class BudgetRefused(RuntimeError):
+    """The §3.4 gate refused the dispatch; the hold reason is the argument."""
+
+
 class StubPack:
     """One pack driven through the machine by explicit steps."""
 
@@ -46,15 +50,22 @@ class StubPack:
         return self.store.get_pack(self.pack_id)
 
     def next_op(self, type: str, *, stage: str | None = None, attempt_id: str | None = None,
-                logical_op_id: str | None = None, reserve: int = 1) -> str:
+                logical_op_id: str | None = None, reserve: int = 1,
+                counts_round: bool = False) -> str:
         self._op_seq += 1
         op_id = f"OP-{self._op_seq}"
+        if reserve:
+            # The stub dispatches through the §3.4 gate for the same reason a
+            # real one must: the reservation and the operation belong to one
+            # step, and a refusal has to happen before the call is made.
+            refused = self.machine.reserve_dispatch(self.pack_id, counts_round=counts_round)
+            if refused is not None:
+                raise BudgetRefused(refused)
         self.store.create_operation(
             op_id, self.pack_id, type=type, stage=stage, attempt_id=attempt_id,
             logical_op_id=logical_op_id,
             reserved_counters={"call_budget": reserve} if reserve else None,
         )
-        self.store.bump(self.pack_id, "calls_reserved", reserve)
         return op_id
 
     def binding(self, *, stage: str, attempt_id: str | None = None,
