@@ -36,6 +36,7 @@ def assemble_contract(*, target: TargetPackage, change: str, pack_id: str,
                       manifest_sha256_value: str, base_revision: str,
                       candidate_input: str | None, environment: dict[str, Any],
                       target_checks: Sequence[dict[str, Any]] = (),
+                      dependencies: dict[str, Any] | None = None,
                       approvals: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build the closed contract for one pack (IDENTITIES §2.4).
 
@@ -98,7 +99,7 @@ def assemble_contract(*, target: TargetPackage, change: str, pack_id: str,
         "files_writable": sorted(pack["files_writable"]),
         "base_revision": base_revision,
         "candidate_fingerprint_input": candidate_input,
-        "dependency_revisions": {},
+        "dependency_revisions": dict(dependencies or {}),
         "evidence_receipts": {},
         "approved_checks": checks,
         "prerun_checks": [{"check_id": check["check_id"], "params": check["params"]}
@@ -141,6 +142,32 @@ def build_environment(target: TargetPackage, tool_versions: dict[str, dict[str, 
     }
 
 
+def dependency_revisions(store: PackStore, pack: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Bind each upstream pack's accepted receipt, or report what is missing.
+
+    A pack that reads another pack's deliverable has to name *which* accepted
+    revision of it, or the work is written against something that may already
+    have changed (IDENTITIES §2.4.1).  An unsatisfied dependency is not a
+    contract defect to review around - the pack simply is not ready, which is
+    what `blocked_deps` means (STATE-TABLE §1.1).
+    """
+    bound: dict[str, Any] = {}
+    missing: list[str] = []
+    for upstream in (pack.get("depends") or {}).get("packs", []):
+        upstream_id = upstream["id"] if isinstance(upstream, dict) else upstream
+        receipts = [r for r in store.receipts(upstream_id, "acceptance")]
+        if not receipts:
+            missing.append(upstream_id)
+            continue
+        latest = receipts[-1]
+        bound[upstream_id] = {
+            "candidate_output": latest["payload"].get("candidate_output"),
+            "accepted_contract_hash": latest["payload"].get("contract_hash"),
+            "acceptance_receipt_sha256": latest["sha256"],
+        }
+    return bound, missing
+
+
 def start_packs(store: PackStore, *, target: TargetPackage, change_dir: Path,
                 base_revision: str, host_boot_id: str | None = None,
                 workspace: Path | None = None) -> list[dict[str, Any]]:
@@ -178,11 +205,25 @@ def start_packs(store: PackStore, *, target: TargetPackage, change_dir: Path,
 
     started: list[dict[str, Any]] = []
     for pack in manifest["packs"]:
+        bound, missing = dependency_revisions(store, pack)
+        if missing:
+            # Not contracted at all: there is nothing to review until the
+            # upstream is accepted, and contracting now would bind a revision
+            # that does not exist yet.
+            store.create_pack(pack["id"], target_id=target.target_id,
+                              change=change_dir.name, state="blocked_deps",
+                              host_boot_id=host_boot_id)
+            store.update_pack(pack["id"],
+                              blockers=[{"reason": "blocked_deps", "packs": sorted(missing)}])
+            started.append({"pack": pack["id"], "contract_hash": None, "contract": None,
+                            "blocked_on": sorted(missing)})
+            continue
         contract = assemble_contract(
             target=target, change=change_dir.name, pack_id=pack["id"], manifest=manifest,
             requirement=requirement, manifest_sha256_value=manifest_sha,
             base_revision=base_revision, candidate_input=None, environment=environment,
             target_checks=payload.get("checks", []),
+            dependencies=bound,
         )
         digest = contract_hash(contract)
         store.create_pack(pack["id"], target_id=target.target_id, change=change_dir.name,

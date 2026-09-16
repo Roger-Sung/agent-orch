@@ -17,7 +17,8 @@ import unittest
 from pathlib import Path
 
 from orchestrator.pack.envelopes import validate_verify
-from orchestrator.pack.intake import assemble_contract, build_environment, start_packs
+from orchestrator.pack.intake import (assemble_contract, build_environment,
+                                     dependency_revisions, start_packs)
 from orchestrator.pack.manifest import validate_manifest
 from orchestrator.pack.state_machine import PackMachine
 from orchestrator.pack.store import PackStore
@@ -371,3 +372,97 @@ class SelectorAuthorityTest(unittest.TestCase):
                 target_checks=[],  # the target reported nothing
             )
         self.assertEqual(ctx.exception.code, "untranslated_selector")
+
+
+class DependencyBindingTest(unittest.TestCase):
+    """IDENTITIES §2.4.1: a pack that reads upstream work names which revision.
+
+    Leaving `dependency_revisions` empty contracts the work against whatever the
+    upstream happens to be at read time, which a real review caught on P2.  An
+    upstream with no acceptance receipt is not a contract defect either - the
+    pack is simply not ready, which is `blocked_deps` (STATE-TABLE §1.1).
+    """
+
+    def setUp(self) -> None:
+        self.store = new_store()
+
+    def _accept(self, pack_id: str, *, output: str, contract_hash: str,
+                sha: str) -> None:
+        self.store.add_receipt(f"RCP-{pack_id}", pack_id, kind="acceptance",
+                               sha256=sha,
+                               payload={"candidate_output": output,
+                                        "contract_hash": contract_hash})
+
+    def test_accepted_upstream_is_bound_to_its_receipt(self) -> None:
+        self._accept("P0", output="cand-1", contract_hash="sha256:" + "b" * 64,
+                     sha="sha256:" + "e" * 64)
+        bound, missing = dependency_revisions(self.store, {"id": "P1", "depends": {"packs": ["P0"]}})
+        self.assertEqual(missing, [])
+        self.assertEqual(bound["P0"], {
+            "candidate_output": "cand-1",
+            "accepted_contract_hash": "sha256:" + "b" * 64,
+            "acceptance_receipt_sha256": "sha256:" + "e" * 64,
+        })
+
+    def test_unaccepted_upstream_is_reported_not_bound(self) -> None:
+        bound, missing = dependency_revisions(self.store, {"id": "P1", "depends": {"packs": ["P0"]}})
+        self.assertEqual(bound, {})
+        self.assertEqual(missing, ["P0"])
+
+    def test_latest_acceptance_wins(self) -> None:
+        self._accept("P0", output="old", contract_hash="sha256:" + "b" * 64,
+                     sha="sha256:" + "1" * 64)
+        self._accept("P0b", output="new", contract_hash="sha256:" + "c" * 64,
+                     sha="sha256:" + "2" * 64)
+        self.store.add_receipt("RCP-P0-2", "P0", kind="acceptance",
+                               sha256="sha256:" + "3" * 64,
+                               payload={"candidate_output": "newer",
+                                        "contract_hash": "sha256:" + "d" * 64})
+        bound, _ = dependency_revisions(self.store, {"id": "P1", "depends": {"packs": ["P0"]}})
+        self.assertEqual(bound["P0"]["candidate_output"], "newer")
+
+    def test_no_dependencies_binds_nothing(self) -> None:
+        bound, missing = dependency_revisions(self.store, {"id": "P1"})
+        self.assertEqual((bound, missing), ({}, []))
+
+
+@unittest.skipUnless(HAS_FIXTURE,
+                     "the _fixture_min target package is not present")
+class ContractCarriesDependencyRevisionsTest(unittest.TestCase):
+    """Binding upstream revisions is worthless unless the contract carries them.
+
+    The producer reads the contract, not the store, so a contract that reports
+    `dependency_revisions: {}` while an upstream exists sends the work out
+    against an unnamed revision - the defect a real review caught on P2.
+    """
+
+    def _assemble(self, dependencies):
+        from orchestrator.pack.intake import assemble_contract
+        from orchestrator.pack.target import load_target
+
+        target = load_target(
+            Path(__file__).resolve().parents[2] / "targets" / "_fixture_min")
+        manifest = {
+            "packs": [{
+                "id": "P1", "contract_version": 1, "title": "t", "tasks": ["T1"],
+                "files_writable": [], "depends": {"packs": ["P0"], "evidence": []},
+                "tier": "high", "tier_basis_ref": None,
+                "obligations": [],
+            }],
+            "deferred": [], "evidence_declared": [],
+        }
+        return assemble_contract(
+            target=target, change="c", pack_id="P1", manifest=manifest,
+            requirement="sha256:" + "a" * 64, manifest_sha256_value="sha256:b",
+            base_revision="abc", candidate_input=None, environment={},
+            target_checks=[], dependencies=dependencies)
+
+    def test_bound_revisions_reach_the_contract(self) -> None:
+        bound = {"P0": {"candidate_output": "cand-1",
+                        "accepted_contract_hash": "sha256:" + "b" * 64,
+                        "acceptance_receipt_sha256": "sha256:" + "e" * 64}}
+        contract = self._assemble(bound)
+        self.assertEqual(contract["dependency_revisions"], bound)
+
+    def test_absent_dependencies_stay_empty(self) -> None:
+        self.assertEqual(self._assemble(None)["dependency_revisions"], {})
