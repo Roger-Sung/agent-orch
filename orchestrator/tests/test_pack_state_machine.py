@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from orchestrator.pack import budgets, receipts, revocation
+from orchestrator.pack import budgets, receipts, revocation, sessions
 from orchestrator.pack.envelopes import validate_review
 from orchestrator.pack.state_machine import (
     ALREADY_CONSUMED,
@@ -709,7 +709,7 @@ class FaultInjectionTest(unittest.TestCase):
         self.pack.claim()
         counts = self.pack.machine.startup_scan(self.pack.pack_id)
         self.assertEqual(counts, {"unknown": 0, "consumed": 0, "deferred": 0,
-                                  "not_spawned": 0, "recovered": 0})
+                                  "not_spawned": 0, "recovered": 0, "session_lost": 0})
         self.assertEqual(self.pack.state(), "claimed")
 
     # "provider 完成未 commit": a receipt exists, so recovery seals and consumes.
@@ -1074,3 +1074,46 @@ class SealedReceiptRecoveryTest(unittest.TestCase):
             self.pack.pack_id, alive=lambda o: False, sealed=self._sealed())
         self.assertEqual(counts["unknown"], 1)
         self.assertEqual(self.refusal, receipts.UNREADABLE)
+
+
+class ReviewSessionLostTest(unittest.TestCase):
+    """ST14b (detection half): a review call that was dispatched and never answered.
+
+    Marking it merely `unknown` loses the fact that the conversation it was
+    speaking on is gone too, and the next dispatch would open a fresh session -
+    routing around the hold instead of resuming (§5).
+    """
+
+    def setUp(self) -> None:
+        self.pack = StubPack()
+        self.pack.contract_review(passes=True)
+        self.pack.claim()
+        produced = self.pack.produce()
+        self.k = self.pack.submit(produced)
+        self.pack.prerun(self.k)
+        self.op = self.pack.next_op("review", stage="review")
+        self.pack.store.update_operation(
+            self.op, spawned=1, process_identity={"pid": 909, "pgid": 909, "start": 1})
+
+    def _open_session(self) -> None:
+        sessions.open_session(self.pack.store, self.pack.pack_id, "reviewer", None,
+                              op_id=self.op)
+
+    def test_a_pending_session_turns_unknown_into_review_session_lost(self) -> None:
+        self._open_session()
+        counts = self.pack.machine.startup_scan(self.pack.pack_id, alive=lambda o: False)
+        self.assertEqual(counts["unknown"], 1)
+        self.assertEqual(counts["session_lost"], 1)
+        self.assertEqual(self.pack.state(), "hold(review_session_lost)")
+
+    def test_without_a_pending_session_it_is_only_unknown(self) -> None:
+        counts = self.pack.machine.startup_scan(self.pack.pack_id, alive=lambda o: False)
+        self.assertEqual(counts["unknown"], 1)
+        self.assertEqual(counts["session_lost"], 0)
+        self.assertNotEqual(self.pack.state(), "hold(review_session_lost)")
+
+    def test_the_pending_row_is_not_silently_cleared(self) -> None:
+        """§5: the pending row is the record that a call was never answered."""
+        self._open_session()
+        self.pack.machine.startup_scan(self.pack.pack_id, alive=lambda o: False)
+        self.assertIsNotNone(self.pack.store.pending_session_for(self.op))

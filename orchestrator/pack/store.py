@@ -489,6 +489,23 @@ class PackStore:
             out.append(record)
         return out
 
+    def pending_session_for(self, op_id: str) -> dict[str, Any] | None:
+        """The session row that is still waiting on this operation, if any.
+
+        A pending row is the record that a call was dispatched and never
+        answered; §5 reads it to tell `review_session_lost` apart from a plain
+        unknown operation.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM pack_sessions WHERE pending_op_id=? AND state='pending'", (op_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        record["provider_binding"] = _load(record["provider_binding"])
+        record["predecessor"] = _load(record["predecessor"])
+        return record
+
     def latest_session(self, pack_id: str, role: str, attempt_id: str | None) -> dict[str, Any] | None:
         rows = self.session_rows(pack_id, role, attempt_id)
         return rows[-1] if rows else None

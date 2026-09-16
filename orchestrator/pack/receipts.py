@@ -21,6 +21,7 @@ supplies because only the caller knows which stage's rules apply.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -60,7 +61,12 @@ def seal(path: Path, *, op_id: str, call_binding: dict[str, Any], outcome: str,
     })
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(body)
+    # Written through a temporary name: a controller that dies mid-write would
+    # otherwise leave a truncated receipt at the real path, and a truncated
+    # receipt is the one failure the reader cannot tell from a short one.
+    scratch = path.with_name(path.name + ".partial")
+    scratch.write_bytes(body)
+    os.replace(scratch, path)
     return "sha256:" + sha256_hex(body)
 
 

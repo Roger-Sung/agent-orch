@@ -7,13 +7,18 @@ field with non-deterministic values pinned.
 """
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from orchestrator.controller import Controller, ControllerError
+from orchestrator.pack.envelopes import REVIEW_BEGIN, REVIEW_END
+from orchestrator.pack.policy import allowed_outcomes as pack_allowed_outcomes
 from orchestrator.pack.store import PackStore
+from orchestrator.tests.pack_stub import full_review_envelope
 from orchestrator.runner import RunResult
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -161,13 +166,23 @@ class PackBranchTest(unittest.TestCase):
         return self.controller.conn.execute(
             "SELECT * FROM tasks WHERE id=?", (self.task_id,)).fetchone()
 
-    # (e) the startup barrier must not touch a pack task.
-    def test_startup_barrier_defers_to_pack_reconcile(self) -> None:
+    # (e) the startup barrier hands a pack task to the pack's own reconcile.
+    # Deferring without running it left an interrupted pack `running` for ever,
+    # which is why this asserts the scan happened rather than that it was skipped.
+    def test_startup_barrier_runs_the_pack_reconcile(self) -> None:
         self.controller.conn.execute(
             "UPDATE tasks SET status='running',lease_token='LEASE-1' WHERE id=?", (self.task_id,))
+        store = self.controller.pack_store
+        store.create_pack(self.task_id, target_id="acme", change="c1", state="producing(1)")
+        store.create_operation("OP-1", self.task_id, type="producer", stage="apply")
+        store.update_operation("OP-1", spawned=1,
+                               process_identity={"pid": 999999, "pgid": 999999, "start": 1})
+
         summary = self.controller.reconcile_startup()
         self.assertEqual(summary["running_blocked"], 0)
-        self.assertEqual(summary["pack_reconcile_deferred"], 1)
+        # A dead group with no receipt is unknown, not blocked and not recovered.
+        self.assertEqual(summary["pack_unknown"], 1)
+        self.assertEqual(store.get_operation("OP-1")["result"], "unknown")
         row = self.task()
         self.assertEqual(row["status"], "running")
         self.assertEqual(row["lease_token"], "LEASE-1")
@@ -337,3 +352,137 @@ class PackCliTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(state, "repair_pending(1)")
+
+
+class PackReceiptRecoveryTest(unittest.TestCase):
+    """The window §5 exists for: the provider finished, the controller did not.
+
+    Sealing inside `commit_run` would put the receipt on the far side of the
+    crash it is meant to survive, so it is written first and its hash recorded
+    in its own transaction - otherwise a crash in between leaves a receipt with
+    nothing to verify it against, which reconcile must refuse.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.controller = Controller(Path(self._tmp.name), runner=SequenceRunner([]))
+        self.addCleanup(self.controller.close)
+        self.task_id = self.controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        self.controller._is_pack_v1 = lambda task: True
+        self.store = self.controller.pack_store
+        self.store.create_pack(self.task_id, target_id="acme", change="c1",
+                               state="reviewing(1)")
+        self.store.create_operation("OP-R", self.task_id, type="review", stage="review")
+        self.store.update_operation(
+            "OP-R", spawned=1,
+            process_identity={"pid": 999999, "pgid": 999999, "start": 1})
+        self.task = self.controller.conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (self.task_id,)).fetchone()
+
+    def _result(self, envelope: dict, outcome: str = "needs_repair") -> RunResult:
+        body = json.dumps(envelope)
+        text = f"{REVIEW_BEGIN}\n{body}\n{REVIEW_END}\nORCHESTRATOR_OUTCOME: {outcome}\n"
+        return RunResult(0, text, outcome, "success", "ok")
+
+    def test_a_sealed_receipt_is_recovered_after_the_crash(self) -> None:
+        self.controller._seal_pack_receipt(self.task, "OP-R", self._result(full_review_envelope(1)))
+        ref = self.store.get_operation("OP-R")["receipt_ref"]
+        self.assertTrue(ref and ref.startswith("sha256:"), "the expectation must be durable")
+        self.assertTrue(self.controller._pack_receipt_path(self.task, "OP-R").is_file())
+
+        counts = self.controller.reconcile_pack(self.task)
+        self.assertEqual(counts["recovered"], 1)
+        self.assertEqual(counts["unknown"], 0)
+        self.assertEqual(self.store.get_operation("OP-R")["result"], "completed")
+
+    def test_a_call_with_no_envelope_seals_nothing(self) -> None:
+        self.controller._seal_pack_receipt(
+            self.task, "OP-R", RunResult(0, "no envelope here", None, "success", "ok"))
+        self.assertIsNone(self.store.get_operation("OP-R")["receipt_ref"])
+        counts = self.controller.reconcile_pack(self.task)
+        self.assertEqual(counts["unknown"], 1)
+        self.assertEqual(counts["recovered"], 0)
+
+    def test_a_receipt_rewritten_after_sealing_is_refused(self) -> None:
+        self.controller._seal_pack_receipt(self.task, "OP-R", self._result(full_review_envelope(1)))
+        path = self.controller._pack_receipt_path(self.task, "OP-R")
+        path.write_bytes(path.read_bytes().replace(b"needs_repair", b"accepted"))
+        counts = self.controller.reconcile_pack(self.task)
+        self.assertEqual(counts["unknown"], 1)
+        self.assertEqual(counts["recovered"], 0)
+
+    def test_a_live_process_group_is_waited_for_not_reconciled(self) -> None:
+        self.store.update_operation(
+            "OP-R", process_identity={"pid": os.getpid(), "pgid": os.getpgid(0), "start": 1})
+        counts = self.controller.reconcile_pack(self.task)
+        self.assertEqual(counts, {"unknown": 0, "consumed": 0, "deferred": 0,
+                                  "not_spawned": 0, "recovered": 0, "session_lost": 0})
+        self.assertIsNone(self.store.get_operation("OP-R")["result"])
+
+
+class EnvelopeRunner:
+    """A runner whose output carries a framed review envelope."""
+
+    def __init__(self, envelope: dict, outcome: str = "needs_repair") -> None:
+        body = json.dumps(envelope)
+        self.text = (f"{REVIEW_BEGIN}\n{body}\n{REVIEW_END}\n"
+                     f"ORCHESTRATOR_OUTCOME: {outcome}\n")
+
+    def run(self, owner: str, prompt: str, timeout: int, log_path: Path, **kwargs) -> RunResult:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(self.text, encoding="utf-8")
+        return RunResult(0, self.text, None, "raw", "raw")
+
+
+class ReceiptCallSiteTest(unittest.TestCase):
+    """The seal has to happen on the real path, not only when called directly.
+
+    Testing `_seal_pack_receipt` on its own says nothing about whether anything
+    invokes it. This drives one real dispatch and stops the loop at the tick,
+    because the post-commit driver that would end it is still step 7 work.
+    """
+
+    def test_a_real_run_seals_before_it_commits(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        controller = Controller(Path(tmp.name),
+                                runner=EnvelopeRunner(full_review_envelope(1)))
+        self.addCleanup(controller.close)
+        task_id = controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        controller._is_pack_v1 = lambda task: True
+        controller._pack_outcomes = lambda task, stage: sorted(
+            pack_allowed_outcomes("review"))
+        controller.pack_store.create_pack(task_id, target_id="acme", change="c1",
+                                          state="reviewing(1)")
+
+        order: list[str] = []
+        seal = controller._seal_pack_receipt
+        controller._seal_pack_receipt = lambda *a, **k: (order.append("seal"), seal(*a, **k))[1]
+        commit = controller._commit_pack_run
+
+        def commit_then_stop(*args, **kwargs):
+            order.append("commit")
+            outcome = commit(*args, **kwargs)
+            # The post-commit driver that would end this loop is still step 7
+            # work; without it a pack-v1 task returns to `queued` and the loop
+            # re-dispatches for ever, so the test stops it here.
+            controller.conn.execute(
+                "UPDATE tasks SET status='waiting_user',stop_reason='stopped_for_test'"
+                " WHERE id=?", (task_id,))
+            return outcome
+
+        controller._commit_pack_run = commit_then_stop
+
+        controller.run_until_stop(task_id)
+
+        self.assertEqual(order[:2], ["seal", "commit"],
+                         "the receipt must be sealed before the commit it survives")
+        receipts_dir = Path(controller.conn.execute(
+            "SELECT artifact_dir FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()["artifact_dir"]) / "pack-receipts"
+        self.assertTrue(sorted(receipts_dir.glob("*.json")),
+                        "a pack-v1 run sealed no receipt, so nothing is recoverable")
+        self.assertTrue(any(row["receipt_ref"] for row in controller.conn.execute(
+            "SELECT receipt_ref FROM pack_operations WHERE pack_id=?", (task_id,))),
+            "the receipt's hash was never made durable")

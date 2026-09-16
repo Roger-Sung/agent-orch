@@ -21,7 +21,7 @@ import hashlib
 import json
 from typing import Any, Callable, Sequence
 
-from . import budgets, revocation
+from . import budgets, revocation, sessions
 from .judge import Decision, judge_v1
 from .store import PackStore
 
@@ -92,10 +92,16 @@ class PackMachine:
         op = self.store.get_operation(op_id)
         if op["result"] is not None:
             return  # idempotent: the same call reported twice is one result.
-        self.store.update_operation(
-            op_id, result=result, result_ref=result_ref,
-            call_binding=call_binding, receipt_ref=receipt_ref,
-        )
+        fields: dict[str, Any] = {"result": result, "result_ref": result_ref}
+        # Only written when supplied.  Both are recorded *before* this call - the
+        # binding when the call is dispatched, the receipt reference when the
+        # provider's output is sealed - so writing None over them here would
+        # destroy the very records recovery reads (§5).
+        if call_binding is not None:
+            fields["call_binding"] = call_binding
+        if receipt_ref is not None:
+            fields["receipt_ref"] = receipt_ref
+        self.store.update_operation(op_id, **fields)
 
     def classify_consumption(self, pack_id: str, op_id: str) -> str:
         """Decide how a closed operation's result should be taken up (§3.0b)."""
@@ -400,7 +406,9 @@ class PackMachine:
         verification lives in `receipts.load`, and a receipt that fails any of
         its checks must arrive here as None, never as a receipt.
         """
-        counts = {"unknown": 0, "consumed": 0, "deferred": 0, "not_spawned": 0, "recovered": 0}
+        counts = {"unknown": 0, "consumed": 0, "deferred": 0, "not_spawned": 0,
+                  "recovered": 0, "session_lost": 0}
+        session_lost: list[dict[str, Any]] = []
         for op in self.store.running_operations(pack_id):
             if op["spawn_outcome"] and op["spawn_outcome"].startswith("launch_failed"):
                 # Positive evidence the launch never happened: refund is safe.
@@ -420,6 +428,12 @@ class PackMachine:
                 continue
             self.store.update_operation(op["op_id"], result="unknown")
             counts["unknown"] += 1
+            if self.store.pending_session_for(op["op_id"]) is not None:
+                # A review call that was dispatched and never answered is not
+                # just an unknown operation: the session it was speaking on is
+                # lost too, and a fresh session would route around the hold
+                # rather than resume the conversation (§5).
+                session_lost.append(op)
 
         for op in self.store.unconsumed_operations(pack_id):
             outcome = self.consume_result(pack_id, op["op_id"])
@@ -427,6 +441,17 @@ class PackMachine:
                 counts["consumed"] += 1
             elif outcome == DEFER:
                 counts["deferred"] += 1
+
+        if session_lost:
+            # Entered once, after every operation has been routed: holding part
+            # way through would hide whatever the rest of the scan found.
+            lost = session_lost[0]
+            counts["session_lost"] = len(session_lost)
+            self.enter_hold(
+                pack_id, "review_session_lost",
+                return_point=sessions.return_state(
+                    lost["stage"], lost["input_output_id"] or self.store.get_pack(pack_id)["k_last"]),
+            )
         return counts
 
     # ------------------------------------------------------------------

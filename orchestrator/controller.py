@@ -50,7 +50,11 @@ from .runner import (
 from .retained import inspect_retained
 from .execution import DEFAULT_POLICY, ExecutionConfigError, extract_plan, review_context
 from .execution_runner import ConfiguredRunner
+from .pack import receipts as pack_receipts
+from .pack.envelopes import parse_framing
+from .pack.errors import EnvelopeInvalid
 from .pack.policy import PackPolicy, allowed_outcomes as pack_allowed_outcomes
+from .pack.state_machine import PackMachine
 from .pack.store import PackStore
 from .review_contract import build_packet
 from . import review_session
@@ -155,8 +159,9 @@ class Controller:
                 # pack-v1 owns its own reconcile (STATE-TABLE §5): blanket-blocking
                 # the run and clearing the lease here would destroy the very
                 # evidence that decides whether a writer is still alive.
-                summary.setdefault("pack_reconcile_deferred", 0)
-                summary["pack_reconcile_deferred"] += 1
+                counts = self.reconcile_pack(task)
+                for key, value in counts.items():
+                    summary[f"pack_{key}"] = summary.get(f"pack_{key}", 0) + value
                 continue
             self._block_orphaned_running(task)
             summary["running_blocked"] += 1
@@ -282,6 +287,7 @@ class Controller:
             if task["status"] == "running":
                 if self._is_pack_v1(task):
                     # Same reason as the startup barrier: pack reconcile decides.
+                    self.reconcile_pack(task)
                     return self.status(task_id)
                 self._block_orphaned_running(task)
                 return self.status(task_id)
@@ -392,6 +398,8 @@ class Controller:
                                      reason=f"review_requires_astra_decision: {result.reason}")
                 if result.final_response is not None and reports_dir is not None:
                     self._atomic_write(reports_dir / "implement-review.md", result.final_response.encode())
+            if self._is_pack_v1(task):
+                self._seal_pack_receipt(task, run_token, result)
             self.commit_run(task_id, run_token, result, profile)
             if isinstance(stage_runner, ConfiguredRunner) and stage_runner.session_binding is not None:
                 sealed = self.conn.execute("SELECT manifest_path,manifest_hash FROM stage_runs WHERE run_token=?", (run_token,)).fetchone()
@@ -1442,7 +1450,9 @@ class Controller:
             result_ref=manifest_hash,
         )
         # Back to queued so the daemon ticks the pack machine; the pack's own
-        # state lives in pack_packs, not in the task row.
+        # state lives in pack_packs, not in the task row.  Consuming here
+        # instead would collapse sealing and consuming into one commit, which
+        # is exactly what §3.0b separates so that exactly-once survives a crash.
         self.conn.execute(
             "UPDATE tasks SET status='queued',stop_reason=NULL,updated_at=?,revision=revision+1"
             " WHERE id=?",
@@ -1478,6 +1488,117 @@ class Controller:
         except Exception:
             return DEFAULT_POLICY
         return (plan.policy_version if plan is not None else None) or DEFAULT_POLICY
+
+    # ------------------------------------------------------------------
+    # pack-v1 reconcile (STATE-TABLE §5) - IMPLEMENTATION-PLAN step 3
+    # ------------------------------------------------------------------
+
+    def _pack_receipt_path(self, task: sqlite3.Row, op_id: str) -> Path:
+        return Path(task["artifact_dir"]) / "pack-receipts" / f"{op_id}.json"
+
+    def _seal_pack_receipt(self, task: sqlite3.Row, run_token: str, result: RunResult) -> None:
+        """Write the call's receipt *before* the commit that would record it.
+
+        §5's recovery case is precisely the window between a provider finishing
+        and the controller committing. Sealing inside `commit_run` would put the
+        receipt on the far side of the crash it exists to survive.
+
+        A call whose output carries no parseable envelope seals nothing: there
+        is no verifiable result to recover, and unknown is the honest answer.
+        """
+        try:
+            envelope, outcome = parse_framing(result.output or "")
+        except EnvelopeInvalid:
+            return
+        try:
+            binding = self.pack_store.get_operation(run_token)["call_binding"] or {}
+        except KeyError:
+            # Same reason `_commit_pack_run` creates one: a run whose operation
+            # row is missing would otherwise lose its result entirely.
+            binding = {}
+        digest = pack_receipts.seal(
+            self._pack_receipt_path(task, run_token), op_id=run_token,
+            call_binding=binding, outcome=outcome, envelope=envelope,
+        )
+        # Its own transaction, committed before the run's: the expectation has
+        # to be durable *before* the commit it protects, or a crash in between
+        # leaves a receipt with nothing to verify it against.
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            try:
+                self.pack_store.get_operation(run_token)
+            except KeyError:
+                self.pack_store.create_operation(
+                    run_token, task["id"], type="provider", stage=str(task["current_stage"]))
+            self.pack_store.update_operation(run_token, receipt_ref=digest)
+            self.conn.execute("COMMIT")
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _pack_operation_alive(op: dict[str, Any]) -> bool:
+        """Whether the operation's original process group still has members.
+
+        Not stop evidence - E-1 stopped being about liveness (D-2026-09-16-01).
+        This only decides whether reconcile waits or looks for a receipt, so
+        every uncertain answer is "alive": waiting costs time, while a wrong
+        "dead" invites a second writer onto the same tree.
+        """
+        identity = op.get("process_identity") or {}
+        pgid = identity.get("pgid")
+        if not pgid:
+            return False
+        try:
+            os.killpg(int(pgid), 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    def _pack_sealed_receipt(self, task: sqlite3.Row,
+                             op: dict[str, Any]) -> dict[str, Any] | None:
+        """The operation's receipt, or None when it cannot be verified.
+
+        Two checks `receipts.load` supports are not available here and are not
+        faked: the call binding is only compared when one was recorded before
+        the spawn, which the pack dispatch site does not yet do, and envelope
+        legality needs the stage's expected header and observations, which this
+        layer does not hold. Both are wired where that context exists.
+        """
+        ref = op.get("receipt_ref")
+        if not ref:
+            return None
+        try:
+            receipt = pack_receipts.load(
+                self._pack_receipt_path(task, op["op_id"]),
+                expected_sha256=ref, op_id=op["op_id"],
+                expected_binding=op.get("call_binding"),
+            )
+        except pack_receipts.ReceiptInvalid:
+            return None
+        return {**receipt, "sha256": ref}
+
+    def reconcile_pack(self, task: sqlite3.Row) -> dict[str, int]:
+        """Run the pack's own §5 reconcile for a task interrupted while running.
+
+        The legacy orphan handler is bypassed for pack-v1 so that it cannot
+        destroy the evidence; until this ran, nothing replaced it and an
+        interrupted pack task simply stayed `running` for ever.
+        """
+        pack_id = task["id"]
+        try:
+            self.pack_store.get_pack(pack_id)
+        except KeyError:
+            return {"reconcile_no_pack": 1}
+        machine = PackMachine(self.pack_store)
+        return machine.startup_scan(
+            pack_id,
+            alive=self._pack_operation_alive,
+            sealed=lambda op: self._pack_sealed_receipt(task, op),
+        )
 
     def _is_pack_v1(self, task: sqlite3.Row) -> bool:
         return self._policy_version(task) == "pack-v1"
