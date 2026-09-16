@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from orchestrator.pack import budgets, revocation
+from orchestrator.pack import budgets, receipts, revocation
+from orchestrator.pack.envelopes import validate_review
 from orchestrator.pack.state_machine import (
     ALREADY_CONSUMED,
     CONSUME,
@@ -19,10 +20,13 @@ from orchestrator.pack.state_machine import (
 from orchestrator.tests.pack_stub import (
     BOOT_A,
     BudgetRefused,
+    ECHOED_HEADER,
+    FAILING_OBSERVATION,
     BOOT_B,
     CONTRACT_H1,
     StubPack,
     envelope,
+    full_review_envelope,
     high_finding,
 )
 
@@ -704,7 +708,8 @@ class FaultInjectionTest(unittest.TestCase):
     def test_crash_after_claim_leaves_a_dispatchable_pack(self) -> None:
         self.pack.claim()
         counts = self.pack.machine.startup_scan(self.pack.pack_id)
-        self.assertEqual(counts, {"unknown": 0, "consumed": 0, "deferred": 0, "not_spawned": 0})
+        self.assertEqual(counts, {"unknown": 0, "consumed": 0, "deferred": 0,
+                                  "not_spawned": 0, "recovered": 0})
         self.assertEqual(self.pack.state(), "claimed")
 
     # "provider 完成未 commit": a receipt exists, so recovery seals and consumes.
@@ -753,6 +758,7 @@ class CoverageMapTest(unittest.TestCase):
         "ST24g": "RemainingFixtureTest", "ST24k": "RemainingFixtureTest",
         "ST25b": "RemainingFixtureTest",
         "ST5": "BudgetGateTest", "ST25": "BudgetGateTest",
+        "ST14": "SealedReceiptRecoveryTest",
         "ST24h-1": "UnknownRecoveryTest", "ST24h-2": "UnknownRecoveryTest",
         "ST24h-2b": "UnknownRecoveryTest", "ST24h-2c": "UnknownRecoveryTest",
         "ST24h-2d": "UnknownRecoveryTest", "ST24h-3": "UnknownRecoveryTest",
@@ -767,7 +773,6 @@ class CoverageMapTest(unittest.TestCase):
     # Still open, with the step that owns them.  Listing them is the point:
     # an unlisted gap is indistinguishable from no gap.
     DEFERRED = {
-        "ST14": "step 7 - needs a real sealed receipt",
         "ST14b": "step 7 - needs a real provider session",
         "ST24e": "step 5 - restore_tree against a real blob store",
     }
@@ -958,3 +963,114 @@ class RevocationProbeTest(unittest.TestCase):
         holders = revocation.lsof_holders([busy])
         self.assertIsNotNone(holders)
         self.assertIn(f"p{os.getpid()}", holders)
+
+
+class SealedReceiptRecoveryTest(unittest.TestCase):
+    """ST14 - a crash in `reviewing(1)` that left a verifiable receipt behind.
+
+    The engine could already replay a receipt; what it could not do was check
+    one.  `recovery_commit` took the caller's word for it, so a truncated,
+    stale or foreign receipt would have been sealed as a genuine result - worse
+    than staying unknown, because unknown is at least visible.
+    """
+
+    def setUp(self) -> None:
+        self.pack = StubPack()
+        self.pack.contract_review(passes=True)
+        self.pack.claim()
+        produced = self.pack.produce()
+        self.k = self.pack.submit(produced)
+        self.pack.prerun(self.k)          # -> reviewing(1)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.receipts_dir = Path(tmp.name)
+
+        # The review call is dispatched and spawned, and then the controller
+        # dies before committing anything: the crash ST14 describes.
+        self.op = self.pack.next_op("review", stage="review")
+        self.pack.store.update_operation(
+            self.op, spawned=1, process_identity={"pid": 909, "pgid": 909, "start": 1})
+        self.binding = self.pack.binding(stage="review", review_round=None)
+        self.envelope = full_review_envelope(1)
+        self.path = self.receipts_dir / f"{self.op}.json"
+        self.sha = receipts.seal(self.path, op_id=self.op, call_binding=self.binding,
+                                 outcome="needs_repair", envelope=self.envelope)
+
+    def _validate(self, envelope, outcome):
+        validate_review(
+            envelope, outcome,
+            expected_header={k: envelope[k] for k in ECHOED_HEADER},
+            active_obligations=["O1"], bundle_observations=FAILING_OBSERVATION)
+
+    def _sealed(self, *, sha: str | None = None, op_id: str | None = None):
+        """What reconcile hands the machine: a verified receipt, or None."""
+        def probe(op):
+            try:
+                receipt = receipts.load(
+                    self.path, expected_sha256=sha or self.sha,
+                    op_id=op_id or op["op_id"], expected_binding=self.binding,
+                    validate=self._validate)
+            except receipts.ReceiptInvalid as exc:
+                self.refusal = exc.code
+                return None
+            return {**receipt, "sha256": sha or self.sha}
+        return probe
+
+    def test_st14_verified_receipt_recovers_to_repair_pending(self) -> None:
+        counts = self.pack.machine.startup_scan(
+            self.pack.pack_id, alive=lambda o: False, sealed=self._sealed())
+        self.assertEqual(counts["recovered"], 1)
+        self.assertEqual(counts["unknown"], 0)
+        self.assertEqual(counts["consumed"], 1, "a recovered result must also be consumed")
+
+        operation = self.pack.store.get_operation(self.op)
+        self.assertEqual(operation["result"], "completed")
+        self.assertEqual(operation["receipt_ref"], self.sha)
+
+        # history == empty: the pack's first sealed review has nothing to
+        # compare against, which is judge step 3.
+        self.pack.store.update_pack(self.pack.pack_id, state=f"judging({self.k})")
+        target = self.pack.machine.judge_round(
+            self.pack.pack_id, self.envelope, history=[])
+        self.assertEqual(self.pack.pack()["decision"]["reason"], "first sealed final_review")
+        self.assertEqual(target, f"repair_pending({self.k})")
+
+    def test_a_rewritten_receipt_leaves_the_operation_unknown(self) -> None:
+        self.path.write_bytes(self.path.read_bytes().replace(b"needs_repair", b"accepted"))
+        counts = self.pack.machine.startup_scan(
+            self.pack.pack_id, alive=lambda o: False, sealed=self._sealed())
+        self.assertEqual(counts["unknown"], 1)
+        self.assertEqual(counts["recovered"], 0)
+        self.assertEqual(self.refusal, receipts.HASH_MISMATCH)
+
+    def test_a_receipt_for_another_operation_is_refused(self) -> None:
+        counts = self.pack.machine.startup_scan(
+            self.pack.pack_id, alive=lambda o: False, sealed=self._sealed(op_id="OP-999"))
+        self.assertEqual(counts["unknown"], 1)
+        self.assertEqual(self.refusal, receipts.FOREIGN_OPERATION)
+
+    def test_a_receipt_bound_to_a_different_call_is_refused(self) -> None:
+        other = self.pack.binding(stage="review", review_round=7)
+        self.sha = receipts.seal(self.path, op_id=self.op, call_binding=other,
+                                 outcome="needs_repair", envelope=self.envelope)
+        counts = self.pack.machine.startup_scan(
+            self.pack.pack_id, alive=lambda o: False, sealed=self._sealed())
+        self.assertEqual(counts["unknown"], 1)
+        self.assertEqual(self.refusal, receipts.BINDING_MISMATCH)
+
+    def test_an_illegal_envelope_is_refused(self) -> None:
+        broken = dict(self.envelope)
+        broken["findings"] = [dict(broken["findings"][0], severity="Critical")]
+        self.sha = receipts.seal(self.path, op_id=self.op, call_binding=self.binding,
+                                 outcome="needs_repair", envelope=broken)
+        counts = self.pack.machine.startup_scan(
+            self.pack.pack_id, alive=lambda o: False, sealed=self._sealed())
+        self.assertEqual(counts["unknown"], 1)
+        self.assertEqual(self.refusal, receipts.ENVELOPE_ILLEGAL)
+
+    def test_no_receipt_at_all_stays_unknown(self) -> None:
+        self.path.unlink()
+        counts = self.pack.machine.startup_scan(
+            self.pack.pack_id, alive=lambda o: False, sealed=self._sealed())
+        self.assertEqual(counts["unknown"], 1)
+        self.assertEqual(self.refusal, receipts.UNREADABLE)

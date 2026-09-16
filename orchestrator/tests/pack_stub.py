@@ -185,3 +185,47 @@ def high_finding(fid: str, lineage: str, obligation: str) -> dict[str, Any]:
         "prior_refs": [],
         "recurrence_of": None,
     }
+
+
+REVIEW_HEADER = {
+    "envelope": "pack-review", "policy_version": "pack-v1", "kind": "final_review",
+    "target_id": "acme", "change": "c1", "pack": "P2", "contract_version": 1,
+    "role": "reviewer", "candidate_fingerprint": "sha256:" + "a" * 64,
+    "contract_hash": CONTRACT_H1, "bundle_hash": "sha256:" + "c" * 64,
+    "plan_fingerprint": "0123456789ab",
+    "requirement_fingerprint": "sha256:" + "d" * 64, "ext": {},
+}
+
+ECHOED_HEADER = ("target_id", "change", "pack", "candidate_fingerprint", "contract_hash",
+                 "bundle_hash", "plan_fingerprint", "requirement_fingerprint")
+
+FAILING_OBSERVATION = {
+    "OBS-1": {"kind": "verify", "usable": True,
+              "projection": {"result_kind": "test", "status": "FAIL",
+                             "subject": {"kind": "obligation", "id": "O1"}}},
+}
+
+
+def full_review_envelope(round_no: int = 1) -> dict[str, Any]:
+    """A review envelope that passes `validate_review`, not a reduced stand-in.
+
+    ST14 requires the sealed receipt's envelope to be *legal*; validating a
+    cut-down dict would check the half that was never in doubt.
+    """
+    envelope = dict(REVIEW_HEADER)
+    envelope.update({
+        "review_round": round_no,
+        "verdict": "needs_repair",
+        "blocked_reason": None,
+        "obligations": {"O1": {"status": "FAIL", "basis": ["OBS-1"], "note": None}},
+        "findings": [{
+            "id": f"F{round_no}-1", "severity": "High", "blocking": True,
+            "obligation_refs": ["O1"], "lineage_ids": ["L-1"], "prior_refs": [],
+            "recurrence_of": None, "title": "transfer is not idempotent",
+            "evidence": "the second call inserts a second row",
+            "locators": ["src/A.java:41"], "observations": ["OBS-1"],
+            "requested_change": "guard on the unique key",
+        }],
+        "contract_findings": [], "improvements": [], "prior_round": None, "remaining": [],
+    })
+    return envelope

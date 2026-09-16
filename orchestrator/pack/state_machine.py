@@ -389,9 +389,18 @@ class PackMachine:
             return f"stopped:{kind}"
         return f"allowed:{action}"
 
-    def startup_scan(self, pack_id: str, *, alive: Callable[[dict[str, Any]], bool] | None = None) -> dict[str, int]:
-        """Route every operation left over by a crash (§3.0b startup scan)."""
-        counts = {"unknown": 0, "consumed": 0, "deferred": 0, "not_spawned": 0}
+    def startup_scan(self, pack_id: str, *, alive: Callable[[dict[str, Any]], bool] | None = None,
+                     sealed: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+                     ) -> dict[str, int]:
+        """Route every operation left over by a crash (§3.0b startup scan).
+
+        A dead operation is only unknown when nothing verifiable was left behind:
+        §5 says to look for a sealed receipt first, and replay its `E_*` when one
+        verifies.  `sealed` returns the *already verified* receipt or None - the
+        verification lives in `receipts.load`, and a receipt that fails any of
+        its checks must arrive here as None, never as a receipt.
+        """
+        counts = {"unknown": 0, "consumed": 0, "deferred": 0, "not_spawned": 0, "recovered": 0}
         for op in self.store.running_operations(pack_id):
             if op["spawn_outcome"] and op["spawn_outcome"].startswith("launch_failed"):
                 # Positive evidence the launch never happened: refund is safe.
@@ -399,6 +408,15 @@ class PackMachine:
                 counts["not_spawned"] += 1
                 continue
             if alive is not None and alive(op):
+                continue
+            receipt = sealed(op) if sealed is not None else None
+            if receipt is not None:
+                self.commit_call_result(
+                    op["op_id"], result="completed",
+                    receipt_ref=receipt["sha256"],
+                    call_binding=receipt["call_binding"],
+                )
+                counts["recovered"] += 1
                 continue
             self.store.update_operation(op["op_id"], result="unknown")
             counts["unknown"] += 1
