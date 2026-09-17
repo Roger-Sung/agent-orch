@@ -519,6 +519,58 @@ class PackMachine:
                               pack_id=pack_id)
         return None
 
+    def rebind_review_session(self, pack_id: str, *, role: str, attempt_id: str | None,
+                              lost_op_id: str, stage: str, record_id: str,
+                              checkpoint_ref: str | None = None,
+                              budget_policy: dict[str, Any] | None = None,
+                              ) -> dict[str, Any]:
+        """`A_rebind_session` - the only authorised exit from review_session_lost.
+
+        The successor keeps the superseded row's binding as its `predecessor`,
+        and the lost call's pending row is left standing: it is the record that
+        a call was dispatched and never answered, so clearing it would erase the
+        reason this hold exists (§5).
+
+        Returns what the caller has to act on - whether to redispatch, and the
+        hold it fell into if the reviewer allowance was already gone.
+        """
+        pack = self.store.get_pack(pack_id)
+        if not pack["state"].startswith("hold(review_session_lost"):
+            raise PackStateError(
+                f"A_rebind_session is not available from {pack['state']!r}")
+
+        lost = self.store.get_operation(lost_op_id)
+        sealed = lost["result"] if lost["result"] in {"completed", "failed"} else None
+        outcome = sessions.rebind_session(self.store, pack_id, role, attempt_id,
+                                          sealed_result=sealed)
+        if checkpoint_ref is not None:
+            self.store.update_session(pack_id, role, attempt_id, outcome["seq"],
+                                      checkpoint_ref=checkpoint_ref)
+
+        if outcome["charge_retry"]:
+            refused = self.use_reviewer_retry(
+                pack_id, stage=stage, output_id=pack["k_last"], cause="reviewer_failed",
+                record_id=record_id, budget_policy=budget_policy)
+            if refused is not None:
+                # The allowance is gone, so there is no redispatch to authorise;
+                # the pack moves from one hold to the one that says why.
+                self.store.update_pack(pack_id, state=f"hold({refused})",
+                                       hold_reason=refused)
+                return {**outcome, "rerun": False, "held": refused}
+
+        state = self.exit_hold(pack_id, alive=lambda op: False)
+        return {**outcome, "held": None, "state": state}
+
+    def settle_rebound_call(self, pack_id: str, *, lost_op_id: str, new_op_id: str,
+                            result: str) -> None:
+        """Record what the redispatched call B did to the unknown call A.
+
+        Only a completed B supersedes A.  A failed B leaves A unknown, because
+        nothing about B's failure says what A did to the tree (§5).
+        """
+        if result == "completed":
+            self.store.update_operation(lost_op_id, superseded_by=new_op_id)
+
     # ------------------------------------------------------------------
     # dispatch gate (§3.3a)
     # ------------------------------------------------------------------

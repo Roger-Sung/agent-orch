@@ -758,7 +758,7 @@ class CoverageMapTest(unittest.TestCase):
         "ST24g": "RemainingFixtureTest", "ST24k": "RemainingFixtureTest",
         "ST25b": "RemainingFixtureTest",
         "ST5": "BudgetGateTest", "ST25": "BudgetGateTest",
-        "ST14": "SealedReceiptRecoveryTest",
+        "ST14": "SealedReceiptRecoveryTest", "ST14b": "ReviewSessionLostTest",
         "ST24h-1": "UnknownRecoveryTest", "ST24h-2": "UnknownRecoveryTest",
         "ST24h-2b": "UnknownRecoveryTest", "ST24h-2c": "UnknownRecoveryTest",
         "ST24h-2d": "UnknownRecoveryTest", "ST24h-3": "UnknownRecoveryTest",
@@ -773,7 +773,6 @@ class CoverageMapTest(unittest.TestCase):
     # Still open, with the step that owns them.  Listing them is the point:
     # an unlisted gap is indistinguishable from no gap.
     DEFERRED = {
-        "ST14b": "step 7 - needs a real provider session",
         "ST24e": "step 5 - restore_tree against a real blob store",
     }
 
@@ -1111,6 +1110,80 @@ class ReviewSessionLostTest(unittest.TestCase):
         self.assertEqual(counts["unknown"], 1)
         self.assertEqual(counts["session_lost"], 0)
         self.assertNotEqual(self.pack.state(), "hold(review_session_lost)")
+
+    def _lose_the_session(self) -> None:
+        self._open_session()
+        self.pack.machine.startup_scan(self.pack.pack_id, alive=lambda o: False)
+
+    # ST14b: the authorised exit rebinds and redispatches, charging one retry.
+    def test_st14b_rebind_redispatches_and_charges_one_retry(self) -> None:
+        self._lose_the_session()
+        before = self.pack.store.latest_session(self.pack.pack_id, "reviewer", None)
+
+        outcome = self.pack.machine.rebind_review_session(
+            self.pack.pack_id, role="reviewer", attempt_id=None, lost_op_id=self.op,
+            stage="review", record_id="RT-1", checkpoint_ref="CKPT-1")
+
+        self.assertTrue(outcome["rerun"])
+        self.assertIsNone(outcome["held"])
+        self.assertEqual(
+            self.pack.machine.reviewer_retry_used(self.pack.pack_id, stage="review",
+                                                  output_id=self.k),
+            1)
+        rows = self.pack.store.session_rows(self.pack.pack_id, "reviewer", None)
+        self.assertEqual(rows[-2]["state"], "superseded")
+        # The successor carries the superseded binding forward rather than
+        # starting from nothing, which is what "predecessor 保留" means.
+        self.assertEqual(rows[-1]["predecessor"], before.get("provider_binding"))
+        self.assertEqual(rows[-1]["state"], "new")
+        self.assertEqual(rows[-1]["checkpoint_ref"], "CKPT-1")
+        self.assertNotEqual(self.pack.state(), "hold(review_session_lost)")
+
+    def test_st14b_a_completed_redispatch_supersedes_the_unknown_call(self) -> None:
+        self._lose_the_session()
+        self.pack.machine.rebind_review_session(
+            self.pack.pack_id, role="reviewer", attempt_id=None, lost_op_id=self.op,
+            stage="review", record_id="RT-1")
+        new_op = self.pack.next_op("review", stage="review")
+        self.pack.machine.settle_rebound_call(
+            self.pack.pack_id, lost_op_id=self.op, new_op_id=new_op, result="completed")
+        self.assertEqual(self.pack.store.get_operation(self.op)["superseded_by"], new_op)
+
+    def test_st14b_a_failed_redispatch_leaves_the_unknown_call_unknown(self) -> None:
+        self._lose_the_session()
+        self.pack.machine.rebind_review_session(
+            self.pack.pack_id, role="reviewer", attempt_id=None, lost_op_id=self.op,
+            stage="review", record_id="RT-1")
+        new_op = self.pack.next_op("review", stage="review")
+        self.pack.machine.settle_rebound_call(
+            self.pack.pack_id, lost_op_id=self.op, new_op_id=new_op, result="failed")
+        lost = self.pack.store.get_operation(self.op)
+        self.assertIsNone(lost["superseded_by"])
+        self.assertEqual(lost["result"], "unknown")
+
+    def test_st14b_an_exhausted_allowance_holds_on_reviewer_failed(self) -> None:
+        self._lose_the_session()
+        for i in range(budgets.DEFAULTS["reviewer_retry"]):
+            self.pack.machine.use_reviewer_retry(
+                self.pack.pack_id, stage="review", output_id=self.k,
+                cause="reviewer_failed", record_id=f"RT-pre-{i}")
+
+        outcome = self.pack.machine.rebind_review_session(
+            self.pack.pack_id, role="reviewer", attempt_id=None, lost_op_id=self.op,
+            stage="review", record_id="RT-1")
+
+        self.assertFalse(outcome["rerun"], "a redispatch with no allowance left")
+        self.assertEqual(outcome["held"], "reviewer_failed")
+        self.assertEqual(self.pack.state(), "hold(reviewer_failed)")
+
+    def test_rebind_is_refused_outside_the_hold(self) -> None:
+        from orchestrator.pack.state_machine import PackStateError
+
+        self._open_session()   # no scan, so the pack is not held
+        with self.assertRaises(PackStateError):
+            self.pack.machine.rebind_review_session(
+                self.pack.pack_id, role="reviewer", attempt_id=None, lost_op_id=self.op,
+                stage="review", record_id="RT-1")
 
     def test_the_pending_row_is_not_silently_cleared(self) -> None:
         """§5: the pending row is the record that a call was never answered."""
