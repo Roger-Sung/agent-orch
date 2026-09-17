@@ -334,6 +334,18 @@ class PackStore:
             (*encoded.values(), op_id),
         )
 
+    def operations(self, pack_id: str, *, stage: str | None = None) -> list[dict[str, Any]]:
+        """Every operation of this pack in creation order."""
+        if stage is None:
+            rows = self.conn.execute(
+                "SELECT op_id FROM pack_operations WHERE pack_id=? ORDER BY created_at, rowid",
+                (pack_id,)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT op_id FROM pack_operations WHERE pack_id=? AND stage=?"
+                " ORDER BY created_at, rowid", (pack_id, stage)).fetchall()
+        return [self.get_operation(row["op_id"]) for row in rows]
+
     def running_operations(self, pack_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT op_id FROM pack_operations WHERE pack_id=? AND result IS NULL", (pack_id,)

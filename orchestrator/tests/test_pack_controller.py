@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 from orchestrator.controller import Controller, ControllerError
+from orchestrator.pack import budgets
 from orchestrator.pack.envelopes import REVIEW_BEGIN, REVIEW_END
 from orchestrator.pack.policy import allowed_outcomes as pack_allowed_outcomes
 from orchestrator.pack.store import PackStore
@@ -460,19 +461,8 @@ class ReceiptCallSiteTest(unittest.TestCase):
         seal = controller._seal_pack_receipt
         controller._seal_pack_receipt = lambda *a, **k: (order.append("seal"), seal(*a, **k))[1]
         commit = controller._commit_pack_run
-
-        def commit_then_stop(*args, **kwargs):
-            order.append("commit")
-            outcome = commit(*args, **kwargs)
-            # The post-commit driver that would end this loop is still step 7
-            # work; without it a pack-v1 task returns to `queued` and the loop
-            # re-dispatches for ever, so the test stops it here.
-            controller.conn.execute(
-                "UPDATE tasks SET status='waiting_user',stop_reason='stopped_for_test'"
-                " WHERE id=?", (task_id,))
-            return outcome
-
-        controller._commit_pack_run = commit_then_stop
+        controller._commit_pack_run = lambda *a, **k: (order.append("commit"),
+                                                       commit(*a, **k))[1]
 
         controller.run_until_stop(task_id)
 
@@ -486,3 +476,37 @@ class ReceiptCallSiteTest(unittest.TestCase):
         self.assertTrue(any(row["receipt_ref"] for row in controller.conn.execute(
             "SELECT receipt_ref FROM pack_operations WHERE pack_id=?", (task_id,))),
             "the receipt's hash was never made durable")
+
+
+class PackRunLoopTerminatesTest(unittest.TestCase):
+    """A pack-v1 task must stop for a stated reason rather than loop.
+
+    `_commit_pack_run` puts the task back to `queued` for the pack machine to
+    advance. Until something advanced it the loop re-dispatched the same stage
+    for ever, and with the legacy caps bypassed there was no limit to stop it
+    either - so this asserts both that the loop ends and why.
+    """
+
+    def test_the_loop_ends_when_the_call_budget_runs_out(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        controller = Controller(Path(tmp.name),
+                                runner=EnvelopeRunner(full_review_envelope(1)))
+        self.addCleanup(controller.close)
+        task_id = controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        controller._is_pack_v1 = lambda task: True
+        controller._pack_outcomes = lambda task, stage: sorted(
+            pack_allowed_outcomes("review"))
+        controller.pack_store.create_pack(task_id, target_id="acme", change="c1",
+                                          state="reviewing(1)")
+
+        controller.run_until_stop(task_id)
+
+        row = controller.conn.execute(
+            "SELECT status, stop_reason FROM tasks WHERE id=?", (task_id,)).fetchone()
+        self.assertEqual(row["status"], "waiting_user")
+        self.assertEqual(row["stop_reason"], "budget_exhausted(call)")
+        # Every reserved call is accounted for; the cap is what stopped it.
+        pack = controller.pack_store.get_pack(task_id)
+        self.assertEqual(pack["calls_reserved"], budgets.DEFAULTS["call_budget"])
+        self.assertEqual(pack["state"], "hold(budget_exhausted(call))")

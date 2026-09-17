@@ -54,7 +54,7 @@ from .pack import receipts as pack_receipts
 from .pack.envelopes import parse_framing
 from .pack.errors import EnvelopeInvalid
 from .pack.policy import PackPolicy, allowed_outcomes as pack_allowed_outcomes
-from .pack.state_machine import PackMachine
+from .pack.state_machine import CONSUME as PACK_CONSUME, PackMachine
 from .pack.store import PackStore
 from .review_contract import build_packet
 from . import review_session
@@ -307,6 +307,18 @@ class Controller:
             if claim is None:
                 return self.status(task_id)
             run_token, stage, profile, log_path = claim
+            if self._is_pack_v1(task):
+                refused = self._open_pack_operation(task, run_token, stage)
+                if refused is not None:
+                    self._stop_claimed_run(
+                        task_id, run_token, profile, stage, log_path, refused,
+                        f"pack-v1 budget refused the dispatch: {refused}",
+                    )
+                    # The stop travels the ordinary commit path, which for
+                    # pack-v1 returns the task to `queued`; the pack is held, so
+                    # the status has to be derived from it rather than left there.
+                    self._advance_pack(task)
+                    return self.status(task_id)
             self._emit_event(
                 "stage_started",
                 {
@@ -401,6 +413,11 @@ class Controller:
             if self._is_pack_v1(task):
                 self._seal_pack_receipt(task, run_token, result)
             self.commit_run(task_id, run_token, result, profile)
+            if self._is_pack_v1(task):
+                # After the commit, never inside it: §3.0b keeps sealing and
+                # consuming in separate transactions so exactly-once survives a
+                # crash between them.
+                self._advance_pack(task)
             if isinstance(stage_runner, ConfiguredRunner) and stage_runner.session_binding is not None:
                 sealed = self.conn.execute("SELECT manifest_path,manifest_hash FROM stage_runs WHERE run_token=?", (run_token,)).fetchone()
                 try:
@@ -1457,6 +1474,116 @@ class Controller:
             "UPDATE tasks SET status='queued',stop_reason=NULL,updated_at=?,revision=revision+1"
             " WHERE id=?",
             (now, task["id"]),
+        )
+
+    def _open_pack_operation(self, task: sqlite3.Row, run_token: str,
+                             stage: Any) -> str | None:
+        """Reserve the call's budget and record its operation, before the spawn.
+
+        Two reasons this cannot wait until after the provider starts. §3.4's
+        gate is the *only* thing that refuses a pack-v1 dispatch, the legacy
+        caps having been bypassed, so a reservation made afterwards refuses
+        nothing. And reconcile can only find an operation that exists: a crash
+        in the spawn window would otherwise leave a running provider with no
+        record at all.
+
+        Returns the hold reason when the dispatch is refused, else None.
+        """
+        pack_id = task["id"]
+        try:
+            self.pack_store.get_pack(pack_id)
+        except KeyError:
+            return None  # a pack-v1 task whose pack row intake has not created
+        machine = PackMachine(self.pack_store)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Caps come from the contract's `budget_policy`; until intake loads
+            # one, §3.4's own defaults apply rather than no limit at all.
+            refused = machine.reserve_dispatch(pack_id, budget_policy=None)
+            if refused is None:
+                self.pack_store.create_operation(
+                    run_token, pack_id, type="provider", stage=stage.name,
+                    reserved_counters={"call_budget": 1},
+                )
+            self.conn.execute("COMMIT")
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+        if refused is not None:
+            machine.enter_hold(pack_id, refused, alive=lambda op: False)
+        return refused
+
+    def _pack_review_history(self, task: sqlite3.Row, pack_id: str,
+                             exclude_op_id: str) -> list[dict[str, Any]]:
+        """Prior rounds' envelopes, read back out of their sealed receipts.
+
+        The history is not stored separately on purpose: rebuilding it from the
+        receipts means the judge folds exactly what was sealed, rather than a
+        second copy that could drift from it.
+        """
+        history: list[dict[str, Any]] = []
+        for op in self.pack_store.operations(pack_id, stage="review"):
+            if op["op_id"] == exclude_op_id or op["result"] != "completed":
+                continue
+            receipt = self._pack_sealed_receipt(task, op)
+            if receipt is not None:
+                history.append(receipt["envelope"])
+        return history
+
+    def _advance_pack(self, task: sqlite3.Row) -> None:
+        """Consume what the call sealed, then set the task status from the pack.
+
+        Without this the task went back to `queued` after every call and the run
+        loop re-dispatched the same stage for ever - the pack machine holds the
+        state that decides whether there is anything left to dispatch.
+        """
+        pack_id = task["id"]
+        try:
+            self.pack_store.get_pack(pack_id)
+        except KeyError:
+            return
+        machine = PackMachine(self.pack_store)
+        for op in list(self.pack_store.unconsumed_operations(pack_id)):
+            machine.consume_result(
+                pack_id, op["op_id"],
+                apply_fn=lambda outcome, consumed, _task=task: self._apply_pack_stage(
+                    _task, pack_id, machine, outcome, consumed),
+            )
+        state = self.pack_store.get_pack(pack_id)["state"]
+        if state == "accepted":
+            status, reason = "done", None
+        elif state.startswith("hold("):
+            status, reason = "waiting_user", state[len("hold("):-1]
+        else:
+            status, reason = "queued", None
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "UPDATE tasks SET status=?,stop_reason=?,updated_at=?,revision=revision+1"
+                " WHERE id=?", (status, reason, _now(), pack_id))
+            self.conn.execute("COMMIT")
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+
+    def _apply_pack_stage(self, task: sqlite3.Row, pack_id: str, machine: PackMachine,
+                          outcome: str, op: dict[str, Any]) -> None:
+        """The one stage effect the machine cannot infer: judging a review.
+
+        The envelope comes from the sealed receipt rather than from provider
+        output parsed a second time, so what is judged is exactly what was
+        sealed and verified.
+        """
+        if outcome != PACK_CONSUME or op.get("stage") != "review":
+            return
+        receipt = self._pack_sealed_receipt(task, op)
+        if receipt is None:
+            return
+        machine.judge_round(
+            pack_id, receipt["envelope"],
+            history=self._pack_review_history(task, pack_id, op["op_id"]),
         )
 
     def _pack_outcomes(self, task: sqlite3.Row, stage: Any) -> list[str] | None:
