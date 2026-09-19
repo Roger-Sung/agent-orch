@@ -65,6 +65,46 @@ def build_parser() -> argparse.ArgumentParser:
     pack_list = subparsers.add_parser("pack-list", help="list pack-v1 packs and their states")
     pack_list.add_argument("--json", action="store_true")
 
+    # Operator exits from a hold (STATE-TABLE §6 `A_*`).  Every hold in the
+    # table names one; without a way to perform them a pack that enters a hold
+    # never leaves it, which is as stuck as a pack that never stops.
+    pack_resolve = subparsers.add_parser(
+        "pack-resolve", help="A_resolve_operation: act on an operation whose result is unknown")
+    pack_resolve.add_argument("pack_id")
+    pack_resolve.add_argument("op_id")
+    pack_resolve.add_argument(
+        "action", choices=["verify_stopped", "restore_input", "restore_output", "recovery_run"])
+
+    pack_revoke_writes = subparsers.add_parser(
+        "pack-revoke-writes",
+        help="E-1: rename an operation's write roots aside and confirm nothing holds them")
+    pack_revoke_writes.add_argument("pack_id")
+    pack_revoke_writes.add_argument("op_id")
+    pack_revoke_writes.add_argument(
+        "--root", type=Path, action="append", required=True, dest="roots",
+        help="a write root to revoke; repeat for each. Named explicitly because"
+             " revoking the wrong tree is not recoverable.")
+
+    pack_rebind = subparsers.add_parser(
+        "pack-rebind", help="A_rebind_session: the exit from hold(review_session_lost)")
+    pack_rebind.add_argument("pack_id")
+    pack_rebind.add_argument("op_id", help="the review operation whose session was lost")
+
+    pack_raise_cap = subparsers.add_parser(
+        "pack-raise-cap", help="A_raise_cap: add to one §3.4 counter's limit")
+    pack_raise_cap.add_argument("pack_id")
+    pack_raise_cap.add_argument("kind")
+    pack_raise_cap.add_argument("extra", type=int)
+
+    pack_allow_apply = subparsers.add_parser(
+        "pack-allow-apply", help="A_allow_apply: authorise the apply and re-check the blockers")
+    pack_allow_apply.add_argument("pack_id")
+
+    pack_revoke_acceptance = subparsers.add_parser(
+        "pack-revoke-acceptance", help="A_revoke_acceptance: withdraw an acceptance")
+    pack_revoke_acceptance.add_argument("pack_id")
+    pack_revoke_acceptance.add_argument("--reason", default="approval_revoked")
+
     start = subparsers.add_parser("start", help="intake, preflight, and route a stateful lifecycle task")
     start.add_argument("description")
     start.add_argument("--task-type", choices=["propose", "apply", "review", "provider-smoke"])
@@ -277,6 +317,34 @@ def main(argv: list[str] | None = None) -> int:
             "A daemon configured with a different ORCH_HOME will never see this state.",
             file=sys.stderr,
         )
+
+    OPERATOR_ACTIONS = {
+        "pack-resolve", "pack-revoke-writes", "pack-rebind", "pack-raise-cap",
+        "pack-allow-apply", "pack-revoke-acceptance",
+    }
+    if args.command in OPERATOR_ACTIONS:
+        from .db import connect
+        from .pack import budgets as pack_budgets, revocation
+        from .pack.errors import PackError
+        from .pack.policy import PackPolicy
+        from .pack.state_machine import PackMachine, PackStateError
+        from .pack.store import PackStore
+
+        conn = connect(home / "orch.db")
+        try:
+            store = PackStore(conn, create=False)
+            machine = PackMachine(store)
+            try:
+                outcome = _run_operator_action(args, store, machine, PackPolicy,
+                                               revocation)
+            except (PackError, PackStateError, pack_budgets.BudgetError, KeyError) as exc:
+                print(f"{args.command} refused: {exc}", file=sys.stderr)
+                return 2
+            conn.commit()
+        finally:
+            conn.close()
+        print(outcome)
+        return 0
 
     if args.command in {"pack-status", "pack-list"}:
         from .db import connect
@@ -573,3 +641,74 @@ def _default_wait_timeout() -> float:
         return float(raw)
     except ValueError as exc:
         raise ValueError(f"invalid ORCH_WAIT_TIMEOUT: {raw!r}") from exc
+
+
+def _run_operator_action(args, store, machine, PackPolicy, revocation) -> str:
+    """One `A_*` action, reported in the operator's own vocabulary.
+
+    Each returns what actually happened rather than "ok": these are the exits
+    from a hold, and an operator who cannot see whether the pack moved has no
+    way to tell a performed action from a refused one.
+    """
+    import uuid as _uuid
+
+    pack_id = args.pack_id
+    if args.command == "pack-raise-cap":
+        machine.raise_cap(pack_id, args.kind, args.extra,
+                          record_id=f"CAP-{_uuid.uuid4()}")
+        caps = machine.budget_caps(pack_id)
+        return f"{pack_id}: cap raised; effective caps now {caps}"
+
+    if args.command == "pack-revoke-acceptance":
+        generation = PackPolicy(store).invalidate_acceptance(pack_id, reason=args.reason)
+        return (f"{pack_id}: acceptance revoked (generation {generation});"
+                f" state {store.get_pack(pack_id)['state']}")
+
+    if args.command == "pack-revoke-writes":
+        op = store.get_operation(args.op_id)
+        quarantine = Path(f"{args.roots[0]}.revoked-{op['op_id']}")
+        result = machine.revoke_write_capability(
+            args.op_id, roots=args.roots, quarantine=quarantine,
+            record_id=f"EV-{_uuid.uuid4()}")
+        if result["ok"]:
+            moved = ", ".join(entry["moved_to"] for entry in result["moved"])
+            return f"{args.op_id}: write capability revoked; roots moved to {moved}"
+        return (f"{args.op_id}: not revoked ({result['reason']});"
+                f" the operation stays unknown")
+
+    if args.command == "pack-resolve":
+        op = store.get_operation(args.op_id)
+        pack = store.get_pack(pack_id)
+        outcome = machine.resolve_operation(
+            pack_id, args.op_id, args.action,
+            current_boot_id=revocation.boot_session_uuid(),
+            op_boot_id=pack["host_boot_id"])
+        return f"{args.op_id}: {outcome}"
+
+    if args.command == "pack-rebind":
+        op = store.get_operation(args.op_id)
+        outcome = machine.rebind_review_session(
+            pack_id, role="reviewer", attempt_id=op["attempt_id"],
+            lost_op_id=args.op_id, stage=op["stage"] or "review",
+            record_id=f"RT-{_uuid.uuid4()}")
+        if outcome["held"]:
+            return f"{pack_id}: not redispatched; held on {outcome['held']}"
+        return (f"{pack_id}: session rebound, redispatch authorised;"
+                f" state {store.get_pack(pack_id)['state']}")
+
+    if args.command == "pack-allow-apply":
+        pack = store.get_pack(pack_id)
+
+        def recheck() -> str | None:
+            # Approving says one thing only. Any other blocker that was
+            # recorded stays until whatever owns it clears it - claiming
+            # otherwise would let a grant wave through an unrelated failure.
+            remaining = [b["reason"] for b in pack["blockers"]
+                         if b.get("reason") not in {"approval_revoked", "approval_missing"}]
+            return remaining[0] if remaining else None
+
+        state = machine.allow_apply(pack_id, record_id=f"GRANT-{_uuid.uuid4()}",
+                                    recheck=recheck)
+        return f"{pack_id}: apply authorised; state {state}"
+
+    raise AssertionError(f"unhandled operator action {args.command!r}")
