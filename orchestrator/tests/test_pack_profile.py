@@ -1,0 +1,50 @@
+"""The pack-v1 profile has to agree with the machine that drives it.
+
+Two couplings break silently. `_advance_pack` sets the task's `current_stage`
+from the pack state, so a state whose stage the profile does not define makes
+the run loop raise instead of dispatching. And pack-v1 refuses any outcome
+outside its stage's allowed set, so a stage declaring one the policy does not
+know is a dispatch that can only ever be blocked.
+"""
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+from orchestrator.pack.policy import PackPolicy, allowed_outcomes
+from orchestrator.profile import load_profile
+
+PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "pack_v1.yaml"
+
+PACK_STATES = ("contracting", "claimed", "producing(1)", "submitted(1)",
+               "reviewing(1)", "judging(1)", "repair_pending(1)")
+
+
+class PackProfileTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.profile = load_profile(PROFILE)
+
+    def test_every_pack_state_names_a_stage_the_profile_defines(self) -> None:
+        for state in PACK_STATES:
+            stage = PackPolicy.stage_for_state(state)
+            self.assertIsNotNone(stage, f"{state} maps to no stage")
+            self.assertIn(stage, self.profile.stages,
+                          f"{state} -> {stage}, which the profile does not define")
+
+    def test_every_stage_outcome_is_one_the_policy_allows(self) -> None:
+        for name, stage in self.profile.stages.items():
+            if stage.terminal:
+                continue
+            allowed = allowed_outcomes(name)
+            for outcome in stage.outcomes:
+                self.assertIn(outcome, allowed,
+                              f"stage {name} declares {outcome!r}, which pack-v1 refuses")
+
+    def test_the_owners_are_the_ones_the_roles_call_for(self) -> None:
+        """Producer is Claude, reviewer is Codex (D-2026-09-14-05)."""
+        owners = {name: stage.owner for name, stage in self.profile.stages.items()
+                  if not stage.terminal}
+        self.assertEqual(owners["apply"], "claude")
+        self.assertEqual(owners["repair"], "claude")
+        self.assertEqual(owners["contract_review"], "codex")
+        self.assertEqual(owners["review"], "codex")
