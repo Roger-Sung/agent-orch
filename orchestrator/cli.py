@@ -96,6 +96,12 @@ def build_parser() -> argparse.ArgumentParser:
     pack_raise_cap.add_argument("kind")
     pack_raise_cap.add_argument("extra", type=int)
 
+    pack_restore_tree = subparsers.add_parser(
+        "pack-restore-tree",
+        help="A_restore_tree: put a frozen candidate back, then re-check the blockers")
+    pack_restore_tree.add_argument("pack_id")
+    pack_restore_tree.add_argument("output_id", type=int)
+
     pack_allow_apply = subparsers.add_parser(
         "pack-allow-apply", help="A_allow_apply: authorise the apply and re-check the blockers")
     pack_allow_apply.add_argument("pack_id")
@@ -320,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
 
     OPERATOR_ACTIONS = {
         "pack-resolve", "pack-revoke-writes", "pack-rebind", "pack-raise-cap",
-        "pack-allow-apply", "pack-revoke-acceptance",
+        "pack-allow-apply", "pack-revoke-acceptance", "pack-restore-tree",
     }
     if args.command in OPERATOR_ACTIONS:
         from .db import connect
@@ -336,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
             machine = PackMachine(store)
             try:
                 outcome = _run_operator_action(args, store, machine, PackPolicy,
-                                               revocation)
+                                               revocation, home)
             except (PackError, PackStateError, pack_budgets.BudgetError, KeyError) as exc:
                 print(f"{args.command} refused: {exc}", file=sys.stderr)
                 return 2
@@ -643,7 +649,7 @@ def _default_wait_timeout() -> float:
         raise ValueError(f"invalid ORCH_WAIT_TIMEOUT: {raw!r}") from exc
 
 
-def _run_operator_action(args, store, machine, PackPolicy, revocation) -> str:
+def _run_operator_action(args, store, machine, PackPolicy, revocation, home) -> str:
     """One `A_*` action, reported in the operator's own vocabulary.
 
     Each returns what actually happened rather than "ok": these are the exits
@@ -651,6 +657,8 @@ def _run_operator_action(args, store, machine, PackPolicy, revocation) -> str:
     way to tell a performed action from a refused one.
     """
     import uuid as _uuid
+
+    from .pack.errors import PackError
 
     pack_id = args.pack_id
     if args.command == "pack-raise-cap":
@@ -695,6 +703,37 @@ def _run_operator_action(args, store, machine, PackPolicy, revocation) -> str:
             return f"{pack_id}: not redispatched; held on {outcome['held']}"
         return (f"{pack_id}: session rebound, redispatch authorised;"
                 f" state {store.get_pack(pack_id)['state']}")
+
+    if args.command == "pack-restore-tree":
+        import json as _json
+
+        from .pack.blobs import BlobStore
+
+        record = store.get_record(f"SNAP-{pack_id}-{args.output_id}")
+        if record is None or record["revoked"]:
+            raise PackError(
+                f"no frozen snapshot for {pack_id} output {args.output_id};"
+                " a candidate can only be restored if its content was captured")
+        blobs = BlobStore(home / "pack-blobs")
+        tree = _json.loads(blobs.get(record["payload"]["snapshot_sha256"]))
+        workspace = store.conn.execute(
+            "SELECT workspace_dir FROM tasks WHERE id=?", (pack_id,)).fetchone()
+        if workspace is None or not workspace["workspace_dir"]:
+            raise PackError(f"{pack_id} has no workspace to restore into")
+        pack = store.get_pack(pack_id)
+
+        def recheck() -> str | None:
+            # Restoring answers exactly one blocker. Anything else recorded
+            # stays, for the same reason a grant does not clear an unrelated
+            # failure.
+            remaining = [b["reason"] for b in pack["blockers"]
+                         if b.get("reason") != "candidate_changed"]
+            return remaining[0] if remaining else None
+
+        state = machine.restore_tree(
+            pack_id, workspace=Path(workspace["workspace_dir"]), tree=tree,
+            blob_store=blobs, recheck=recheck)
+        return f"{pack_id}: candidate {args.output_id} restored; state {state}"
 
     if args.command == "pack-allow-apply":
         pack = store.get_pack(pack_id)

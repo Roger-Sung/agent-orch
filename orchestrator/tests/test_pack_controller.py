@@ -10,12 +10,13 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from orchestrator.controller import Controller, ControllerError
-from orchestrator.pack import budgets
+from orchestrator.pack import budgets, trees
 from orchestrator.pack.envelopes import REVIEW_BEGIN, REVIEW_END
 from orchestrator.pack.policy import allowed_outcomes as pack_allowed_outcomes
 from orchestrator.pack.store import PackStore
@@ -510,3 +511,84 @@ class PackRunLoopTerminatesTest(unittest.TestCase):
         pack = controller.pack_store.get_pack(task_id)
         self.assertEqual(pack["calls_reserved"], budgets.DEFAULTS["call_budget"])
         self.assertEqual(pack["state"], "hold(budget_exhausted(call))")
+
+
+class FreezeCandidateTest(unittest.TestCase):
+    """The producer's output is frozen with its content, not just its fingerprint.
+
+    A fingerprint notices that a candidate changed and cannot put it back, so
+    `A_restore_tree` had nothing to restore from and `submitted(k)` was never
+    reached on the real path at all.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.workspace = self.root / "ws"
+        self.workspace.mkdir()
+        for argv in (["git", "init", "-q"],
+                     ["git", "config", "user.email", "t@example.com"],
+                     ["git", "config", "user.name", "t"]):
+            subprocess.run(argv, cwd=self.workspace, check=True, capture_output=True)
+        (self.workspace / "src").mkdir()
+        (self.workspace / "src" / "A.java").write_text("class A {}\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.workspace, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=self.workspace, check=True,
+                       capture_output=True)
+
+        self.controller = Controller(self.root / "home", runner=SequenceRunner([]))
+        self.addCleanup(self.controller.close)
+        self.task_id = self.controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        self.controller._is_pack_v1 = lambda task: True
+        self.controller.conn.execute(
+            "UPDATE tasks SET workspace_dir=? WHERE id=?", (str(self.workspace), self.task_id))
+        store = self.controller.pack_store
+        store.create_pack(self.task_id, target_id="acme", change="c1", state="producing(1)")
+        store.create_attempt("WA-1", self.task_id, base_revision="abc",
+                             candidate_input="sha256:" + "a" * 64, next_output_id=1)
+        store.create_operation("OP-A", self.task_id, type="producer", stage="apply",
+                               attempt_id="WA-1")
+        self.controller.pack_store.update_operation("OP-A", result="completed")
+        self.controller.conn.commit()
+        self.task = self.controller.conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (self.task_id,)).fetchone()
+
+    def test_consuming_the_apply_freezes_the_output_and_its_content(self) -> None:
+        self.controller._advance_pack(self.task)
+
+        pack = self.controller.pack_store.get_pack(self.task_id)
+        self.assertEqual(pack["state"], "submitted(1)")
+        self.assertEqual(pack["k_last"], 1)
+        self.assertEqual(
+            self.controller.pack_store.get_operation("OP-A")["produced_output_id"], 1)
+        self.assertEqual(
+            self.controller.pack_store.get_attempt("WA-1")["next_output_id"], 2)
+
+        snapshot = self.controller.pack_candidate_snapshot(self.task_id, 1)
+        self.assertIsNotNone(snapshot, "a fingerprint with no content cannot be restored")
+        self.assertIn("src/A.java", [entry["path"] for entry in snapshot["files"]])
+
+    def test_the_frozen_content_is_enough_to_restore_the_tree(self) -> None:
+        """The payoff: A_restore_tree now has something to restore from."""
+        self.controller._advance_pack(self.task)
+        snapshot = self.controller.pack_candidate_snapshot(self.task_id, 1)
+
+        (self.workspace / "src" / "A.java").write_text("class A { broken }\n")
+        (self.workspace / "stray.txt").write_text("left behind\n")
+        trees.restore(self.controller.pack_blobs(), self.workspace, snapshot)
+
+        self.assertEqual((self.workspace / "src" / "A.java").read_text(), "class A {}\n")
+        self.assertFalse((self.workspace / "stray.txt").exists())
+
+    def test_a_task_with_no_workspace_freezes_nothing(self) -> None:
+        self.controller.conn.execute(
+            "UPDATE tasks SET workspace_dir=NULL WHERE id=?", (self.task_id,))
+        task = self.controller.conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (self.task_id,)).fetchone()
+
+        self.controller._advance_pack(task)
+
+        self.assertIsNone(self.controller.pack_candidate_snapshot(self.task_id, 1))
+        self.assertEqual(self.controller.pack_store.get_pack(self.task_id)["k_last"], 0)

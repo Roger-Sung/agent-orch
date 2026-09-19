@@ -1476,6 +1476,61 @@ class Controller:
             (now, task["id"]),
         )
 
+    def pack_blobs(self) -> Any:
+        """The engine-owned content store, shared by every pack in this home."""
+        from .pack.blobs import BlobStore
+
+        store = getattr(self, "_pack_blobs", None)
+        if store is None:
+            store = BlobStore(self.home / "pack-blobs")
+            self._pack_blobs = store
+        return store
+
+    def _freeze_pack_candidate(self, task: sqlite3.Row, pack_id: str,
+                               op: dict[str, Any]) -> None:
+        """Freeze what the producer wrote: its fingerprint *and* its content.
+
+        Recording only the fingerprint notices that a candidate changed and
+        cannot put it back, which is why `A_restore_tree` had nothing to
+        restore from. The snapshot goes to the blob store and only its digest
+        is recorded, so a large tree does not land in the database.
+        """
+        from .pack import trees
+        from .pack.identities import candidate_fingerprint
+        from .profile import canonical_json
+
+        workspace = task["workspace_dir"]
+        attempt_id = op.get("attempt_id")
+        if not workspace or not attempt_id:
+            # Nothing to freeze that could later be restored; saying so beats
+            # recording a fingerprint with no content behind it.
+            return
+        root = Path(workspace)
+        attempt = self.pack_store.get_attempt(attempt_id)
+        output_id = attempt["next_output_id"]
+
+        fingerprint = candidate_fingerprint(root)
+        snapshot = trees.snapshot(self.pack_blobs(), root)
+        digest = self.pack_blobs().put(canonical_json(snapshot))
+
+        self.pack_store.freeze_output(pack_id, output_id, attempt_id, fingerprint)
+        self.pack_store.update_attempt(attempt_id, next_output_id=output_id + 1)
+        self.pack_store.update_operation(op["op_id"], produced_output_id=output_id)
+        self.pack_store.add_record(
+            f"SNAP-{pack_id}-{output_id}", self.CANDIDATE_SNAPSHOT,
+            {"output_id": output_id, "snapshot_sha256": digest,
+             "candidate_fingerprint": fingerprint}, pack_id=pack_id)
+        self.pack_store.update_pack(pack_id, state=f"submitted({output_id})")
+
+    def pack_candidate_snapshot(self, pack_id: str, output_id: int) -> dict[str, Any] | None:
+        """The stored tree of one frozen output, ready for `A_restore_tree`."""
+        import json as _json
+
+        record = self.pack_store.get_record(f"SNAP-{pack_id}-{output_id}")
+        if record is None or record["revoked"]:
+            return None
+        return _json.loads(self.pack_blobs().get(record["payload"]["snapshot_sha256"]))
+
     def _open_pack_operation(self, task: sqlite3.Row, run_token: str,
                              stage: Any) -> str | None:
         """Reserve the call's budget and record its operation, before the spawn.
@@ -1576,7 +1631,12 @@ class Controller:
         output parsed a second time, so what is judged is exactly what was
         sealed and verified.
         """
-        if outcome != PACK_CONSUME or op.get("stage") != "review":
+        if outcome != PACK_CONSUME:
+            return
+        if op.get("stage") == "apply":
+            self._freeze_pack_candidate(task, pack_id, op)
+            return
+        if op.get("stage") != "review":
             return
         receipt = self._pack_sealed_receipt(task, op)
         if receipt is None:
@@ -1619,6 +1679,8 @@ class Controller:
     # ------------------------------------------------------------------
     # pack-v1 reconcile (STATE-TABLE §5) - IMPLEMENTATION-PLAN step 3
     # ------------------------------------------------------------------
+
+    CANDIDATE_SNAPSHOT = "candidate_snapshot"
 
     def _pack_receipt_path(self, task: sqlite3.Row, op_id: str) -> Path:
         return Path(task["artifact_dir"]) / "pack-receipts" / f"{op_id}.json"

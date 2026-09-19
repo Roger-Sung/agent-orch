@@ -156,3 +156,49 @@ class OperatorActionCliTest(unittest.TestCase):
         store.create_operation("OP-R", "P2", type="review", stage="review")
         conn.commit()
         self.assertEqual(main(["pack-rebind", "P2", "OP-R"]), 2)
+
+    def test_restore_tree_puts_a_frozen_candidate_back(self) -> None:
+        import json as _json
+
+        from orchestrator.pack import trees
+        from orchestrator.pack.blobs import BlobStore
+        from orchestrator.profile import canonical_json
+
+        workspace = self.home / "ws"
+        (workspace / "src").mkdir(parents=True)
+        (workspace / "src" / "A.java").write_text("class A {}\n")
+        blobs = BlobStore(self.home / "pack-blobs")
+        snapshot = trees.snapshot(blobs, workspace)
+        digest = blobs.put(canonical_json(snapshot))
+
+        conn, store = self.store()
+        conn.execute(
+            "INSERT INTO tasks(id,type,status,current_stage,profile_hash,input_hash,"
+            "profile_snapshot_path,input_snapshot_path,artifact_dir,max_transitions,"
+            "created_at,updated_at,workspace_dir)"
+            " VALUES('P2','apply','waiting_user','apply','ph','ih','ps','is','ad',10,0,0,?)",
+            (str(workspace),))
+        store.add_record("SNAP-P2-1", "candidate_snapshot",
+                         {"output_id": 1, "snapshot_sha256": digest,
+                          "candidate_fingerprint": "sha256:" + "a" * 64}, pack_id="P2")
+        store.update_pack("P2", state="hold(candidate_changed)",
+                          hold_reason="candidate_changed", return_point="submitted(1)",
+                          blockers=[{"reason": "candidate_changed"}])
+        conn.commit()
+
+        (workspace / "src" / "A.java").write_text("class A { broken }\n")
+        (workspace / "stray.txt").write_text("left behind\n")
+
+        self.assertEqual(main(["pack-restore-tree", "P2", "1"]), 0)
+
+        self.assertEqual((workspace / "src" / "A.java").read_text(), "class A {}\n")
+        self.assertFalse((workspace / "stray.txt").exists())
+        _, store2 = self.store()
+        self.assertEqual(store2.get_pack("P2")["state"], "submitted(1)")
+
+    def test_restore_tree_is_refused_when_nothing_was_frozen(self) -> None:
+        conn, store = self.store()
+        store.update_pack("P2", state="hold(candidate_changed)",
+                          hold_reason="candidate_changed")
+        conn.commit()
+        self.assertEqual(main(["pack-restore-tree", "P2", "1"]), 2)
