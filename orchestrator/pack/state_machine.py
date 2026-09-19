@@ -21,7 +21,7 @@ import hashlib
 import json
 from typing import Any, Callable, Sequence
 
-from . import budgets, revocation, sessions
+from . import budgets, revocation, sessions, trees
 from .judge import Decision, judge_v1
 from .store import PackStore
 
@@ -518,6 +518,53 @@ class PackMachine:
                               {"stage": stage, "output_id": output_id, "cause": cause},
                               pack_id=pack_id)
         return None
+
+    ALLOW_APPLY = "allow_apply"
+
+    def _recheck_preconditions(self, pack_id: str,
+                               recheck: Callable[[], str | None]) -> str:
+        """Re-verify a hold's preconditions and route on what still fails.
+
+        A different failure is not the same hold cleared and a new one entered:
+        the blocker moves while the continuation stays, because the work the
+        pack still owes did not change just because the reason it is stuck did.
+        """
+        blocker = recheck()
+        if blocker is None:
+            # The re-verification is authoritative: a blocker recorded by an
+            # earlier recheck would otherwise keep the pack held for a reason
+            # this one just found no longer true.
+            self.store.update_pack(pack_id, blockers=[], hold_reason=None)
+            return self.exit_hold(pack_id, alive=lambda op: False)
+        self.store.update_pack(pack_id, state=f"hold({blocker})", hold_reason=blocker,
+                               blockers=[{"reason": blocker}])
+        return f"hold({blocker})"
+
+    def restore_tree(self, pack_id: str, *, workspace: Any, tree: dict[str, Any],
+                     blob_store: Any, recheck: Callable[[], str | None]) -> str:
+        """`A_restore_tree` - put the candidate back, then re-verify.
+
+        Only from `hold(candidate_changed)`: restoring a tree the pack is not
+        held over would overwrite whatever is legitimately there now.
+        """
+        pack = self.store.get_pack(pack_id)
+        if not pack["state"].startswith("hold(candidate_changed"):
+            raise PackStateError(
+                f"A_restore_tree is not available from {pack['state']!r}")
+        trees.restore(blob_store, workspace, tree)
+        return self._recheck_preconditions(pack_id, recheck)
+
+    def allow_apply(self, pack_id: str, *, record_id: str,
+                    recheck: Callable[[], str | None]) -> str:
+        """`A_allow_apply` - record the authorisation, then re-verify.
+
+        The grant is a record rather than a state change so that the same
+        re-verification decides the outcome; approving does not by itself say
+        the other preconditions now hold.
+        """
+        self.store.add_record(record_id, self.ALLOW_APPLY, {"pack_id": pack_id},
+                              pack_id=pack_id)
+        return self._recheck_preconditions(pack_id, recheck)
 
     def rebind_review_session(self, pack_id: str, *, role: str, attempt_id: str | None,
                               lost_op_id: str, stage: str, record_id: str,

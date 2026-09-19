@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from orchestrator.pack import budgets, receipts, revocation, sessions
+from orchestrator.pack import budgets, receipts, revocation, sessions, trees
+from orchestrator.pack.blobs import BlobStore
 from orchestrator.pack.envelopes import validate_review
 from orchestrator.pack.state_machine import (
     ALREADY_CONSUMED,
@@ -759,6 +760,7 @@ class CoverageMapTest(unittest.TestCase):
         "ST25b": "RemainingFixtureTest",
         "ST5": "BudgetGateTest", "ST25": "BudgetGateTest",
         "ST14": "SealedReceiptRecoveryTest", "ST14b": "ReviewSessionLostTest",
+        "ST24e": "RestoreTreeTest",
         "ST24h-1": "UnknownRecoveryTest", "ST24h-2": "UnknownRecoveryTest",
         "ST24h-2b": "UnknownRecoveryTest", "ST24h-2c": "UnknownRecoveryTest",
         "ST24h-2d": "UnknownRecoveryTest", "ST24h-3": "UnknownRecoveryTest",
@@ -772,9 +774,9 @@ class CoverageMapTest(unittest.TestCase):
 
     # Still open, with the step that owns them.  Listing them is the point:
     # an unlisted gap is indistinguishable from no gap.
-    DEFERRED = {
-        "ST24e": "step 5 - restore_tree against a real blob store",
-    }
+    # Empty at last: every STATE-TABLE §10 fixture now runs.  The map stays
+    # because an unlisted gap is indistinguishable from no gap.
+    DEFERRED: dict[str, str] = {}
 
     def test_no_fixture_is_both_covered_and_deferred(self) -> None:
         self.assertEqual(set(self.COVERED) & set(self.DEFERRED), set())
@@ -1190,3 +1192,81 @@ class ReviewSessionLostTest(unittest.TestCase):
         self._open_session()
         self.pack.machine.startup_scan(self.pack.pack_id, alive=lambda o: False)
         self.assertIsNotNone(self.pack.store.pending_session_for(self.op))
+
+
+class RestoreTreeTest(unittest.TestCase):
+    """ST24e - the tree is put back, and re-verification finds the next problem.
+
+    `freeze_output` records a candidate's fingerprint, which notices that a tree
+    changed and cannot put it back; restoring needs the content, so this runs
+    against a real blob store rather than a stand-in.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.workspace = self.root / "ws"
+        (self.workspace / "src").mkdir(parents=True)
+        (self.workspace / "src" / "A.java").write_text("class A {}\n")
+        self.blobs = BlobStore(self.root / "blobs")
+        self.tree = trees.snapshot(self.blobs, self.workspace)
+
+        self.pack = StubPack()
+        self.pack.contract_review(passes=True)
+        self.pack.claim()
+        op = self.pack.produce()
+        self.k = self.pack.submit(op)
+        self.pack.store.update_pack(self.pack.pack_id, continuation=f"reverify_then_review({self.k})")
+        self.pack.machine.enter_hold(self.pack.pack_id, "candidate_changed",
+                                     return_point=f"submitted({self.k})",
+                                     continuation=f"reverify_then_review({self.k})",
+                                     alive=lambda op: False)
+        self.pack.machine.stop_and_release(self.pack.pack_id,
+                                           next_state="hold(candidate_changed)")
+        # What the interrupted writer did to the tree.
+        (self.workspace / "src" / "A.java").write_text("class A { broken }\n")
+        (self.workspace / "stray.txt").write_text("left behind\n")
+
+    def _restore(self, recheck):
+        return self.pack.machine.restore_tree(
+            self.pack.pack_id, workspace=self.workspace, tree=self.tree,
+            blob_store=self.blobs, recheck=recheck)
+
+    def test_st24e_restore_then_the_blocker_moves_and_the_continuation_stays(self) -> None:
+        state = self._restore(lambda: "approval_revoked")
+
+        self.assertEqual((self.workspace / "src" / "A.java").read_text(), "class A {}\n")
+        self.assertFalse((self.workspace / "stray.txt").exists(),
+                         "a restore that leaves the writer's files is not a restore")
+        self.assertEqual(state, "hold(approval_revoked)")
+        pack = self.pack.pack()
+        self.assertEqual(pack["hold_reason"], "approval_revoked")
+        self.assertEqual([b["reason"] for b in pack["blockers"]], ["approval_revoked"])
+        self.assertEqual(pack["continuation"], f"reverify_then_review({self.k})",
+                         "the work still owed did not change with the reason")
+
+    def test_st24e_allow_apply_then_a_clean_recheck_returns_to_the_return_point(self) -> None:
+        self._restore(lambda: "approval_revoked")
+        state = self.pack.machine.allow_apply(
+            self.pack.pack_id, record_id="GRANT-1", recheck=lambda: None)
+        self.assertEqual(state, f"submitted({self.k})")
+        self.assertEqual(self.pack.state(), f"submitted({self.k})")
+        self.assertIsNone(self.pack.pack()["hold_reason"])
+        self.assertEqual(
+            len(self.pack.store.records_of_kind("allow_apply", self.pack.pack_id)), 1)
+
+    def test_approving_does_not_by_itself_clear_another_blocker(self) -> None:
+        self._restore(lambda: "approval_revoked")
+        state = self.pack.machine.allow_apply(
+            self.pack.pack_id, record_id="GRANT-1", recheck=lambda: "environment_changed")
+        self.assertEqual(state, "hold(environment_changed)")
+
+    def test_restore_is_refused_outside_the_hold_it_belongs_to(self) -> None:
+        from orchestrator.pack.state_machine import PackStateError
+
+        self.pack.store.update_pack(self.pack.pack_id, state=f"submitted({self.k})")
+        with self.assertRaises(PackStateError):
+            self._restore(lambda: None)
+        self.assertEqual((self.workspace / "src" / "A.java").read_text(),
+                         "class A { broken }\n")
