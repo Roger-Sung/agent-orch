@@ -11,6 +11,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+from orchestrator.pack.envelopes import OUTCOME_PREFIX, REVIEW_BEGIN, REVIEW_END
 from orchestrator.pack.policy import PackPolicy, allowed_outcomes
 from orchestrator.profile import load_profile
 
@@ -48,3 +49,46 @@ class PackProfileTest(unittest.TestCase):
         self.assertEqual(owners["repair"], "claude")
         self.assertEqual(owners["contract_review"], "codex")
         self.assertEqual(owners["review"], "codex")
+
+
+class EnvelopePromptTest(unittest.TestCase):
+    """A reviewer cannot guess the framing it is required to produce.
+
+    Describing the markers instead of spelling them out fails at the only point
+    where it is expensive: after the provider has run, when the envelope does
+    not parse and the round is spent. These assert the prompt carries the exact
+    strings the parser looks for, so renaming a constant breaks a test rather
+    than a live review.
+    """
+
+    REVIEWING_STAGES = ("contract_review", "review")
+
+    def setUp(self) -> None:
+        self.profile = load_profile(PROFILE)
+
+    def test_the_reviewing_stages_spell_the_markers_out(self) -> None:
+        for name in self.REVIEWING_STAGES:
+            prompt = self.profile.stages[name].prompt
+            self.assertIn(REVIEW_BEGIN, prompt, f"{name} does not name the opening marker")
+            self.assertIn(REVIEW_END, prompt, f"{name} does not name the closing marker")
+
+    def test_every_stage_asks_for_the_outcome_line_the_parser_reads(self) -> None:
+        for name, stage in self.profile.stages.items():
+            if stage.terminal:
+                continue
+            self.assertIn(OUTCOME_PREFIX, stage.prompt,
+                          f"{name} never asks for a typed outcome line")
+
+    def test_each_stage_asks_only_for_outcomes_it_is_allowed(self) -> None:
+        for name, stage in self.profile.stages.items():
+            if stage.terminal:
+                continue
+            allowed = allowed_outcomes(name)
+            asked = {
+                token.split()[0].rstrip(".,")
+                for token in stage.prompt.split(OUTCOME_PREFIX)[1:]
+            }
+            self.assertTrue(asked, f"{name} names no outcome after the prefix")
+            self.assertLessEqual(
+                asked, allowed,
+                f"{name} asks for {sorted(asked - allowed)}, which pack-v1 refuses")
