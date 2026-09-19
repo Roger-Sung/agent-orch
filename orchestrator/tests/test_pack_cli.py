@@ -202,3 +202,65 @@ class OperatorActionCliTest(unittest.TestCase):
                           hold_reason="candidate_changed")
         conn.commit()
         self.assertEqual(main(["pack-restore-tree", "P2", "1"]), 2)
+
+
+@unittest.skipUnless((Path(__file__).resolve().parents[2] / "targets" / "_fixture_min"
+                      / "profile.yaml").is_file(), "the fixture target is not present")
+class PackStartTest(unittest.TestCase):
+    """Intake is what makes every pack-v1 branch reachable from outside.
+
+    `start_packs` built the pack rows and no task was ever created against them,
+    so the daemon had nothing to pick up. The assertion that matters is not that
+    a task exists but that the controller classifies it as pack-v1: a task the
+    classifier reads as legacy runs the whole flow down the wrong path in
+    silence.
+    """
+
+    TARGET = Path(__file__).resolve().parents[2] / "targets" / "_fixture_min"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name) / "home"
+        previous = os.environ.get("ORCH_HOME")
+        os.environ["ORCH_HOME"] = str(self.home)
+        self.addCleanup(lambda: os.environ.__setitem__("ORCH_HOME", previous)
+                        if previous is not None else os.environ.pop("ORCH_HOME", None))
+        self.workspace = Path(tmp.name) / "ws"
+        self.workspace.mkdir(parents=True)
+
+    def _run(self) -> int:
+        return main([
+            "pack-start",
+            "--target-dir", str(self.TARGET),
+            "--change-dir", str(self.TARGET / "change"),
+            "--workspace", str(self.workspace),
+            "--base-revision", "abc",
+            "--producer-model", "claude-opus-5",
+            "--reviewer-model", "gpt-6-astra",
+        ])
+
+    def test_a_task_is_created_and_reads_as_pack_v1(self) -> None:
+        from orchestrator.controller import Controller
+
+        self.assertEqual(self._run(), 0)
+
+        controller = Controller(self.home, runner=None)
+        self.addCleanup(controller.close)
+        tasks = list(controller.conn.execute("SELECT * FROM tasks"))
+        self.assertEqual(len(tasks), 1)
+        task = tasks[0]
+        self.assertEqual(controller._policy_version(task), "pack-v1",
+                         "a pack task the classifier reads as legacy runs the wrong flow")
+        # The pack and its task share one identity, which is what the controller
+        # looks the pack up by.
+        self.assertEqual(controller.pack_store.get_pack(task["id"])["pack_id"], task["id"])
+
+    def test_the_input_carries_the_contract_the_prompts_refer_to(self) -> None:
+        self.assertEqual(self._run(), 0)
+        intake = sorted((self.home / "pack-intake").glob("*.md"))
+        self.assertEqual(len(intake), 1)
+        text = intake[0].read_text(encoding="utf-8")
+        self.assertIn("Dispatch contract", text)
+        self.assertIn("files_writable", text)
+        self.assertIn("Contract hash: sha256:", text)

@@ -68,6 +68,19 @@ def build_parser() -> argparse.ArgumentParser:
     # Operator exits from a hold (STATE-TABLE §6 `A_*`).  Every hold in the
     # table names one; without a way to perform them a pack that enters a hold
     # never leaves it, which is as stuck as a pack that never stops.
+    pack_start = subparsers.add_parser(
+        "pack-start", help="create a change's packs and a task for each that can run")
+    pack_start.add_argument("--target-dir", type=Path, required=True)
+    pack_start.add_argument("--change-dir", type=Path, required=True)
+    pack_start.add_argument("--workspace", type=Path, required=True)
+    pack_start.add_argument("--profile", type=Path,
+                            default=Path(__file__).resolve().parent / "profiles" / "pack_v1.yaml")
+    pack_start.add_argument("--base-revision", required=True)
+    pack_start.add_argument("--producer-model", required=True)
+    pack_start.add_argument("--reviewer-model", required=True)
+    pack_start.add_argument("--effort", default="medium", choices=["low", "medium", "high"])
+    pack_start.add_argument("--json", action="store_true")
+
     pack_resolve = subparsers.add_parser(
         "pack-resolve", help="A_resolve_operation: act on an operation whose result is unknown")
     pack_resolve.add_argument("pack_id")
@@ -323,6 +336,33 @@ def main(argv: list[str] | None = None) -> int:
             "A daemon configured with a different ORCH_HOME will never see this state.",
             file=sys.stderr,
         )
+
+    if args.command == "pack-start":
+        # Aliased: a bare `from .controller import Controller` here would make
+        # the name local to the whole of main(), shadowing the module-level
+        # binding every other branch uses.
+        from .controller import Controller as _PackController
+        from .pack.launch import launch_packs
+
+        controller = _PackController(home, runner=None)
+        try:
+            launched = launch_packs(
+                controller, target_dir=args.target_dir, change_dir=args.change_dir,
+                workspace=args.workspace, profile_path=args.profile,
+                base_revision=args.base_revision, producer_model=args.producer_model,
+                reviewer_model=args.reviewer_model, effort=args.effort)
+            controller.conn.commit()
+        finally:
+            controller.close()
+        if args.json:
+            print(json.dumps(launched, ensure_ascii=False, indent=2))
+        else:
+            for record in launched:
+                if record["task"] is None:
+                    print(f"{record['pack']:<28} blocked_deps on {record['blocked_on']}")
+                else:
+                    print(f"{record['pack']:<28} queued  {record['contract_hash']}")
+        return 0
 
     OPERATOR_ACTIONS = {
         "pack-resolve", "pack-revoke-writes", "pack-rebind", "pack-raise-cap",

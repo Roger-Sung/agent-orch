@@ -18,6 +18,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--argv", default="[]")
     parser.add_argument("--env", default="{}")
     parser.add_argument("--tools", required=True)
+    # Conditional flag (PLAN §4): the engine always passes it when it knows
+    # the workspace. Nothing here is workspace-dependent, so it is accepted
+    # and ignored - refusing it would fail a launch the contract allows.
+    parser.add_argument("--workspace")
     args = parser.parse_args(argv)
 
     tools = json.loads(args.tools)
