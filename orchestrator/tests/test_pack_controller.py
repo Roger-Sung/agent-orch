@@ -18,7 +18,7 @@ from pathlib import Path
 from orchestrator.controller import Controller, ControllerError
 from orchestrator.pack import budgets, trees
 from orchestrator.pack.envelopes import REVIEW_BEGIN, REVIEW_END
-from orchestrator.pack.policy import allowed_outcomes as pack_allowed_outcomes
+from orchestrator.pack.policy import PackPolicy, allowed_outcomes as pack_allowed_outcomes
 from orchestrator.pack.store import PackStore
 from orchestrator.tests.pack_stub import full_review_envelope
 from orchestrator.runner import RunResult
@@ -592,3 +592,69 @@ class FreezeCandidateTest(unittest.TestCase):
 
         self.assertIsNone(self.controller.pack_candidate_snapshot(self.task_id, 1))
         self.assertEqual(self.controller.pack_store.get_pack(self.task_id)["k_last"], 0)
+
+
+class TransitionPackTaskTest(unittest.TestCase):
+    """§8: the pack and its task move together, or neither does.
+
+    The primitive existed but only wrote the pack row, so the task it is named
+    after was never touched: a pack could move to repair while its task stayed
+    queued for apply, and the run loop would re-dispatch the stage the pack had
+    already left.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.controller = Controller(Path(tmp.name), runner=SequenceRunner([]))
+        self.addCleanup(self.controller.close)
+        self.task_id = self.controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        self.controller._is_pack_v1 = lambda task: True
+        self.store = self.controller.pack_store
+        self.store.create_pack(self.task_id, target_id="acme", change="c1",
+                               state="producing(1)")
+        self.controller.conn.commit()
+        self.policy = PackPolicy(self.store)
+
+    def task(self):
+        return self.controller.conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (self.task_id,)).fetchone()
+
+    def test_the_task_follows_the_pack_to_the_next_stage(self) -> None:
+        before = self.task()
+        self.policy.transition_pack_task(self.task_id, "repair_pending(1)",
+                                         task_status="queued")
+        row = self.task()
+        self.assertEqual(self.store.get_pack(self.task_id)["state"], "repair_pending(1)")
+        self.assertEqual(row["current_stage"], "repair",
+                         "the task still owes the stage the pack has left")
+        self.assertEqual(row["status"], "queued")
+        self.assertEqual(row["transitions_count"], before["transitions_count"] + 1)
+        self.assertEqual(row["revision"], before["revision"] + 1)
+
+    def test_a_hold_carries_its_reason_onto_the_task(self) -> None:
+        self.policy.transition_pack_task(
+            self.task_id, "hold(budget_exhausted(call))", task_status="waiting_user",
+            stop_reason="budget_exhausted(call)", hold_reason="budget_exhausted(call)")
+        row = self.task()
+        self.assertEqual(row["status"], "waiting_user")
+        self.assertEqual(row["stop_reason"], "budget_exhausted(call)")
+
+    def test_neither_row_moves_when_the_task_write_fails(self) -> None:
+        """One transaction is the point; half a transition is worse than none."""
+        before_stage = self.task()["current_stage"]
+        conn = self.controller.conn
+        conn.execute(
+            "CREATE TRIGGER refuse_task_update BEFORE UPDATE ON tasks"
+            " BEGIN SELECT RAISE(ABORT, 'injected'); END")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.policy.transition_pack_task(self.task_id, "repair_pending(1)",
+                                                 task_status="queued")
+        finally:
+            conn.execute("ROLLBACK")
+            conn.execute("DROP TRIGGER refuse_task_update")
+
+        self.assertEqual(self.store.get_pack(self.task_id)["state"], "producing(1)")
+        self.assertEqual(self.task()["current_stage"], before_stage)

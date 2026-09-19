@@ -1605,18 +1605,21 @@ class Controller:
                 apply_fn=lambda outcome, consumed, _task=task: self._apply_pack_stage(
                     _task, pack_id, machine, outcome, consumed),
             )
-        state = self.pack_store.get_pack(pack_id)["state"]
+        pack = self.pack_store.get_pack(pack_id)
+        state = pack["state"]
         if state == "accepted":
             status, reason = "done", None
         elif state.startswith("hold("):
             status, reason = "waiting_user", state[len("hold("):-1]
         else:
             status, reason = "queued", None
+        # Both rows in one transaction (§8): written separately, a crash in
+        # between leaves a task queued for a stage its pack has already left.
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            self.conn.execute(
-                "UPDATE tasks SET status=?,stop_reason=?,updated_at=?,revision=revision+1"
-                " WHERE id=?", (status, reason, _now(), pack_id))
+            PackPolicy(self.pack_store).transition_pack_task(
+                pack_id, state, task_status=status, stop_reason=reason,
+                hold_reason=pack["hold_reason"])
             self.conn.execute("COMMIT")
         except BaseException:
             if self.conn.in_transaction:
