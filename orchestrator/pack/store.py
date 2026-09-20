@@ -267,6 +267,15 @@ class PackStore:
             (attempt_id, pack_id, base_revision, candidate_input, next_output_id, _now()),
         )
 
+    def bump_attempt(self, attempt_id: str, column: str, delta: int = 1) -> int:
+        """Settled counters live on the attempt, because their scope is one."""
+        self.conn.execute(
+            f"UPDATE pack_work_attempts SET {column}={column}+? WHERE attempt_id=?",
+            (delta, attempt_id))
+        return self.conn.execute(
+            f"SELECT {column} AS v FROM pack_work_attempts WHERE attempt_id=?",
+            (attempt_id,)).fetchone()["v"]
+
     def get_attempt(self, attempt_id: str) -> dict[str, Any]:
         row = self.conn.execute(
             "SELECT * FROM pack_work_attempts WHERE attempt_id=?", (attempt_id,)

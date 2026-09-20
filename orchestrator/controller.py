@@ -1724,7 +1724,9 @@ class Controller:
         try:
             # Caps come from the contract's `budget_policy`; until intake loads
             # one, §3.4's own defaults apply rather than no limit at all.
-            refused = machine.reserve_dispatch(pack_id, budget_policy=None)
+            # The producer gate runs first: a refusal must not spend a call.
+            refused = (machine.producer_gate(pack_id, stage.name)
+                       or machine.reserve_dispatch(pack_id, budget_policy=None))
             if refused is None:
                 pack = self.pack_store.get_pack(pack_id)
                 attempt = self._claimed_attempt(pack_id, stage.name)

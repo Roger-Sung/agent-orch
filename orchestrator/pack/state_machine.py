@@ -92,6 +92,13 @@ class PackMachine:
         op = self.store.get_operation(op_id)
         if op["result"] is not None:
             return  # idempotent: the same call reported twice is one result.
+        # §3.4's settled counter: a producer op that failed is counted once,
+        # here, where the result is written.  Only a plain `failed` counts -
+        # `failed_not_spawned` never ran, and `failed_superseded_by_hold` was
+        # stopped by the engine, so charging either to the producer would spend
+        # an attempt on something it did not do.
+        if result == "failed" and op["stage"] in {"apply", "repair"} and op["attempt_id"]:
+            self.store.bump_attempt(op["attempt_id"], "producer_failures", 1)
         fields: dict[str, Any] = {"result": result, "result_ref": result_ref}
         # Only written when supplied.  Both are recorded *before* this call - the
         # binding when the call is dispatched, the receipt reference when the
@@ -473,6 +480,25 @@ class PackMachine:
         budgets.caps(None, [{"kind": kind, "extra": extra}])  # rejects a bad kind/extra here
         self.store.add_record(record_id, self.CAP_RAISE, {"kind": kind, "extra": extra},
                               pack_id=pack_id)
+
+    def producer_gate(self, pack_id: str, stage: str,
+                      budget_policy: dict[str, Any] | None = None) -> str | None:
+        """Refuse a producer dispatch once this attempt has failed its cap.
+
+        Checked before the reservation, so a refused dispatch spends nothing.
+        Without it a producer that fails on every call is simply re-dispatched
+        until the whole call budget is gone - which a live run did, 24 times,
+        on an argv error it would have hit every time.
+        """
+        if stage not in {"apply", "repair"}:
+            return None
+        attempt = self.store.current_attempt(pack_id)
+        if attempt is None:
+            return None
+        caps = self.budget_caps(pack_id, budget_policy)
+        if budgets.exhausted("attempt_cap", attempt["producer_failures"], caps["attempt_cap"]):
+            return budgets.hold_reason("attempt_cap")
+        return None
 
     def reserve_dispatch(self, pack_id: str, *, budget_policy: dict[str, Any] | None = None,
                          counts_round: bool = False) -> str | None:

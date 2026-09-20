@@ -134,3 +134,50 @@ class PackPipelineTest(unittest.TestCase):
         producer_stages = [stage for stage, _owner in self.calls
                            if stage in {"apply", "repair"}]
         self.assertEqual(producer_stages, ["apply", "repair"])
+
+    def test_a_producer_that_always_fails_stops_at_its_attempt_cap(self) -> None:
+        """The live failure: an argv error the producer would hit every time.
+
+        Without the settled counter this spent the whole call budget - 24 real
+        dispatches of a call that could not succeed.
+        """
+        from orchestrator.pack import budgets
+
+        outer = self
+
+        class AlwaysFails:
+            session_binding = None
+
+            def __init__(self, stage: str) -> None:
+                self.stage = stage
+
+            def run(self, owner, prompt, timeout, log_path, **kwargs):
+                outer.calls.append((self.stage, owner))
+                if len(outer.calls) > 20:
+                    raise AssertionError(f"runaway dispatch: {outer.calls}")
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                if self.stage == "contract_review":
+                    envelope = dict(REVIEW_HEADER)
+                    envelope.update({
+                        "review_round": None, "candidate_fingerprint": None,
+                        "verdict": "accepted", "blocked_reason": None, "obligations": {},
+                        "findings": [], "contract_findings": [], "improvements": [],
+                        "prior_round": None, "remaining": []})
+                    text = _framed(envelope, "contract_pass")
+                    log_path.write_text(text, encoding="utf-8")
+                    return RunResult(0, text, None, "raw", "raw")
+                text = "error: unknown option '--sandbox'\n"
+                log_path.write_text(text, encoding="utf-8")
+                return RunResult(1, text, None, "blocked", "runner_nonzero")
+
+        self.controller._execution_runner_for = lambda task, stage: AlwaysFails(stage.name)
+
+        self.controller.run_until_stop(self.pack_id)
+
+        producer_calls = [c for c in self.calls if c[0] in {"apply", "repair"}]
+        self.assertEqual(len(producer_calls), budgets.DEFAULTS["attempt_cap"],
+                         f"the producer was dispatched {len(producer_calls)} times")
+        pack = self.controller.pack_store.get_pack(self.pack_id)
+        self.assertEqual(pack["state"], "hold(producer_failed)")
+        self.assertLess(pack["calls_reserved"], budgets.DEFAULTS["call_budget"],
+                        "a capped producer must not have spent the call budget")

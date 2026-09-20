@@ -1270,3 +1270,71 @@ class RestoreTreeTest(unittest.TestCase):
             self._restore(lambda: None)
         self.assertEqual((self.workspace / "src" / "A.java").read_text(),
                          "class A { broken }\n")
+
+
+class ProducerFailureCapTest(unittest.TestCase):
+    """§3.4's settled counter, which was never implemented.
+
+    Only the reserved counters existed, so a producer that fails on every call
+    was re-dispatched until the whole call budget was gone - a live run did
+    exactly that, 24 times, on an argv error that would have recurred every
+    time. `attempt_cap` is what turns that into two attempts and a hold.
+    """
+
+    def setUp(self) -> None:
+        self.pack = StubPack()
+        self.pack.contract_review(passes=True)
+        self.attempt = self.pack.claim()
+
+    def _fail_a_producer(self, index: int) -> None:
+        op = self.pack.next_op("producer", stage="apply", attempt_id=self.attempt)
+        self.pack.machine.commit_call_result(
+            op, result="failed",
+            call_binding=self.pack.binding(stage="apply", attempt_id=self.attempt))
+
+    def test_failures_are_counted_on_the_attempt(self) -> None:
+        self._fail_a_producer(1)
+        self._fail_a_producer(2)
+        self.assertEqual(
+            self.pack.store.get_attempt(self.attempt)["producer_failures"], 2)
+
+    def test_the_cap_refuses_the_next_dispatch(self) -> None:
+        self.assertIsNone(self.pack.machine.producer_gate(self.pack.pack_id, "apply"))
+        for i in range(budgets.DEFAULTS["attempt_cap"]):
+            self._fail_a_producer(i)
+        self.assertEqual(self.pack.machine.producer_gate(self.pack.pack_id, "apply"),
+                         "producer_failed")
+
+    def test_a_completed_producer_is_not_charged(self) -> None:
+        op = self.pack.next_op("producer", stage="apply", attempt_id=self.attempt)
+        self.pack.machine.commit_call_result(
+            op, result="completed",
+            call_binding=self.pack.binding(stage="apply", attempt_id=self.attempt))
+        self.assertEqual(
+            self.pack.store.get_attempt(self.attempt)["producer_failures"], 0)
+
+    def test_work_the_producer_did_not_do_is_not_charged_to_it(self) -> None:
+        """A launch that never happened, and a stop the engine ordered."""
+        for result in ("failed_not_spawned", "failed_superseded_by_hold"):
+            op = self.pack.next_op("producer", stage="apply", attempt_id=self.attempt)
+            self.pack.machine.commit_call_result(
+                op, result=result,
+                call_binding=self.pack.binding(stage="apply", attempt_id=self.attempt))
+        self.assertEqual(
+            self.pack.store.get_attempt(self.attempt)["producer_failures"], 0)
+        self.assertIsNone(self.pack.machine.producer_gate(self.pack.pack_id, "apply"))
+
+    def test_a_reviewer_failure_is_not_a_producer_failure(self) -> None:
+        op = self.pack.next_op("review", stage="review", attempt_id=self.attempt)
+        self.pack.machine.commit_call_result(
+            op, result="failed",
+            call_binding=self.pack.binding(stage="review", attempt_id=self.attempt))
+        self.assertEqual(
+            self.pack.store.get_attempt(self.attempt)["producer_failures"], 0)
+
+    def test_the_gate_does_not_apply_to_stages_without_a_producer(self) -> None:
+        for i in range(budgets.DEFAULTS["attempt_cap"]):
+            self._fail_a_producer(i)
+        self.assertIsNone(
+            self.pack.machine.producer_gate(self.pack.pack_id, "contract_review"))
+        self.assertIsNone(self.pack.machine.producer_gate(self.pack.pack_id, "review"))
