@@ -416,6 +416,13 @@ class PackStore:
             "SELECT COUNT(*) AS n FROM pack_dispatch_records WHERE pack_id=?", (pack_id,)
         ).fetchone()["n"]
 
+    def get_output(self, pack_id: str, output_id: int) -> dict[str, Any] | None:
+        """One frozen output, or None when that candidate was never frozen."""
+        row = self.conn.execute(
+            "SELECT * FROM pack_outputs WHERE pack_id=? AND output_id=?",
+            (pack_id, output_id)).fetchone()
+        return dict(row) if row is not None else None
+
     def last_dispatch_record(self, pack_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             "SELECT * FROM pack_dispatch_records WHERE pack_id=? ORDER BY source_review_seq DESC,"

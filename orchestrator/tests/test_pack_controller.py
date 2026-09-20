@@ -658,3 +658,111 @@ class TransitionPackTaskTest(unittest.TestCase):
 
         self.assertEqual(self.store.get_pack(self.task_id)["state"], "producing(1)")
         self.assertEqual(self.task()["current_stage"], before_stage)
+
+
+@unittest.skipUnless((Path(__file__).resolve().parents[2] / "targets" / "_fixture_min"
+                      / "profile.yaml").is_file(), "the fixture target is not present")
+class PrerunRunsInEngineTest(unittest.TestCase):
+    """prerun is the target's verify CLI, not a provider call.
+
+    Dispatching it to a model would put a transcription between the check and
+    the reviewer, which is precisely what sealed observations exist to remove:
+    a model can report that a failing check passed, an envelope cannot.
+    """
+
+    TARGET = Path(__file__).resolve().parents[2] / "targets" / "_fixture_min"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.workspace = self.root / "ws"
+        self.workspace.mkdir()
+        self.controller = Controller(self.root / "home", runner=SequenceRunner([]))
+        self.addCleanup(self.controller.close)
+
+        from orchestrator.pack.launch import launch_packs
+        launched = launch_packs(
+            self.controller, target_dir=self.TARGET, change_dir=self.TARGET / "change",
+            workspace=self.workspace,
+            profile_path=Path(__file__).resolve().parents[1] / "profiles" / "pack_v1.yaml",
+            base_revision="abc", producer_model="claude-opus-5",
+            reviewer_model="gpt-6-astra")
+        self.controller.conn.commit()
+        self.pack_id = launched[0]["pack"]
+        store = self.controller.pack_store
+        store.create_attempt("WA-1", self.pack_id, base_revision="abc",
+                             candidate_input=None, next_output_id=1)
+        store.freeze_output(self.pack_id, 1, "WA-1", "sha256:" + "b" * 64)
+        store.update_pack(self.pack_id, state="submitted(1)")
+        self.controller.conn.commit()
+        self.task = self.controller.conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (self.pack_id,)).fetchone()
+
+    def test_prerun_seals_observations_without_a_provider(self) -> None:
+        op_id = self.controller._run_pack_prerun(self.task)
+
+        op = self.controller.pack_store.get_operation(op_id)
+        self.assertEqual(op["type"], "verify")
+        self.assertEqual(op["result"], "completed")
+        bundle = Path(self.task["artifact_dir"]) / "prerun" / "1" / "bundle" / "observations"
+        sealed = sorted(bundle.glob("*.json"))
+        self.assertTrue(sealed, "prerun sealed no observation for the reviewer to read")
+
+    def test_prerun_charges_no_provider_call_budget(self) -> None:
+        """§3.4 counts provider calls; verification must not starve dispatch."""
+        before = self.controller.pack_store.get_pack(self.pack_id)["calls_reserved"]
+        self.controller._run_pack_prerun(self.task)
+        self.assertEqual(
+            self.controller.pack_store.get_pack(self.pack_id)["calls_reserved"], before)
+
+    def test_consuming_the_prerun_moves_the_pack_to_review(self) -> None:
+        self.controller._run_pack_prerun(self.task)
+        self.controller._advance_pack(self.task)
+        self.assertEqual(self.controller.pack_store.get_pack(self.pack_id)["state"],
+                         "reviewing(1)")
+
+    def test_the_run_loop_runs_prerun_itself_and_dispatches_no_provider(self) -> None:
+        """Calling the method proves nothing about whether the loop uses it."""
+        class Refuse:
+            def run(self, *args, **kwargs):
+                raise AssertionError("a provider was dispatched for prerun")
+
+        self.controller.runner = Refuse()
+        calls: list[str] = []
+        real = self.controller._run_pack_prerun
+        self.controller._run_pack_prerun = lambda task: (calls.append("prerun"), real(task))[1]
+        self.controller.conn.execute(
+            "UPDATE tasks SET status='queued',current_stage='prerun' WHERE id=?",
+            (self.pack_id,))
+        self.controller.conn.commit()
+
+        self.controller.run_until_stop(self.pack_id)
+
+        # The runner raises if it is ever asked to run, so reaching here at all
+        # means no provider was dispatched for prerun.
+        self.assertEqual(calls, ["prerun"], "the loop did not run prerun in-engine")
+        self.assertEqual(self.controller.pack_store.get_pack(self.pack_id)["state"],
+                         "reviewing(1)", "prerun ran but the pack did not move on")
+
+    def test_an_unusable_run_reports_unknown_rather_than_a_status(self) -> None:
+        """A run that could not vouch for itself has no status to claim."""
+        import json as _json
+
+        target = self.controller._pack_target(self.pack_id)
+        original = self.controller._pack_target
+        def broken(_pack_id):
+            class Broken:
+                root = target.root
+                def verify(self, plan_path, out_path):
+                    raise RuntimeError("verify crashed")
+            return Broken()
+        self.controller._pack_target = broken
+        try:
+            self.controller._run_pack_prerun(self.task)
+        finally:
+            self.controller._pack_target = original
+
+        bundle = Path(self.task["artifact_dir"]) / "prerun" / "1" / "bundle" / "observations"
+        sealed = _json.loads(sorted(bundle.glob("*.json"))[0].read_text())
+        self.assertEqual(sealed["acquisition"]["status"], "UNKNOWN")

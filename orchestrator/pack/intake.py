@@ -31,6 +31,10 @@ def unsatisfied_placeholders(template: Sequence[str], params: dict[str, Any]) ->
     return needed - set(params)
 
 
+CONTRACT_RECORD = "contract"
+TARGET_RECORD = "target_dir"
+
+
 def assemble_contract(*, target: TargetPackage, change: str, pack_id: str,
                       manifest: dict[str, Any], requirement: str,
                       manifest_sha256_value: str, base_revision: str,
@@ -231,5 +235,39 @@ def start_packs(store: PackStore, *, target: TargetPackage, change_dir: Path,
         store.update_pack(pack["id"], contract_hash=digest,
                           contract_version=pack["contract_version"],
                           return_point="claimed")
+        # The contract body, not only its hash: every later stage works from it,
+        # and a hash alone cannot be read back.  Keyed by the hash so a revised
+        # contract is a new record rather than an overwrite of the one a sealed
+        # call was bound to.
+        store.add_record(f"CONTRACT-{digest.split(':', 1)[1][:16]}", CONTRACT_RECORD,
+                         {"contract_hash": digest, "contract": contract,
+                          # The probed environment, not only its digest: a later
+                          # stage that re-probed would get a different answer,
+                          # which is the drift the digest exists to detect.
+                          "environment": environment},
+                         pack_id=pack["id"])
         started.append({"pack": pack["id"], "contract_hash": digest, "contract": contract})
     return started
+
+
+def current_record(store: PackStore, pack_id: str) -> dict[str, Any] | None:
+    """The whole contract record - contract and the environment it was built on."""
+    pack = store.get_pack(pack_id)
+    for record in store.records_of_kind(CONTRACT_RECORD, pack_id):
+        if not record["revoked"] and record["payload"]["contract_hash"] == pack["contract_hash"]:
+            return record["payload"]
+    return None
+
+
+def current_contract(store: PackStore, pack_id: str) -> dict[str, Any] | None:
+    """The contract the pack is running under right now, or None.
+
+    Matched on the pack's own `contract_hash` rather than "the newest record":
+    a revision that has been recorded but not adopted must not be handed to a
+    stage still bound to the previous one.
+    """
+    pack = store.get_pack(pack_id)
+    for record in store.records_of_kind(CONTRACT_RECORD, pack_id):
+        if not record["revoked"] and record["payload"]["contract_hash"] == pack["contract_hash"]:
+            return record["payload"]["contract"]
+    return None

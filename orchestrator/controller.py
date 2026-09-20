@@ -293,6 +293,14 @@ class Controller:
                 return self.status(task_id)
             profile = self._profile_for(task)
             stage = profile.stage(task["current_stage"])
+            if self._is_pack_v1(task) and stage.name == "prerun":
+                # Ahead of the provider preflight, because prerun involves no
+                # provider: it runs the target's own verify CLI, and asking a
+                # model to report what the checks said is exactly the
+                # transcription sealed observations exist to remove.
+                self._run_pack_prerun(task)
+                self._advance_pack(task)
+                continue
             if not stage.terminal:
                 try:
                     stage_runner = self._execution_runner_for(task, stage)
@@ -1531,6 +1539,117 @@ class Controller:
             return None
         return _json.loads(self.pack_blobs().get(record["payload"]["snapshot_sha256"]))
 
+    def _pack_target(self, pack_id: str) -> Any:
+        from .pack.intake import TARGET_RECORD
+        from .pack.target import load_target
+
+        record = self.pack_store.get_record(f"TARGET-{pack_id}")
+        if record is None or record["revoked"]:
+            raise ControllerError(f"{pack_id} has no target package recorded")
+        return load_target(Path(record["payload"]["path"]))
+
+    def _run_pack_prerun(self, task: sqlite3.Row) -> str:
+        """Run the contract's prerun checks against the frozen candidate.
+
+        No provider is involved, so no call budget is reserved: §3.4 counts
+        provider calls, and charging a verify run against that budget would let
+        verification starve the dispatches it exists to inform.
+        """
+        from .pack import verify_runner
+        from .pack.blobs import BlobStore, seal_observation
+        from .pack.intake import current_record
+
+        pack_id = task["id"]
+        pack = self.pack_store.get_pack(pack_id)
+        record = current_record(self.pack_store, pack_id)
+        if record is None:
+            raise ControllerError(f"{pack_id} has no contract to verify against")
+        contract, environment = record["contract"], record.get("environment", {})
+        target = self._pack_target(pack_id)
+        attempt = self.pack_store.current_attempt(pack_id)
+        output_id = pack["k_last"]
+        frozen = self.pack_store.get_output(pack_id, output_id)
+
+        op_id = f"PRERUN-{pack_id}-{output_id}-{uuid.uuid4().hex[:8]}"
+        self.pack_store.create_operation(op_id, pack_id, type="verify", stage="prerun",
+                                         attempt_id=attempt["attempt_id"] if attempt else None)
+        base = Path(task["artifact_dir"]) / "prerun" / f"{output_id}"
+        bundle = base / "bundle"
+        blobs = BlobStore(self.home / "pack-blobs")
+        checks = {check["check_id"]: check for check in contract["approved_checks"]}
+
+        observations = []
+        for index, requested in enumerate(contract["prerun_checks"], start=1):
+            check = checks.get(requested["check_id"])
+            if check is None:
+                raise ControllerError(
+                    f"{pack_id}: prerun names {requested['check_id']!r}, which the"
+                    " contract does not approve")
+            artifacts_root = base / f"artifacts-{index}"
+            out_path = base / f"envelope-{index}.json"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            plan = verify_runner.build_plan(
+                pack_id=pack_id, change=pack["change"], target_id=pack["target_id"],
+                contract_version=pack["contract_version"], operation_id=op_id,
+                attempt_id=attempt["attempt_id"] if attempt else "", 
+                candidate_fingerprint=frozen["candidate_fingerprint"] if frozen else "",
+                check=check, params=requested.get("params", {}),
+                subject={"kind": "obligation", "id": check["check_id"]},
+                workspace=Path(task["workspace_dir"]),
+                artifacts_root=artifacts_root,
+                target_package_digest=environment.get("target_package_digest", ""),
+                target_package_version=environment.get("target_package_version", ""),
+                tool_versions=environment.get("tool_versions", {}),
+                assigned_resources=[])
+            plan_path = base / f"plan-{index}.json"
+            plan_path.write_text(json.dumps(plan, sort_keys=True), encoding="utf-8")
+
+            def spawn(_plan, _plan_path=plan_path, _out=out_path):
+                try:
+                    target.verify(_plan_path, _out)
+                except Exception as exc:  # transport failure is a result, not a crash
+                    return {"exit_code": 1, "timed_out": False, "signal": None,
+                            "error": str(exc)}
+                return {"exit_code": 0, "timed_out": False, "signal": None}
+
+            envelope, receipt = verify_runner.run_verify(
+                plan=plan, artifacts_root=artifacts_root, out_path=out_path, spawn=spawn)
+            verdict = verify_runner.decide_usable(
+                envelope=envelope or {}, plan=plan, receipt=receipt,
+                contract_tool_versions=environment.get("tool_versions", {}),
+                contract_package_digest=environment.get("target_package_digest", ""),
+                contract_package_version=environment.get("target_package_version", ""),
+                artifacts_root=artifacts_root,
+                # No managed resources in the prerun path yet, so there is
+                # nothing released and nothing for the engine to clean up;
+                # declaring them empty is the honest input, not a stub.
+                verified_release={}, engine_cleanup={})
+            subject = {"kind": "obligation", "id": check["check_id"]}
+            observations.append(seal_observation(
+                blobs, bundle, f"OBS-{index}",
+                {"kind": "verify",
+                 "candidate_fingerprint": plan["candidate_fingerprint"],
+                 "contract_hash": pack["contract_hash"],
+                 "operation_id": op_id,
+                 "invocation_id": plan["invocation_id"],
+                 "result_kind": plan["result_kind"],
+                 # What the check reported, or UNKNOWN when the envelope is not
+                 # usable: an unusable run has no status to claim.
+                 "status": (envelope or {}).get("status") if verdict["usable"] else "UNKNOWN",
+                 "subject": subject,
+                 "produced_by": "engine"},
+                envelope, usable=bool(verdict["usable"]), subject=subject))
+
+        # Bound like any other call: consumption is decided from the binding,
+        # and a result with none cannot be told apart from one that belongs to
+        # a superseded output.
+        self.pack_store.update_operation(
+            op_id, result="completed",
+            call_binding={"stage": "prerun", "attempt_id": attempt["attempt_id"] if attempt else None,
+                          "output_id": output_id, "review_round": None,
+                          "contract_hash": pack["contract_hash"]})
+        return op_id
+
     def _open_pack_operation(self, task: sqlite3.Row, run_token: str,
                              stage: Any) -> str | None:
         """Reserve the call's budget and record its operation, before the spawn.
@@ -1638,6 +1757,13 @@ class Controller:
             return
         if op.get("stage") == "apply":
             self._freeze_pack_candidate(task, pack_id, op)
+            return
+        if op.get("stage") == "prerun":
+            # The observations are sealed; what they say is the reviewer's to
+            # judge, so a failing check moves the pack on rather than stopping
+            # it - a failure is evidence, not a transport error.
+            self.pack_store.update_pack(
+                pack_id, state=f"reviewing({self.pack_store.get_pack(pack_id)['k_last']})")
             return
         if op.get("stage") != "review":
             return

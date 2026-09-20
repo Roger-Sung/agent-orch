@@ -19,7 +19,7 @@ from typing import Any
 from ..execution import SCHEMA_VERSION, render_plan, resolve_request
 from ..profile import Profile, load_profile
 from . import revocation
-from .intake import start_packs
+from .intake import TARGET_RECORD, start_packs
 from .target import load_target
 
 # Which pack role each stage of the pack-v1 profile is dispatched under.
@@ -104,6 +104,11 @@ def launch_packs(controller: Any, *, target_dir: Path, change_dir: Path,
             launched.append({"pack": pack_id, "task": None,
                              "blocked_on": record.get("blocked_on", [])})
             continue
+        # Where the target package lives, so a later stage can load the same
+        # one: the engine knows a target only by the path it was given.
+        controller.pack_store.add_record(
+            f"TARGET-{pack_id}", TARGET_RECORD,
+            {"path": str(Path(target_dir).resolve())}, pack_id=pack_id)
         request = build_request(profile, change=Path(change_dir).name, pack_id=pack_id,
                                 producer_model=producer_model,
                                 reviewer_model=reviewer_model, effort=effort)
