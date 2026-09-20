@@ -85,7 +85,30 @@ def _input_text(record: dict[str, Any], plan_frame: str) -> str:
             "The pack entry the contract's `plan_digest` and `manifest_sha256`\n"
             "stand for. Every obligation the contract lists by id is defined\n"
             "here, with the task that claims it, its selector and its source.\n\n"
-            "```json\n" + slice_json + "\n```\n")
+            "```json\n" + slice_json + "\n```\n\n"
+            + _how_checks_resolve(record))
+
+
+def _how_checks_resolve(record: dict[str, Any]) -> str:
+    """Where an approved check's argv actually resolves.
+
+    `argv_template` is relative to the *target package* root, not the
+    workspace: the engine runs every target CLI with that as its working
+    directory. A contract that does not say so reads as naming a path in the
+    workspace that is not there, which a real review refused over - and it was
+    right to, because nothing it had been given said otherwise.
+    """
+    environment = record.get("environment") or {}
+    return (
+        "## How the approved checks resolve\n\n"
+        "Each `approved_checks[].argv_template` is executed by the target\n"
+        "package, with the package root as its working directory - not the\n"
+        "workspace. A path such as `tests/check.sh` is supplied by the package\n"
+        "below and is not expected to exist in the workspace, and the producer\n"
+        "neither needs nor is permitted to create it.\n\n"
+        f"- target: `{record.get('target_id')}`\n"
+        f"- package version: `{environment.get('target_package_version')}`\n"
+        f"- package digest: `{environment.get('target_package_digest')}`\n")
 
 
 def launch_packs(controller: Any, *, target_dir: Path, change_dir: Path,

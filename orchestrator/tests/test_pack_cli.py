@@ -271,6 +271,12 @@ class PackStartTest(unittest.TestCase):
         self.assertIn("Manifest slice", text)
         self.assertIn('"obligations"', text)
         self.assertIn("Manifest sha256: sha256:", text)
+        # And where an approved check resolves: `argv_template` is relative to
+        # the target package, not the workspace. A real review refused a
+        # contract over this, reading it as a workspace path that was missing.
+        self.assertIn("How the approved checks resolve", text)
+        self.assertIn("package root as its working directory", text)
+        self.assertIn("package digest:", text)
 
     def test_enqueue_hands_the_pack_to_the_daemon_under_its_own_id(self) -> None:
         """A task written straight to the database is one the daemon never sees."""

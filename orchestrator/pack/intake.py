@@ -267,7 +267,9 @@ def start_packs(store: PackStore, *, target: TargetPackage, change_dir: Path,
                         # plan backs an obligation while seeing the obligation
                         # only as an id and the plan only as a hash.
                         "manifest_slice": pack,
-                        "manifest_sha256": manifest_sha})
+                        "manifest_sha256": manifest_sha,
+                        "target_id": target.target_id,
+                        "environment": environment})
     return started
 
 
