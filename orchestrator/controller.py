@@ -1539,6 +1539,50 @@ class Controller:
             return None
         return _json.loads(self.pack_blobs().get(record["payload"]["snapshot_sha256"]))
 
+    def _claimed_attempt(self, pack_id: str, stage_name: str) -> dict[str, Any] | None:
+        """The work attempt a producer stage writes under, created if absent.
+
+        A producer dispatched without one freezes nothing, so the candidate is
+        never recorded and the pack stays where it was - which reads as the
+        stage having produced nothing and dispatches it again. The contract
+        review deliberately has none: it predates the attempt (§2.7).
+        """
+        attempt = self.pack_store.current_attempt(pack_id)
+        if attempt is not None or stage_name not in {"apply", "repair"}:
+            return attempt
+        from .pack.intake import current_contract
+
+        contract = current_contract(self.pack_store, pack_id)
+        pack = self.pack_store.get_pack(pack_id)
+        previous = self.pack_store.get_output(pack_id, pack["k_last"])
+        attempt_id = f"WA-{pack_id}-{uuid.uuid4().hex[:8]}"
+        self.pack_store.create_attempt(
+            attempt_id, pack_id,
+            base_revision=(contract or {}).get("base_revision", ""),
+            candidate_input=previous["candidate_fingerprint"] if previous else None,
+            next_output_id=pack["k_last"] + 1)
+        return self.pack_store.get_attempt(attempt_id)
+
+    def _settle_contract_review(self, task: sqlite3.Row, pack_id: str,
+                                machine: PackMachine, op: dict[str, Any]) -> None:
+        """Where a contract review sends the pack (STATE-TABLE §406).
+
+        Findings go back to the contract's author and the task stops; a pass
+        returns the pack to the point it was contracted from. Without this the
+        pack sat in `contracting` with a consumed pass and the loop re-issued
+        the same review until the call budget stopped it.
+        """
+        receipt = self._pack_sealed_receipt(task, op)
+        envelope = (receipt or {}).get("envelope") or {}
+        self.pack_store.bump(pack_id, "review_seq")
+        if envelope.get("contract_findings"):
+            machine.enter_hold(pack_id, "contract_hold", return_point="contracting",
+                               alive=lambda o: False)
+            return
+        pack = self.pack_store.get_pack(pack_id)
+        self.pack_store.update_pack(pack_id, state=pack["return_point"] or "claimed",
+                                    hold_reason=None)
+
     def _pack_target(self, pack_id: str) -> Any:
         from .pack.intake import TARGET_RECORD
         from .pack.target import load_target
@@ -1675,10 +1719,32 @@ class Controller:
             # one, §3.4's own defaults apply rather than no limit at all.
             refused = machine.reserve_dispatch(pack_id, budget_policy=None)
             if refused is None:
+                pack = self.pack_store.get_pack(pack_id)
+                attempt = self._claimed_attempt(pack_id, stage.name)
                 self.pack_store.create_operation(
                     run_token, pack_id, type="provider", stage=stage.name,
+                    attempt_id=attempt["attempt_id"] if attempt else None,
                     reserved_counters={"call_budget": 1},
                 )
+                # Bound at dispatch, not at commit: consumption is decided by
+                # comparing this against the pack, so a call with no binding
+                # can only ever read as stale - and a stale contract review is
+                # re-dispatched, which is how one pack spent its whole call
+                # budget on the same round.
+                # A result is only consumable while the pack is in the state
+                # its stage runs in (§3.0b). Dispatching without moving the
+                # pack there leaves every result deferred for ever, which reads
+                # as the stage having produced nothing and dispatches it again.
+                if stage.name in {"apply", "repair"} and attempt is not None:
+                    self.pack_store.update_pack(
+                        pack_id, state=f"producing({attempt['next_output_id']})")
+                self.pack_store.update_operation(run_token, call_binding={
+                    "stage": stage.name,
+                    "attempt_id": attempt["attempt_id"] if attempt else None,
+                    "output_id": pack["k_last"] or None,
+                    "review_round": pack["review_round"] or None,
+                    "contract_hash": pack["contract_hash"],
+                })
             self.conn.execute("COMMIT")
         except BaseException:
             if self.conn.in_transaction:
@@ -1755,7 +1821,13 @@ class Controller:
         """
         if outcome != PACK_CONSUME:
             return
-        if op.get("stage") == "apply":
+        if op.get("stage") == "contract_review":
+            self._settle_contract_review(task, pack_id, machine, op)
+            return
+        if op.get("stage") in {"apply", "repair"}:
+            # Both produce a candidate. Freezing only `apply` left every repair
+            # round unfrozen, so the pack never advanced and the round was
+            # dispatched again.
             self._freeze_pack_candidate(task, pack_id, op)
             return
         if op.get("stage") == "prerun":

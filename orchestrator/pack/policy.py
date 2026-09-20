@@ -93,6 +93,9 @@ class PackPolicy:
 
         if task_status is None:
             return
+        # A repair round is already on the `repair` stage when it is dispatched,
+        # because `repair_pending` maps to it; the producing state it moves into
+        # afterwards is never re-derived, so there is nothing here to special-case.
         stage = current_stage or self.stage_for_state(to_state)
         assignments = ["status=?", "stop_reason=?", "updated_at=?",
                        "revision=revision+1", "transitions_count=transitions_count+1"]
