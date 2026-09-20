@@ -264,3 +264,82 @@ class PackStartTest(unittest.TestCase):
         self.assertIn("Dispatch contract", text)
         self.assertIn("files_writable", text)
         self.assertIn("Contract hash: sha256:", text)
+
+    def test_enqueue_hands_the_pack_to_the_daemon_under_its_own_id(self) -> None:
+        """A task written straight to the database is one the daemon never sees."""
+        import json as _json
+
+        self.assertEqual(main([
+            "pack-start", "--target-dir", str(self.TARGET),
+            "--change-dir", str(self.TARGET / "change"),
+            "--workspace", str(self.workspace), "--base-revision", "abc",
+            "--producer-model", "claude-opus-5", "--reviewer-model", "gpt-6-astra",
+            "--enqueue"]), 0)
+
+        requests = sorted((self.home / "inbox").glob("*.json"))
+        self.assertEqual(len(requests), 1)
+        request = _json.loads(requests[0].read_text())
+        self.assertEqual(request["action"], "run")
+        # The controller looks a pack up by its task id, so the request has to
+        # name it rather than let the daemon mint a request-id task.
+        self.assertEqual(request["task_id"], "P1")
+        self.assertTrue(Path(request["input"]).is_file())
+        self.assertTrue(Path(request["profile"]).is_file())
+
+        from orchestrator.controller import Controller
+        controller = Controller(self.home, runner=None)
+        self.addCleanup(controller.close)
+        self.assertEqual(
+            list(controller.conn.execute("SELECT id FROM tasks")), [],
+            "enqueueing must leave the task for the daemon to create")
+
+
+@unittest.skipUnless((Path(__file__).resolve().parents[2] / "targets" / "_fixture_min"
+                      / "profile.yaml").is_file(), "the fixture target is not present")
+class DaemonRunsTheNamedTaskTest(unittest.TestCase):
+    """The daemon has to honour the id the request names.
+
+    Checking that `pack-start` wrote a well-formed request says nothing about
+    whether the daemon uses the id in it; minting its own would leave the
+    controller looking up a pack that does not exist.
+    """
+
+    TARGET = Path(__file__).resolve().parents[2] / "targets" / "_fixture_min"
+
+    def test_a_run_request_creates_the_task_under_the_id_it_names(self) -> None:
+        import json as _json
+        import uuid as _uuid
+
+        from orchestrator import daemon
+        from orchestrator.controller import Controller
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name) / "home"
+        workspace = Path(tmp.name) / "ws"
+        workspace.mkdir(parents=True)
+        controller = Controller(home, runner=None)
+        self.addCleanup(controller.close)
+        # Stop at the first dispatch: the id is settled by then.
+        controller.run_until_stop = lambda task_id: controller.status(task_id)
+
+        request_id = str(_uuid.uuid4())
+        request = {
+            "request_id": request_id, "action": "run", "type": "apply",
+            "profile": str(Path(__file__).resolve().parents[1] / "profiles" / "pack_v1.yaml"),
+            "input": str(Path(tmp.name) / "input.md"),
+            "workspace": str(workspace), "task_id": "P1",
+        }
+        Path(request["input"]).write_text("# pack input\n", encoding="utf-8")
+        processing = home / "processing"
+        processed = home / "processed"
+        processing.mkdir(parents=True, exist_ok=True)
+        processed.mkdir(parents=True, exist_ok=True)
+        claimed = processing / f"{request_id}.json"
+        claimed.write_text(_json.dumps(request), encoding="utf-8")
+
+        daemon._handle(controller, claimed, processed)
+
+        ids = [row["id"] for row in controller.conn.execute("SELECT id FROM tasks")]
+        self.assertEqual(ids, ["P1"],
+                         "the daemon minted its own id, so the pack is unreachable")

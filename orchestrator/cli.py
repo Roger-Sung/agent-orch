@@ -79,6 +79,9 @@ def build_parser() -> argparse.ArgumentParser:
     pack_start.add_argument("--producer-model", required=True)
     pack_start.add_argument("--reviewer-model", required=True)
     pack_start.add_argument("--effort", default="medium", choices=["low", "medium", "high"])
+    pack_start.add_argument("--enqueue", action="store_true",
+                            help="hand each pack to the daemon instead of creating"
+                                 " the task in place; the daemon reads only its inbox")
     pack_start.add_argument("--json", action="store_true")
 
     pack_resolve = subparsers.add_parser(
@@ -350,7 +353,8 @@ def main(argv: list[str] | None = None) -> int:
                 controller, target_dir=args.target_dir, change_dir=args.change_dir,
                 workspace=args.workspace, profile_path=args.profile,
                 base_revision=args.base_revision, producer_model=args.producer_model,
-                reviewer_model=args.reviewer_model, effort=args.effort)
+                reviewer_model=args.reviewer_model, effort=args.effort,
+                enqueue=args.enqueue)
             controller.conn.commit()
         finally:
             controller.close()

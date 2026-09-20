@@ -110,11 +110,15 @@ def _handle(controller: Controller, req_path: Path, processed: Path) -> None:
             input_path = Path(req["input"])
             print(f"[orchestrator-daemon] picked up {req_path.name}: type={task_type}", flush=True)
             workspace = req.get("workspace")
+            # A pack-v1 request names its own id, because the controller looks
+            # a pack up by its task id; anything else leaves the machine
+            # querying a pack that does not exist.  Everything else keeps the
+            # request id, as before.
             task_id = controller.submit(
                 task_type,
                 profile,
                 input_path,
-                task_id=request_id,
+                task_id=req.get("task_id") or request_id,
                 operation_id=request_id,
                 workspace=Path(workspace) if workspace else None,
             )

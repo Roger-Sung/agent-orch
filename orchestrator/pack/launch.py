@@ -13,6 +13,7 @@ not exist.
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -82,8 +83,14 @@ def _input_text(record: dict[str, Any], plan_frame: str) -> str:
 def launch_packs(controller: Any, *, target_dir: Path, change_dir: Path,
                  workspace: Path, profile_path: Path, base_revision: str,
                  producer_model: str, reviewer_model: str,
-                 effort: str = "medium") -> list[dict[str, Any]]:
-    """Create every pack of a change, and a task for each that is ready to run."""
+                 effort: str = "medium", enqueue: bool = False) -> list[dict[str, Any]]:
+    """Create every pack of a change, and hand each ready one to a runner.
+
+    `enqueue` decides which runner.  The daemon only ever reads its inbox, so a
+    task written straight into the database is one nothing will pick up; with
+    `enqueue` the request goes to the inbox instead and the daemon creates the
+    task itself, under the pack's id.
+    """
     target = load_target(Path(target_dir))
     profile = load_profile(Path(profile_path))
     intake_dir = Path(controller.home) / "pack-intake"
@@ -115,8 +122,21 @@ def launch_packs(controller: Any, *, target_dir: Path, change_dir: Path,
         plan = resolve_request(request, profile)
         path = intake_dir / f"{pack_id}.md"
         path.write_text(_input_text(record, render_plan(plan)), encoding="utf-8")
-        controller.submit(profile.type, Path(profile_path), path,
-                          task_id=pack_id, workspace=Path(workspace))
+        if enqueue:
+            request_id = str(uuid.uuid4())
+            request = {"request_id": request_id, "action": "run", "type": profile.type,
+                       "profile": str(Path(profile_path).resolve()), "input": str(path),
+                       "workspace": str(Path(workspace).resolve()), "task_id": pack_id}
+            inbox = Path(controller.home) / "inbox"
+            inbox.mkdir(parents=True, exist_ok=True)
+            # Written elsewhere and moved in: the daemon polls the directory, so
+            # a partially written file could otherwise be claimed mid-write.
+            scratch = intake_dir / f"{request_id}.json"
+            scratch.write_text(json.dumps(request), encoding="utf-8")
+            scratch.replace(inbox / f"{request_id}.json")
+        else:
+            controller.submit(profile.type, Path(profile_path), path,
+                              task_id=pack_id, workspace=Path(workspace))
         launched.append({"pack": pack_id, "task": pack_id,
                          "contract_hash": record["contract_hash"]})
     return launched
