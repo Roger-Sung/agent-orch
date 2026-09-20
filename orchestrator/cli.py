@@ -79,6 +79,9 @@ def build_parser() -> argparse.ArgumentParser:
     pack_start.add_argument("--producer-model", required=True)
     pack_start.add_argument("--reviewer-model", required=True)
     pack_start.add_argument("--effort", default="medium", choices=["low", "medium", "high"])
+    pack_start.add_argument("--pack", action="append", dest="only",
+                            help="only hand these packs to a runner; every pack of"
+                                 " the change is still created, so dependencies bind")
     pack_start.add_argument("--enqueue", action="store_true",
                             help="hand each pack to the daemon instead of creating"
                                  " the task in place; the daemon reads only its inbox")
@@ -354,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
                 workspace=args.workspace, profile_path=args.profile,
                 base_revision=args.base_revision, producer_model=args.producer_model,
                 reviewer_model=args.reviewer_model, effort=args.effort,
-                enqueue=args.enqueue)
+                enqueue=args.enqueue, only=args.only)
             controller.conn.commit()
         finally:
             controller.close()

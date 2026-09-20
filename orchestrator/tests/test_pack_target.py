@@ -466,3 +466,41 @@ class ContractCarriesDependencyRevisionsTest(unittest.TestCase):
 
     def test_absent_dependencies_stay_empty(self) -> None:
         self.assertEqual(self._assemble(None)["dependency_revisions"], {})
+
+
+@unittest.skipUnless(HAS_FIXTURE,
+                     "the _fixture_min target package is not present")
+class IntakeIsRerunnableTest(unittest.TestCase):
+    """A pack blocked on an upstream has to be contractable once it lands.
+
+    Frontier automation is out of scope for this stage, so an operator re-runs
+    intake after accepting the upstream. Creating the pack again would collide,
+    and skipping it would leave a pack that can never be contracted at all.
+    """
+
+    def setUp(self) -> None:
+        from orchestrator.pack.target import load_target
+
+        self.store = new_store()
+        self.target = load_target(TARGET_ROOT)
+
+    def _start(self):
+        return start_packs(self.store, target=self.target,
+                           change_dir=TARGET_ROOT / "change", base_revision="abc")
+
+    def test_re_running_intake_does_not_collide(self) -> None:
+        first = self._start()
+        again = self._start()
+        self.assertEqual([r["pack"] for r in first], [r["pack"] for r in again])
+        self.assertTrue(again[0].get("already_started"),
+                        "a contracted pack must not be re-contracted")
+
+    def test_an_underway_pack_keeps_its_contract(self) -> None:
+        pack_id = self._start()[0]["pack"]
+        before = self.store.get_pack(pack_id)["contract_hash"]
+        self.store.update_pack(pack_id, state="producing(1)")
+        self._start()
+        after = self.store.get_pack(pack_id)
+        self.assertEqual(after["contract_hash"], before)
+        self.assertEqual(after["state"], "producing(1)",
+                         "re-running intake moved a pack a sealed call is bound to")

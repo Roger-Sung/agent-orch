@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from ..execution import SCHEMA_VERSION, render_plan, resolve_request
 from ..profile import Profile, load_profile
@@ -83,7 +83,8 @@ def _input_text(record: dict[str, Any], plan_frame: str) -> str:
 def launch_packs(controller: Any, *, target_dir: Path, change_dir: Path,
                  workspace: Path, profile_path: Path, base_revision: str,
                  producer_model: str, reviewer_model: str,
-                 effort: str = "medium", enqueue: bool = False) -> list[dict[str, Any]]:
+                 effort: str = "medium", enqueue: bool = False,
+                 only: Sequence[str] | None = None) -> list[dict[str, Any]]:
     """Create every pack of a change, and hand each ready one to a runner.
 
     `enqueue` decides which runner.  The daemon only ever reads its inbox, so a
@@ -105,6 +106,17 @@ def launch_packs(controller: Any, *, target_dir: Path, change_dir: Path,
     launched: list[dict[str, Any]] = []
     for record in started:
         pack_id = record["pack"]
+        if only and pack_id not in only:
+            # Every pack of the change is still created - a dependency cannot
+            # bind to a pack row that does not exist - but only the named ones
+            # are handed to a runner.
+            launched.append({"pack": pack_id, "task": None, "skipped": True})
+            continue
+        if record.get("already_started"):
+            launched.append({"pack": pack_id, "task": pack_id,
+                             "contract_hash": record["contract_hash"],
+                             "already_started": True})
+            continue
         if record.get("contract") is None:
             # Blocked on an upstream that has not been accepted: contracting it
             # now would bind a revision that does not exist yet.

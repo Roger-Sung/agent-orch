@@ -209,14 +209,25 @@ def start_packs(store: PackStore, *, target: TargetPackage, change_dir: Path,
 
     started: list[dict[str, Any]] = []
     for pack in manifest["packs"]:
+        try:
+            existing = store.get_pack(pack["id"])
+        except KeyError:
+            existing = None
+        if existing is not None and existing["state"] != "blocked_deps":
+            # Already contracted and under way: re-running intake must not
+            # re-contract a pack a sealed call is bound to.
+            started.append({"pack": pack["id"], "contract_hash": existing["contract_hash"],
+                            "contract": None, "already_started": True})
+            continue
         bound, missing = dependency_revisions(store, pack)
         if missing:
             # Not contracted at all: there is nothing to review until the
             # upstream is accepted, and contracting now would bind a revision
             # that does not exist yet.
-            store.create_pack(pack["id"], target_id=target.target_id,
-                              change=change_dir.name, state="blocked_deps",
-                              host_boot_id=host_boot_id)
+            if existing is None:
+                store.create_pack(pack["id"], target_id=target.target_id,
+                                  change=change_dir.name, state="blocked_deps",
+                                  host_boot_id=host_boot_id)
             store.update_pack(pack["id"],
                               blockers=[{"reason": "blocked_deps", "packs": sorted(missing)}])
             started.append({"pack": pack["id"], "contract_hash": None, "contract": None,
@@ -230,9 +241,13 @@ def start_packs(store: PackStore, *, target: TargetPackage, change_dir: Path,
             dependencies=bound,
         )
         digest = contract_hash(contract)
-        store.create_pack(pack["id"], target_id=target.target_id, change=change_dir.name,
-                          state="contracting", host_boot_id=host_boot_id)
-        store.update_pack(pack["id"], contract_hash=digest,
+        try:
+            store.get_pack(pack["id"])
+        except KeyError:
+            store.create_pack(pack["id"], target_id=target.target_id,
+                              change=change_dir.name, state="contracting",
+                              host_boot_id=host_boot_id)
+        store.update_pack(pack["id"], state="contracting", contract_hash=digest,
                           contract_version=pack["contract_version"],
                           return_point="claimed")
         # The contract body, not only its hash: every later stage works from it,
