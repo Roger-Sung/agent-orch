@@ -2591,6 +2591,8 @@ class Controller:
             return self.runner
         if type(self.runner) is not SubprocessRunner:
             raise ExecutionConfigError("custom runner cannot silently ignore execution plan")
+        if plan.policy_version == "pack-v1":
+            return self._pack_stage_runner(task, stage, plan)
         runner = ConfiguredRunner(plan.stages[stage.name], plan.digest)
         if runner.choice.role == "reviewer":
             context = review_context(self._read_verified_input(task["id"]))
@@ -2601,6 +2603,35 @@ class Controller:
                 raise ExecutionConfigError("review session binding missing or belongs to another series")
             runner.bind_session(self.home, plan.spec_series_id, expected)
         return runner
+
+    def _pack_stage_runner(self, task: sqlite3.Row, stage: Any, plan: Any) -> Any:
+        """The launcher for one pack stage, per the §3.1 role matrix.
+
+        `configured_command` picks its argv from the *role name*, which encodes
+        execution-v1's executor=codex / reviewer=claude. pack-v1 inverts that,
+        so reusing it hands a Claude producer Codex's argv - it dies on
+        `--sandbox` - and hands a Codex reviewer the *executor* argv, which is
+        `danger-full-access`: write access to the tree the reviewer is supposed
+        to be unable to touch.
+        """
+        from .execution_runner import provider_command
+        from .pack.dispatch import PackRunner
+        from .pack.provider_adapters import ClaudeAdapter, CodexAdapter
+
+        choice = plan.stages[stage.name]
+        workspace = self._workspace_for(task)
+        binary = provider_command(choice.provider)[0]
+        if choice.provider == "claude":
+            adapter = ClaudeAdapter(binary=binary, model=choice.model)
+            argv = adapter.command(cwd=str(workspace))
+        else:
+            last_message = (Path(task["artifact_dir"]) / "pack-final"
+                            / f"{stage.name}.txt")
+            last_message.parent.mkdir(parents=True, exist_ok=True)
+            adapter = CodexAdapter(binary=binary, model=choice.model,
+                                   codex_home=Path.home() / ".codex")
+            argv = adapter.command(cwd=str(workspace), last_message=str(last_message))
+        return PackRunner(argv)
 
     def _provider_preflight(self, owner: str | None, *, runner: Any = None) -> ProviderPreflightResult:
         if owner is None:
