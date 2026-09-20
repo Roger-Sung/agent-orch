@@ -20,7 +20,7 @@ from orchestrator.pack import budgets, trees
 from orchestrator.pack.envelopes import REVIEW_BEGIN, REVIEW_END
 from orchestrator.pack.policy import PackPolicy, allowed_outcomes as pack_allowed_outcomes
 from orchestrator.pack.store import PackStore
-from orchestrator.tests.pack_stub import full_review_envelope
+from orchestrator.tests.pack_stub import REVIEW_HEADER, full_review_envelope
 from orchestrator.runner import RunResult
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -766,3 +766,88 @@ class PrerunRunsInEngineTest(unittest.TestCase):
         bundle = Path(self.task["artifact_dir"]) / "prerun" / "1" / "bundle" / "observations"
         sealed = _json.loads(sorted(bundle.glob("*.json"))[0].read_text())
         self.assertEqual(sealed["acquisition"]["status"], "UNKNOWN")
+
+
+class EnvelopeFramingIsFailClosedTest(unittest.TestCase):
+    """A reviewer whose envelope cannot be read must never read as a pass.
+
+    Both halves of this came from one live run. A reasoning provider echoes the
+    envelope while it works, so the full stream carried three marker blocks and
+    framing - which requires exactly one - rejected a perfectly well-formed
+    answer. The contract review then read the absent envelope as "no findings"
+    and sent the pack to a producer, which is the single thing that gate exists
+    to prevent.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.controller = Controller(Path(tmp.name), runner=SequenceRunner([]))
+        self.addCleanup(self.controller.close)
+        self.task_id = self.controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        self.controller._is_pack_v1 = lambda task: True
+        self.store = self.controller.pack_store
+        self.store.create_pack(self.task_id, target_id="acme", change="c1",
+                               state="contracting", host_boot_id=None)
+        self.store.update_pack(self.task_id, return_point="claimed")
+        self.store.create_operation("OP-C", self.task_id, type="provider",
+                                    stage="contract_review")
+        # Bound at dispatch, as the real path does: the receipt records the
+        # binding it was sealed under, and reading it back compares the two.
+        self.binding = {"stage": "contract_review", "attempt_id": None,
+                        "output_id": None, "review_round": None,
+                        "contract_hash": self.store.get_pack(self.task_id)["contract_hash"]}
+        self.store.update_operation("OP-C", call_binding=self.binding)
+        self.controller.conn.commit()
+        self.task = self.controller.conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (self.task_id,)).fetchone()
+
+    def _envelope(self, contract_findings=()):
+        envelope = dict(REVIEW_HEADER)
+        envelope.update({
+            "review_round": None, "candidate_fingerprint": None,
+            "verdict": "needs_repair" if contract_findings else "accepted",
+            "blocked_reason": None, "obligations": {}, "findings": [],
+            "contract_findings": list(contract_findings), "improvements": [],
+            "prior_round": None, "remaining": []})
+        return envelope
+
+    def _result(self, *, stream: str, final: str | None) -> RunResult:
+        return RunResult(0, stream, "contract_pass", "success", "ok",
+                         final_response=final)
+
+    def test_a_stream_with_repeated_markers_still_seals_from_the_final_message(self) -> None:
+        block = (f"{REVIEW_BEGIN}\n{json.dumps(self._envelope())}\n{REVIEW_END}\n"
+                 "ORCHESTRATOR_OUTCOME: contract_pass\n")
+        # What a reasoning provider actually emits: the answer, drafted twice
+        # over, then given once.
+        self.controller._seal_pack_receipt(
+            self.task, "OP-C", self._result(stream=block * 3, final=block))
+        self.assertTrue(self.store.get_operation("OP-C")["receipt_ref"],
+                        "a well-formed final message was rejected because the"
+                        " stream repeated it")
+
+    def test_an_unreadable_contract_review_holds_instead_of_passing(self) -> None:
+        self.controller._seal_pack_receipt(
+            self.task, "OP-C", self._result(stream="no envelope at all", final=None))
+        self.assertIsNone(self.store.get_operation("OP-C")["receipt_ref"])
+
+        self.store.update_operation("OP-C", result="completed")
+        self.controller._advance_pack(self.task)
+
+        pack = self.store.get_pack(self.task_id)
+        self.assertEqual(pack["state"], "hold(contract_invalid)")
+        self.assertNotEqual(pack["state"], "claimed")
+
+    def test_contract_findings_still_hold_the_pack(self) -> None:
+        finding = {"id": "C1", "kind": "missing_source", "obligation_refs": ["O1"],
+                   "source_ref": "proposal.md", "claim": "no source",
+                   "requested_revision": "cite one"}
+        envelope = self._envelope([finding])
+        block = (f"{REVIEW_BEGIN}\n{json.dumps(envelope)}\n{REVIEW_END}\n"
+                 "ORCHESTRATOR_OUTCOME: contract_findings\n")
+        self.controller._seal_pack_receipt(
+            self.task, "OP-C", self._result(stream=block, final=block))
+        self.store.update_operation("OP-C", result="completed")
+        self.controller._advance_pack(self.task)
+        self.assertEqual(self.store.get_pack(self.task_id)["state"], "hold(contract_hold)")

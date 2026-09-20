@@ -1573,9 +1573,16 @@ class Controller:
         the same review until the call budget stopped it.
         """
         receipt = self._pack_sealed_receipt(task, op)
-        envelope = (receipt or {}).get("envelope") or {}
         self.pack_store.bump(pack_id, "review_seq")
-        if envelope.get("contract_findings"):
+        if receipt is None:
+            # Fail closed. This gate exists to keep a bad contract away from a
+            # producer, so a review whose envelope cannot be read is the one
+            # case where passing it on is least defensible - and that is
+            # exactly what reading an absent envelope as "no findings" did.
+            machine.enter_hold(pack_id, "contract_invalid", return_point="contracting",
+                               alive=lambda o: False)
+            return
+        if (receipt.get("envelope") or {}).get("contract_findings"):
             machine.enter_hold(pack_id, "contract_hold", return_point="contracting",
                                alive=lambda o: False)
             return
@@ -1841,6 +1848,14 @@ class Controller:
             return
         receipt = self._pack_sealed_receipt(task, op)
         if receipt is None:
+            # Same fail-closed rule, with the exit §3.4 gives this one: a
+            # redispatch spends one of the reviewer's allowance, and running
+            # out of allowance is a hold rather than a silent retry.
+            refused = machine.use_reviewer_retry(
+                pack_id, stage="review", output_id=self.pack_store.get_pack(pack_id)["k_last"],
+                cause="envelope_invalid", record_id=f"RT-{uuid.uuid4()}")
+            if refused is not None:
+                machine.enter_hold(pack_id, refused, alive=lambda o: False)
             return
         machine.judge_round(
             pack_id, receipt["envelope"],
@@ -1896,8 +1911,14 @@ class Controller:
         A call whose output carries no parseable envelope seals nothing: there
         is no verifiable result to recover, and unknown is the honest answer.
         """
+        # The provider's *final message*, not its whole stream. Framing requires
+        # exactly one marker block, and a reasoning provider echoes the envelope
+        # as it works - the live run saw three copies in one stdout - so parsing
+        # the stream rejects a perfectly well-formed answer. Falling back to the
+        # stream covers providers whose stdout *is* the final message.
+        authoritative = result.final_response or result.output or ""
         try:
-            envelope, outcome = parse_framing(result.output or "")
+            envelope, outcome = parse_framing(authoritative)
         except EnvelopeInvalid:
             return
         try:
