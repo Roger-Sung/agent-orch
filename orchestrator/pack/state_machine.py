@@ -99,6 +99,15 @@ class PackMachine:
         # an attempt on something it did not do.
         if result == "failed" and op["stage"] in {"apply", "repair"} and op["attempt_id"]:
             self.store.bump_attempt(op["attempt_id"], "producer_failures", 1)
+        if result == "failed" and op["stage"] in {"review", "contract_review"}:
+            # A reviewer that failed spends one of its allowance here, because
+            # the envelope path that normally spends it is never reached: there
+            # is no envelope to be invalid.
+            pack = self.store.get_pack(op["pack_id"])
+            self.store.add_record(
+                f"RF-{op_id}", self.RETRY_USED,
+                {"stage": op["stage"], "output_id": pack["k_last"] or None,
+                 "cause": "reviewer_failed"}, pack_id=op["pack_id"])
         fields: dict[str, Any] = {"result": result, "result_ref": result_ref}
         # Only written when supplied.  Both are recorded *before* this call - the
         # binding when the call is dispatched, the receipt reference when the
@@ -481,23 +490,33 @@ class PackMachine:
         self.store.add_record(record_id, self.CAP_RAISE, {"kind": kind, "extra": extra},
                               pack_id=pack_id)
 
-    def producer_gate(self, pack_id: str, stage: str,
-                      budget_policy: dict[str, Any] | None = None) -> str | None:
-        """Refuse a producer dispatch once this attempt has failed its cap.
+    def dispatch_gate_for_role(self, pack_id: str, stage: str,
+                               budget_policy: dict[str, Any] | None = None) -> str | None:
+        """Refuse a dispatch once this role has spent its failure allowance.
 
         Checked before the reservation, so a refused dispatch spends nothing.
         Without it a producer that fails on every call is simply re-dispatched
         until the whole call budget is gone - which a live run did, 24 times,
         on an argv error it would have hit every time.
         """
-        if stage not in {"apply", "repair"}:
-            return None
-        attempt = self.store.current_attempt(pack_id)
-        if attempt is None:
-            return None
         caps = self.budget_caps(pack_id, budget_policy)
-        if budgets.exhausted("attempt_cap", attempt["producer_failures"], caps["attempt_cap"]):
-            return budgets.hold_reason("attempt_cap")
+        if stage in {"apply", "repair"}:
+            attempt = self.store.current_attempt(pack_id)
+            if attempt is None:
+                return None
+            if budgets.exhausted("attempt_cap", attempt["producer_failures"],
+                                 caps["attempt_cap"]):
+                return budgets.hold_reason("attempt_cap")
+            return None
+        if stage in {"review", "contract_review"}:
+            # The same failure mode on the other side: a reviewer that cannot
+            # start is re-dispatched until the call budget is gone unless its
+            # own allowance is consulted here.
+            pack = self.store.get_pack(pack_id)
+            used = self.reviewer_retry_used(pack_id, stage=stage,
+                                            output_id=pack["k_last"] or None)
+            if budgets.exhausted("reviewer_retry", used, caps["reviewer_retry"]):
+                return budgets.hold_reason("reviewer_retry", cause="reviewer_failed")
         return None
 
     def reserve_dispatch(self, pack_id: str, *, budget_policy: dict[str, Any] | None = None,

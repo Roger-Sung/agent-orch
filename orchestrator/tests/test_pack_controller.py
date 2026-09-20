@@ -488,7 +488,7 @@ class PackRunLoopTerminatesTest(unittest.TestCase):
     either - so this asserts both that the loop ends and why.
     """
 
-    def test_the_loop_ends_when_the_call_budget_runs_out(self) -> None:
+    def test_the_loop_ends_at_the_tightest_cap_that_applies(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         controller = Controller(Path(tmp.name),
@@ -506,11 +506,13 @@ class PackRunLoopTerminatesTest(unittest.TestCase):
         row = controller.conn.execute(
             "SELECT status, stop_reason FROM tasks WHERE id=?", (task_id,)).fetchone()
         self.assertEqual(row["status"], "waiting_user")
-        self.assertEqual(row["stop_reason"], "budget_exhausted(call)")
-        # Every reserved call is accounted for; the cap is what stopped it.
+        # The call budget is the last resort, not the first brake: this stage's
+        # own allowance runs out well before it, and stopping at the tighter of
+        # the two is the whole point of having a per-role one.
+        self.assertEqual(row["stop_reason"], "reviewer_failed")
         pack = controller.pack_store.get_pack(task_id)
-        self.assertEqual(pack["calls_reserved"], budgets.DEFAULTS["call_budget"])
-        self.assertEqual(pack["state"], "hold(budget_exhausted(call))")
+        self.assertEqual(pack["state"], "hold(reviewer_failed)")
+        self.assertLess(pack["calls_reserved"], budgets.DEFAULTS["call_budget"])
 
 
 class FreezeCandidateTest(unittest.TestCase):

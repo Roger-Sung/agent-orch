@@ -54,6 +54,18 @@ class PackRunner(SubprocessRunner):
     def _command(self, owner: str) -> list[str]:
         return list(self._argv)
 
+    def run(self, owner: str, prompt: str, *args: Any, **kwargs: Any) -> Any:
+        """The prompt goes on stdin, because the adapter's argv says so.
+
+        Both pack adapters end their argv with the flag that means "read the
+        prompt from stdin"; appending it as an argument instead makes the CLI
+        reject the whole call before it starts. The legacy path appends,
+        because its providers take the prompt that way - which is why this
+        cannot be left to the base class.
+        """
+        kwargs.setdefault("stdin_payload", prompt)
+        return super().run(owner, prompt, *args, **kwargs)
+
 
 class OperationPaths:
     """The per-operation directories an engine grants and then removes."""

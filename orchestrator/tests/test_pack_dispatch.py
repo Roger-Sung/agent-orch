@@ -206,3 +206,37 @@ class StderrDoesNotDeadlockTest(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertIn("DONE", result.output or "")
         self.assertEqual(self.paths.stderr.stat().st_size, noise)
+
+
+class PromptGoesOnStdinTest(unittest.TestCase):
+    """Both pack adapters read the prompt from stdin, so it must not be argv.
+
+    A live run rejected every reviewer call before it started - `unexpected
+    argument '<the whole prompt>'` - because the dispatch path appended the
+    prompt the way the legacy providers take it.
+    """
+
+    def test_the_runner_passes_the_prompt_as_stdin_not_an_argument(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Recording(PackRunner):
+            def _spawn_and_capture(self, *args, **kwargs):  # pragma: no cover
+                raise AssertionError("not reached")
+
+        runner = Recording(["/bin/true", "-"])
+        original = PackRunner.__mro__[1].run
+
+        def fake(self, owner, prompt, *args, **kwargs):
+            captured.update(kwargs)
+            captured["argv"] = self._command(owner)
+            return None
+
+        PackRunner.__mro__[1].run = fake
+        try:
+            runner.run("codex", "THE PROMPT", timeout=1)
+        finally:
+            PackRunner.__mro__[1].run = original
+
+        self.assertEqual(captured.get("stdin_payload"), "THE PROMPT")
+        self.assertNotIn("THE PROMPT", captured["argv"],
+                         "the prompt was passed as an argument as well")

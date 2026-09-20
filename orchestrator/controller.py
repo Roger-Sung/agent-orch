@@ -1725,7 +1725,7 @@ class Controller:
             # Caps come from the contract's `budget_policy`; until intake loads
             # one, §3.4's own defaults apply rather than no limit at all.
             # The producer gate runs first: a refusal must not spend a call.
-            refused = (machine.producer_gate(pack_id, stage.name)
+            refused = (machine.dispatch_gate_for_role(pack_id, stage.name)
                        or machine.reserve_dispatch(pack_id, budget_policy=None))
             if refused is None:
                 pack = self.pack_store.get_pack(pack_id)
@@ -2625,12 +2625,13 @@ class Controller:
             adapter = ClaudeAdapter(binary=binary, model=choice.model)
             argv = adapter.command(cwd=str(workspace))
         else:
-            last_message = (Path(task["artifact_dir"]) / "pack-final"
-                            / f"{stage.name}.txt")
-            last_message.parent.mkdir(parents=True, exist_ok=True)
             adapter = CodexAdapter(binary=binary, model=choice.model,
                                    codex_home=Path.home() / ".codex")
-            argv = adapter.command(cwd=str(workspace), last_message=str(last_message))
+            # No `--output-last-message` here. The runner owns the final-response
+            # channel and refuses to share it, which is right: two parties
+            # writing the same channel is how a typed outcome gets read out of
+            # the display stream instead of the answer.
+            argv = adapter.command(cwd=str(workspace))
         return PackRunner(argv)
 
     def _provider_preflight(self, owner: str | None, *, runner: Any = None) -> ProviderPreflightResult:

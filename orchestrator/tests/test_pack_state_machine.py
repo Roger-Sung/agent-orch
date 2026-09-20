@@ -1299,10 +1299,10 @@ class ProducerFailureCapTest(unittest.TestCase):
             self.pack.store.get_attempt(self.attempt)["producer_failures"], 2)
 
     def test_the_cap_refuses_the_next_dispatch(self) -> None:
-        self.assertIsNone(self.pack.machine.producer_gate(self.pack.pack_id, "apply"))
+        self.assertIsNone(self.pack.machine.dispatch_gate_for_role(self.pack.pack_id, "apply"))
         for i in range(budgets.DEFAULTS["attempt_cap"]):
             self._fail_a_producer(i)
-        self.assertEqual(self.pack.machine.producer_gate(self.pack.pack_id, "apply"),
+        self.assertEqual(self.pack.machine.dispatch_gate_for_role(self.pack.pack_id, "apply"),
                          "producer_failed")
 
     def test_a_completed_producer_is_not_charged(self) -> None:
@@ -1322,7 +1322,7 @@ class ProducerFailureCapTest(unittest.TestCase):
                 call_binding=self.pack.binding(stage="apply", attempt_id=self.attempt))
         self.assertEqual(
             self.pack.store.get_attempt(self.attempt)["producer_failures"], 0)
-        self.assertIsNone(self.pack.machine.producer_gate(self.pack.pack_id, "apply"))
+        self.assertIsNone(self.pack.machine.dispatch_gate_for_role(self.pack.pack_id, "apply"))
 
     def test_a_reviewer_failure_is_not_a_producer_failure(self) -> None:
         op = self.pack.next_op("review", stage="review", attempt_id=self.attempt)
@@ -1336,5 +1336,5 @@ class ProducerFailureCapTest(unittest.TestCase):
         for i in range(budgets.DEFAULTS["attempt_cap"]):
             self._fail_a_producer(i)
         self.assertIsNone(
-            self.pack.machine.producer_gate(self.pack.pack_id, "contract_review"))
-        self.assertIsNone(self.pack.machine.producer_gate(self.pack.pack_id, "review"))
+            self.pack.machine.dispatch_gate_for_role(self.pack.pack_id, "contract_review"))
+        self.assertIsNone(self.pack.machine.dispatch_gate_for_role(self.pack.pack_id, "review"))
