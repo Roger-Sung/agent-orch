@@ -75,9 +75,17 @@ def _input_text(record: dict[str, Any], plan_frame: str) -> str:
     would be a second, divergent statement of the same thing.
     """
     contract = json.dumps(record["contract"], ensure_ascii=False, indent=2, sort_keys=True)
+    slice_json = json.dumps(record.get("manifest_slice"), ensure_ascii=False,
+                            indent=2, sort_keys=True)
     return (f"{plan_frame}# Pack {record['pack']}\n\n"
-            f"Contract hash: {record['contract_hash']}\n\n"
-            "## Dispatch contract\n\n```json\n" + contract + "\n```\n")
+            f"Contract hash: {record['contract_hash']}\n"
+            f"Manifest sha256: {record.get('manifest_sha256')}\n\n"
+            "## Dispatch contract\n\n```json\n" + contract + "\n```\n\n"
+            "## Manifest slice\n\n"
+            "The pack entry the contract's `plan_digest` and `manifest_sha256`\n"
+            "stand for. Every obligation the contract lists by id is defined\n"
+            "here, with the task that claims it, its selector and its source.\n\n"
+            "```json\n" + slice_json + "\n```\n")
 
 
 def launch_packs(controller: Any, *, target_dir: Path, change_dir: Path,

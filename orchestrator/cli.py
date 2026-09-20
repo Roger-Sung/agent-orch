@@ -365,10 +365,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(launched, ensure_ascii=False, indent=2))
         else:
             for record in launched:
-                if record["task"] is None:
-                    print(f"{record['pack']:<28} blocked_deps on {record['blocked_on']}")
+                name = f"{record['pack']:<28}"
+                if record.get("skipped"):
+                    print(f"{name} created, not dispatched (--pack)")
+                elif record["task"] is None:
+                    print(f"{name} blocked_deps on {record.get('blocked_on', [])}")
+                elif record.get("already_started"):
+                    print(f"{name} already under way  {record['contract_hash']}")
                 else:
-                    print(f"{record['pack']:<28} queued  {record['contract_hash']}")
+                    print(f"{name} queued  {record['contract_hash']}")
         return 0
 
     OPERATOR_ACTIONS = {

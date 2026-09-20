@@ -264,6 +264,13 @@ class PackStartTest(unittest.TestCase):
         self.assertIn("Dispatch contract", text)
         self.assertIn("files_writable", text)
         self.assertIn("Contract hash: sha256:", text)
+        # The obligations the contract names by id are defined here. Without it
+        # a reviewer is asked whether the plan backs an obligation while seeing
+        # the obligation as an id and the plan as a hash - which a real review
+        # refused to do, correctly.
+        self.assertIn("Manifest slice", text)
+        self.assertIn('"obligations"', text)
+        self.assertIn("Manifest sha256: sha256:", text)
 
     def test_enqueue_hands_the_pack_to_the_daemon_under_its_own_id(self) -> None:
         """A task written straight to the database is one the daemon never sees."""

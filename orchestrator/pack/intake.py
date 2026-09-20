@@ -261,7 +261,13 @@ def start_packs(store: PackStore, *, target: TargetPackage, change_dir: Path,
                           # which is the drift the digest exists to detect.
                           "environment": environment},
                          pack_id=pack["id"])
-        started.append({"pack": pack["id"], "contract_hash": digest, "contract": contract})
+        started.append({"pack": pack["id"], "contract_hash": digest, "contract": contract,
+                        # The manifest entry the contract's digests stand for.
+                        # Without it a reviewer is asked to judge whether the
+                        # plan backs an obligation while seeing the obligation
+                        # only as an id and the plan only as a hash.
+                        "manifest_slice": pack,
+                        "manifest_sha256": manifest_sha})
     return started
 
 
