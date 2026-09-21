@@ -296,3 +296,15 @@ class JsonResultIsUnwrappedTest(unittest.TestCase):
 
         self.assertEqual(got.output, answer)
         self.assertTrue(got.output.splitlines()[-1].startswith("ORCHESTRATOR_OUTCOME:"))
+
+    def test_the_protocol_it_records_is_one_the_engine_knows(self) -> None:
+        """Boundary metadata is validated, not trusted.
+
+        A name the engine does not recognise is refused at seal time, so the
+        whole run is lost after the provider has already done the work - which
+        is what happened with an invented one.
+        """
+        from orchestrator.runner import FINAL_RESPONSE_PROTOCOLS
+
+        unwrapped = _unwrap_json_result(self._wrapped("x\n\nORCHESTRATOR_OUTCOME: produced"))
+        self.assertIn(unwrapped.final_response_source, FINAL_RESPONSE_PROTOCOLS)

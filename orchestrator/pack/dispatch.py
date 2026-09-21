@@ -24,7 +24,7 @@ import os
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..runner import RunResult, SubprocessRunner
+from ..runner import CLAUDE_JSON_PROTOCOL, RunResult, SubprocessRunner
 from .errors import PackError
 from .provider_adapters import ProviderAdapter, redact
 
@@ -68,8 +68,11 @@ def _unwrap_json_result(result: Any) -> Any:
     answer = payload.get("result")
     if not isinstance(answer, str) or not answer.strip():
         return result
+    # The engine already names this protocol; inventing another name for it
+    # gets the run refused at seal time, because the boundary metadata is
+    # validated against the known set rather than trusted.
     return _replace(result, output=answer, final_response=answer,
-                    final_response_source="provider_json_result")
+                    final_response_source=CLAUDE_JSON_PROTOCOL)
 
 
 class PackRunner(SubprocessRunner):
