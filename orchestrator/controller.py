@@ -2623,7 +2623,13 @@ class Controller:
         binary = provider_command(choice.provider)[0]
         if choice.provider == "claude":
             adapter = ClaudeAdapter(binary=binary, model=choice.model)
-            argv = adapter.command(cwd=str(workspace))
+            runner = PackRunner(adapter.command(cwd=str(workspace), single_boundary=True))
+            # Inseparable from `single_boundary`: with the provider's own
+            # permission layer off, the runner must refuse to spawn at all
+            # unless the engine's L1 sandbox is in place. One boundary, and it
+            # is the one the engine can account for.
+            runner.require_outer_sandbox = True
+            return runner
         else:
             adapter = CodexAdapter(binary=binary, model=choice.model,
                                    codex_home=Path.home() / ".codex")

@@ -112,3 +112,28 @@ class PackStagesLaunchThroughTheirAdaptersTest(unittest.TestCase):
             with self.subTest(stage=stage):
                 self.assertNotIn("danger-full-access", argv)
                 self.assertEqual(argv[argv.index("-s") + 1], "read-only")
+
+    def test_the_producer_has_exactly_one_boundary_and_it_is_enforced(self) -> None:
+        """Turning the inner layer off is only safe paired with the outer one.
+
+        With both on, the provider's own layer refuses non-interactively - a
+        live run watched it turn down nine writes to the one path the contract
+        declared writable. With both off there would be no boundary at all, so
+        the runner has to refuse to spawn without the engine's sandbox.
+        """
+        runner = self.controller._execution_runner_for(
+            self.task, self.profile.stage("apply"))
+        argv = runner._command("claude")
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertTrue(
+            getattr(runner, "require_outer_sandbox", False),
+            "the inner permission layer is off and nothing requires the outer one")
+
+    def test_a_reviewer_keeps_its_own_limits(self) -> None:
+        """Only the producer writes; the reviewer's restrictions stay on."""
+        for stage in ("contract_review", "review"):
+            runner = self.controller._execution_runner_for(
+                self.task, self.profile.stage(stage))
+            with self.subTest(stage=stage):
+                self.assertNotIn("--dangerously-skip-permissions",
+                                 runner._command("codex"))

@@ -103,8 +103,23 @@ class ClaudeAdapter(ProviderAdapter):
     provider = "claude"
 
     def command(self, *, cwd: str, resume_session: str | None = None,
-                sandbox: str = "workspace-write") -> list[str]:
+                sandbox: str = "workspace-write",
+                single_boundary: bool = False) -> list[str]:
+        """`single_boundary` turns the provider's own permission layer off.
+
+        Only ever correct when the engine's L1 sandbox is enforced around the
+        call (§3.1), which is why the caller must also set the runner's
+        `require_outer_sandbox`: the two are one decision, and taking the inner
+        layer away without the outer one would leave no boundary at all.
+
+        With both layers on, the inner one refuses non-interactively. A live
+        run watched it turn down nine separate writes to the single path the
+        contract declared writable, while naming that path's own directory as
+        allowed - so the producer could not produce and said so.
+        """
         argv = [self.binary, "-p", "--model", self.model, "--output-format", "json"]
+        if single_boundary:
+            argv.append("--dangerously-skip-permissions")
         if self.effort:
             argv += ["--effort", self.effort]
         if resume_session:
