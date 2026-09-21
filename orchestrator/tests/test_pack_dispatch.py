@@ -1,6 +1,7 @@
 """Provider dispatch through the engine's runner and containment (step 7)."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -8,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from orchestrator.pack.dispatch import (
+    _unwrap_json_result,
     OperationPaths,
     PackRunner,
     build_env,
@@ -17,7 +19,7 @@ from orchestrator.pack.dispatch import (
 )
 from orchestrator.pack.errors import PackError
 from orchestrator.pack.provider_adapters import ClaudeAdapter, CodexAdapter
-from orchestrator.runner import _child_env
+from orchestrator.runner import RunResult, _child_env
 
 
 class OperationPathsTest(unittest.TestCase):
@@ -240,3 +242,57 @@ class PromptGoesOnStdinTest(unittest.TestCase):
         self.assertEqual(captured.get("stdin_payload"), "THE PROMPT")
         self.assertNotIn("THE PROMPT", captured["argv"],
                          "the prompt was passed as an argument as well")
+
+
+class JsonResultIsUnwrappedTest(unittest.TestCase):
+    """A provider whose whole stdout is a wrapper still has to be readable.
+
+    Claude with `--output-format json` escapes the typed outcome inside a
+    field, so it stops being the last line of the stream. A live run produced
+    the candidate, printed `ORCHESTRATOR_OUTCOME: produced`, and was recorded
+    as having printed no outcome at all.
+    """
+
+    def _wrapped(self, answer: str) -> RunResult:
+        payload = {"type": "result", "subtype": "success", "is_error": False,
+                   "result": answer}
+        return RunResult(0, json.dumps(payload), None, "raw", "raw")
+
+    def test_the_answer_becomes_the_output(self) -> None:
+        answer = "did the work\n\nORCHESTRATOR_OUTCOME: produced"
+        unwrapped = _unwrap_json_result(self._wrapped(answer))
+        self.assertEqual(unwrapped.output, answer)
+        self.assertEqual(unwrapped.final_response, answer)
+        self.assertTrue(unwrapped.output.splitlines()[-1].startswith(
+            "ORCHESTRATOR_OUTCOME:"), "the outcome is not the last line")
+
+    def test_plain_output_is_untouched(self) -> None:
+        plain = RunResult(0, "ORCHESTRATOR_OUTCOME: produced\n", None, "raw", "raw")
+        self.assertIs(_unwrap_json_result(plain), plain)
+
+    def test_json_that_is_not_a_provider_result_is_untouched(self) -> None:
+        other = RunResult(0, '{"type": "progress"}', None, "raw", "raw")
+        self.assertIs(_unwrap_json_result(other), other)
+
+    def test_an_empty_answer_is_not_substituted(self) -> None:
+        """Replacing the stream with nothing would hide why the call failed."""
+        empty = self._wrapped("   ")
+        self.assertIs(_unwrap_json_result(empty), empty)
+
+    def test_the_runner_unwraps_what_it_returns(self) -> None:
+        """Calling the helper proves nothing about whether `run` uses it."""
+        answer = "done\n\nORCHESTRATOR_OUTCOME: produced"
+        wrapped = self._wrapped(answer)
+        base = PackRunner.__mro__[1].run
+
+        def fake(self, owner, prompt, *args, **kwargs):
+            return wrapped
+
+        PackRunner.__mro__[1].run = fake
+        try:
+            got = PackRunner(["/bin/true", "-"]).run("claude", "p", timeout=1)
+        finally:
+            PackRunner.__mro__[1].run = base
+
+        self.assertEqual(got.output, answer)
+        self.assertTrue(got.output.splitlines()[-1].startswith("ORCHESTRATOR_OUTCOME:"))

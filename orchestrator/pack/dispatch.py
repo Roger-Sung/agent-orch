@@ -19,6 +19,7 @@ cannot acquire a boundary by being dispatched from the wrong place.
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Sequence
@@ -37,6 +38,38 @@ WRITERS = frozenset({"producer", "verify"})
 # provider auth has to survive, and it is not something a contract should be
 # able to point at.
 PROVIDER_STATE_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
+
+
+def _unwrap_json_result(result: Any) -> Any:
+    """Return the provider's answer as text when its whole stdout is a wrapper.
+
+    Claude with `--output-format json` prints one JSON object, so the typed
+    outcome line ends up escaped inside a field rather than standing as the
+    last line of the stream - and every reader downstream, the outcome
+    classifier first, looks for a line. A live run produced the candidate
+    correctly, printed `ORCHESTRATOR_OUTCOME: produced`, and was recorded as
+    having printed no outcome at all.
+
+    The raw object is still on disk in the run's output file; what changes is
+    only which of the two a reader is handed. Anything that is not such a
+    wrapper is passed straight through.
+    """
+    from dataclasses import replace as _replace
+
+    text = getattr(result, "output", None)
+    if not isinstance(text, str) or not text.lstrip().startswith("{"):
+        return result
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return result
+    if not isinstance(payload, dict) or payload.get("type") != "result":
+        return result
+    answer = payload.get("result")
+    if not isinstance(answer, str) or not answer.strip():
+        return result
+    return _replace(result, output=answer, final_response=answer,
+                    final_response_source="provider_json_result")
 
 
 class PackRunner(SubprocessRunner):
@@ -64,7 +97,7 @@ class PackRunner(SubprocessRunner):
         cannot be left to the base class.
         """
         kwargs.setdefault("stdin_payload", prompt)
-        return super().run(owner, prompt, *args, **kwargs)
+        return _unwrap_json_result(super().run(owner, prompt, *args, **kwargs))
 
 
 class OperationPaths:
