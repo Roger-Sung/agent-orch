@@ -100,6 +100,34 @@ CREATE TABLE IF NOT EXISTS quarantine(
   reason TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS trajectory_events(
+  trajectory_id TEXT NOT NULL,
+  seq INTEGER NOT NULL CHECK(seq > 0),
+  event_id TEXT NOT NULL UNIQUE,
+  schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+  event_type TEXT NOT NULL,
+  event_version INTEGER NOT NULL CHECK(event_version > 0),
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  run_token TEXT REFERENCES stage_runs(run_token),
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms >= 0),
+  canonical_json BLOB NOT NULL CHECK(typeof(canonical_json) = 'blob'),
+  prev_event_hash TEXT,
+  event_hash TEXT NOT NULL,
+  PRIMARY KEY(trajectory_id, seq)
+);
+
+CREATE TRIGGER IF NOT EXISTS trajectory_events_no_update
+BEFORE UPDATE ON trajectory_events
+BEGIN
+  SELECT RAISE(ABORT, 'trajectory_events is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trajectory_events_no_delete
+BEFORE DELETE ON trajectory_events
+BEGIN
+  SELECT RAISE(ABORT, 'trajectory_events is append-only');
+END;
 """
 
 
