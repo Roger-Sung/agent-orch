@@ -99,6 +99,10 @@ reason it has none. There is no fallback to the display stream — that fallback
 | unreadable, or not valid UTF-8 under a strict decode | `provider_final_response_unreadable` |
 | larger than 4 MiB | `provider_final_response_too_large` |
 
+A structurally readable provider response can still fail the machine-checkable
+review contract. That is reported separately as `review_contract_rejected`;
+it is a semantic verdict error, not damage to the provider output channel.
+
 ### One descriptor, and why
 
 The read is a single `os.open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)`, an

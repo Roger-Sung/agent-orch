@@ -55,7 +55,10 @@ sidflag = "--resume" if "--resume" in sys.argv else "--session-id"
 sid = sys.argv[sys.argv.index(sidflag)+1]
 axis = os.environ.get("FAKE_REVIEW_AXIS", "PASS")
 record = {{"candidate_sha256": packet["candidate_sha256"], "spec_sha256": packet["evidence"]["spec_sha256"], "axes": {{"product_spec": axis, "constraints": "PASS", "verification": "PASS"}}, "findings": [], "remaining_evidence": []}}
-if axis == "UNKNOWN": record["remaining_evidence"] = [{{"owner": "Astra", "check": "clarify requirement"}}]
+if axis == "UNKNOWN":
+    remaining = {{"owner": "Astra", "check": "clarify requirement"}}
+    if packet["evidence"]["kind"] == "implementation": remaining["gate"] = "before acceptance"
+    record["remaining_evidence"] = [remaining]
 outcome = "ready" if axis == "PASS" else "needs_user_decision"
 final = {REVIEW_BEGIN!r} + "\\n" + json.dumps(record) + "\\n" + {REVIEW_END!r} + "\\n" + {CONVERGENCE_BEGIN!r} + '\\n{{"live": [], "resolved": []}}\\n' + {CONVERGENCE_END!r} + "\\nORCHESTRATOR_OUTCOME: " + outcome
 if os.environ.get("FAKE_REVIEW_WRONG_SESSION"): sid = "00000000-0000-4000-8000-000000000000"
@@ -427,16 +430,44 @@ Path(sys.argv[sys.argv.index("--output-last-message")+1]).write_text({CONVERGENC
 
 
 class ReviewContractTests(unittest.TestCase):
+    @staticmethod
+    def _packet(kind="spec"):
+        context = {"kind": kind, "spec_text": "spec", "spec_sha256": hashlib.sha256(b"spec").hexdigest()}
+        if kind == "spec":
+            return build_packet(context, None, None)
+        return {"candidate_sha256": "c" * 64, "evidence": context}
+
+    @staticmethod
+    def _text(record, outcome="ready"):
+        return REVIEW_BEGIN + json.dumps(record) + REVIEW_END + "\nORCHESTRATOR_OUTCOME: " + outcome
+
     def test_ready_cannot_mask_failed_axis_or_wrong_candidate(self):
-        context = {"kind": "spec", "spec_text": "spec", "spec_sha256": hashlib.sha256(b"spec").hexdigest()}
-        packet = build_packet(context, None, None)
-        base = {"candidate_sha256": packet["candidate_sha256"], "spec_sha256": context["spec_sha256"],
+        packet = self._packet()
+        base = {"candidate_sha256": packet["candidate_sha256"], "spec_sha256": packet["evidence"]["spec_sha256"],
                 "axes": {"product_spec": "PASS", "constraints": "PASS", "verification": "PASS"},
                 "findings": [], "remaining_evidence": []}
-        def text(record): return REVIEW_BEGIN + json.dumps(record) + REVIEW_END + "\nORCHESTRATOR_OUTCOME: ready"
-        validate_review(text(base), packet)
+        validate_review(self._text(base), packet)
         for axis in ("FAIL", "UNKNOWN", "DEFERRED", []):
             record = json.loads(json.dumps(base)); record["axes"]["verification"] = axis
-            with self.subTest(axis=axis), self.assertRaises(ExecutionConfigError): validate_review(text(record), packet)
+            with self.subTest(axis=axis), self.assertRaises(ExecutionConfigError): validate_review(self._text(record), packet)
         base["candidate_sha256"] = "f" * 64
-        with self.assertRaises(ExecutionConfigError): validate_review(text(base), packet)
+        with self.assertRaises(ExecutionConfigError): validate_review(self._text(base), packet)
+
+    def test_implementation_ready_accepts_owned_deferred_production_check(self):
+        packet = self._packet("implementation")
+        record = {"candidate_sha256": packet["candidate_sha256"], "spec_sha256": packet["evidence"]["spec_sha256"],
+                  "axes": {"product_spec": "PASS", "constraints": "PASS", "verification": "DEFERRED"},
+                  "findings": [], "remaining_evidence": [
+                      {"check": "restart daemon and verify recovery", "owner": "stop-gate", "gate": "before deploy"}
+                  ]}
+        self.assertEqual(validate_review(self._text(record), packet)["axes"]["verification"], "DEFERRED")
+
+    def test_implementation_deferred_requires_gate(self):
+        packet = self._packet("implementation")
+        record = {"candidate_sha256": packet["candidate_sha256"], "spec_sha256": packet["evidence"]["spec_sha256"],
+                  "axes": {"product_spec": "PASS", "constraints": "PASS", "verification": "DEFERRED"},
+                  "findings": [], "remaining_evidence": [
+                      {"check": "restart daemon", "owner": "stop-gate"}
+                  ]}
+        with self.assertRaisesRegex(ExecutionConfigError, "owner/check/gate"):
+            validate_review(self._text(record), packet)

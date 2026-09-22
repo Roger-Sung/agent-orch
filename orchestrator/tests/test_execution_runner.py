@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 from orchestrator.execution import ExecutionChoice, ExecutionConfigError, extract_plan, render_plan, resolve_request
 from orchestrator.execution_runner import ConfiguredRunner, configured_command, provider_json
-from orchestrator.runner import CLAUDE_JSON_PROTOCOL, RunResult, SubprocessRunner, classify_result
+from orchestrator.review_contract import REVIEW_BEGIN, REVIEW_END
+from orchestrator.runner import (CLAUDE_JSON_PROTOCOL, REVIEW_CONTRACT_REJECTED,
+                                 RunResult, SubprocessRunner, classify_result)
 from orchestrator.tests import test_execution
 from orchestrator.tests import test_containment_layers
 
@@ -93,6 +95,28 @@ class ConfiguredCommandTests(unittest.TestCase):
         self.assertEqual(provider_json("CLI warning\n" + line + "\n")["result"], "quoted model text")
         for raw in (line + "\n" + line, '{"type":"result","type":"result"}'):
             with self.assertRaises(ExecutionConfigError): provider_json(raw)
+
+    def test_semantic_review_rejection_is_not_reported_as_unreadable_provider_output(self):
+        packet = {"candidate_sha256": "c" * 64,
+                  "evidence": {"kind": "spec", "spec_sha256": "s" * 64}}
+        record = {"candidate_sha256": packet["candidate_sha256"],
+                  "spec_sha256": packet["evidence"]["spec_sha256"],
+                  "axes": {"product_spec": "FAIL", "constraints": "PASS", "verification": "PASS"},
+                  "findings": [], "remaining_evidence": []}
+        final = REVIEW_BEGIN + json.dumps(record) + REVIEW_END + "\nORCHESTRATOR_OUTCOME: ready"
+        payload = {"type": "result", "subtype": "success", "is_error": False,
+                   "result": final, "session_id": "session-a",
+                   "modelUsage": {"claude-fable-5-1": {"canonicalModel": "claude-fable-5-1"}}}
+        runner = ConfiguredRunner(self.review, "a" * 64, ["claude", "-p"])
+        runner.review_packet = packet
+        raw = RunResult(0, json.dumps(payload), None, "raw", "raw", started_at_ms=1)
+        with patch.object(SubprocessRunner, "run", return_value=raw):
+            result = runner.run("claude", "prompt", 10, Path("unused"))
+        self.assertIsNone(result.final_response_error)
+        self.assertEqual(result.execution_receipt["review_contract_error"], REVIEW_CONTRACT_REJECTED)
+        self.assertEqual(classify_result(0, result.output, {"ready"}, source=result).reason,
+                         REVIEW_CONTRACT_REJECTED)
+        self.assertIn("ready contradicts review evidence", result.execution_receipt["verification_error"])
 
 
 class PlanFramingTests(unittest.TestCase):

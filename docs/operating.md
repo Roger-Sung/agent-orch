@@ -176,6 +176,7 @@ Which stop reason lands where, and who can move it on:
 | `missing_outcome` | `blocked` | human |
 | `ambiguous_outcome` | `blocked` | human |
 | `unknown_outcome` | `blocked` | human |
+| `review_contract_rejected` | `blocked` | correct the review record or contract, then rerun the reviewer stage |
 | `timeout` | `blocked` | human |
 | `sandbox_unavailable` | `blocked` | human |
 | `sandbox_setup_failed` | `blocked` | human |
@@ -188,6 +189,17 @@ Which stop reason lands where, and who can move it on:
 bound was reached — the loop was working, it just ran out of rope. The second
 means a run produced something the machine refuses to act on. Both need a
 human; both keep every artifact.
+
+For `review_contract_rejected`, correct and deploy the contract or fix the
+reviewer's response shape, then resume the same task:
+
+```sh
+python3 -m orchestrator status TASK_ID
+python3 -m orchestrator resume TASK_ID
+```
+
+The blocked run stays sealed. Resume runs the current reviewer stage again on
+the task's current immutable candidate and does not reuse the old verdict.
 
 ## Protected-root drift and retained output
 

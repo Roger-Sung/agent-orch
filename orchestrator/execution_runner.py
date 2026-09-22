@@ -15,7 +15,8 @@ from .execution import ExecutionChoice, ExecutionConfigError, _unique_object
 from .review_contract import review_prompt, validate_review
 from . import review_session
 from .runner import (
-    CLAUDE_JSON_PROTOCOL, FINAL_RESPONSE_UNREADABLE, RunResult, SubprocessRunner,
+    CLAUDE_JSON_PROTOCOL, FINAL_RESPONSE_UNREADABLE, REVIEW_CONTRACT_REJECTED,
+    RunResult, SubprocessRunner,
     _codex_config_issue, provider_command,
 )
 
@@ -176,8 +177,19 @@ class ConfiguredRunner(SubprocessRunner):
             receipt["provider_reported_model"] = self.choice.model
             receipt["provider_session_id"] = payload.get("session_id")
             if self.review_packet is not None:
-                receipt["review"] = validate_review(text, self.review_packet)
-                receipt["candidate_sha256"] = self.review_packet["candidate_sha256"]
+                try:
+                    receipt["review"] = validate_review(text, self.review_packet)
+                    receipt["candidate_sha256"] = self.review_packet["candidate_sha256"]
+                except ExecutionConfigError as exc:
+                    receipt["verification_error"] = str(exc)
+                    receipt["review_contract_error"] = REVIEW_CONTRACT_REJECTED
+                    return replace(
+                        raw,
+                        final_response=text,
+                        final_response_source=CLAUDE_JSON_PROTOCOL,
+                        final_response_error=None,
+                        execution_receipt=receipt,
+                    )
             error = None
         except (ValueError, TypeError, KeyError) as exc:
             receipt["verification_error"] = str(exc)

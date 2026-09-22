@@ -693,12 +693,18 @@ FINAL_RESPONSE_MISSING = "provider_final_response_missing"
 FINAL_RESPONSE_EMPTY = "provider_final_response_empty"
 FINAL_RESPONSE_UNREADABLE = "provider_final_response_unreadable"
 FINAL_RESPONSE_TOO_LARGE = "provider_final_response_too_large"
+REVIEW_CONTRACT_REJECTED = "review_contract_rejected"
 
 #: The complete set. A sealed manifest naming anything else is naming a reason
 #: this engine did not produce, so both sealed readers refuse it rather than
 #: treating an unknown string as some kind of failure they can interpret.
 FINAL_RESPONSE_ERRORS = frozenset(
-    {FINAL_RESPONSE_MISSING, FINAL_RESPONSE_EMPTY, FINAL_RESPONSE_UNREADABLE, FINAL_RESPONSE_TOO_LARGE}
+    {
+        FINAL_RESPONSE_MISSING,
+        FINAL_RESPONSE_EMPTY,
+        FINAL_RESPONSE_UNREADABLE,
+        FINAL_RESPONSE_TOO_LARGE,
+    }
 )
 #: The complete set of protocols, for the same reason.
 FINAL_RESPONSE_PROTOCOLS = frozenset({WHOLE_STREAM_PROTOCOL, CODEX_LAST_MESSAGE_PROTOCOL, CLAUDE_JSON_PROTOCOL})
@@ -1103,6 +1109,9 @@ def classify_result(
     # response for reasons already reported.
     if source is not None and source.final_response_error is not None:
         return RunResult(exit_code, output, None, "blocked", source.final_response_error, False, **fields)
+    if (source is not None and isinstance(source.execution_receipt, dict)
+            and source.execution_receipt.get("review_contract_error") == REVIEW_CONTRACT_REJECTED):
+        return RunResult(exit_code, output, None, "blocked", REVIEW_CONTRACT_REJECTED, False, **fields)
     authoritative = source.final_response if source is not None and source.final_response is not None else output
     matches = OUTCOME_RE.findall(authoritative)
     final_outcome = _final_outcome_marker(authoritative)
