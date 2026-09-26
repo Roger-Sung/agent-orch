@@ -10,6 +10,12 @@
 
 它為 Claude／Codex 長流程的持久、可續跑執行而建，用在事後必須能稽核每次重試與副作用的場合。公開目的是給人讀，不是給人用——見英文版的 Project status。引擎沒有第三方 Python 依賴，demo 不需要任何設定。
 
+## 唯一引擎與 canonical 狀態
+
+`agent-orch` 是唯一持續維護的 orchestrator engine。它只有一套 canonical lifecycle state（`tasks` 與 `stage_runs`）、一套 canonical event log（`transitions`，`notifications` 是衍生資料），以及一套 canonical run receipt（`stage_runs.manifest_path` 加 `manifest_hash`）。引擎只使用 `ORCH_HOME/orchestrator.db` 這一個持久化 SQLite DB；唯一合法的 execution policy 識別值是 `policy_version=execution-v1`。
+
+AI-OS 是這個引擎的 client／profile provider，不是另一個引擎。T1SBE Node controller 的定位是 reference-only／retired：它只保留作為歷史設計參考，不是 dependency、integration target 或 compatibility product。
+
 ## 給作品集讀者
 
 這份作品展示的是**如何控制可能犯錯的 agent 流程**，不是訓練模型，也不是宣稱兩個模型一定比一個好。重點在三個工程問題：哪份輸出才有權威、誰能推進狀態、什麼證據足以支持安全重試。

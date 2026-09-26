@@ -6,6 +6,21 @@ has to wade through. The [README](../README.md) covers what the system is and
 why it is shaped this way; this document covers how to stand it up, wire it,
 check the wiring, and act on the stops it produces.
 
+## Deployment boundary and canonical storage
+
+Deploy `agent-orch` as the single orchestrator engine. Its canonical lifecycle
+state is `tasks` plus `stage_runs`; its canonical event log is `transitions`
+(`notifications` is derived); and its canonical run receipt is the
+database-committed `stage_runs.manifest_path` plus `manifest_hash`. The only
+durable engine database is `ORCH_HOME/orchestrator.db`. Configurations and
+submitted plans must use the sole valid policy identifier,
+`policy_version=execution-v1`.
+
+AI-OS consumes this engine as a client and supplies deployment profiles. It
+does not provide a second lifecycle or state store. The T1SBE Node controller
+is reference-only / retired historical material. Do not treat it as a runtime
+dependency, an integration target, or a compatibility product.
+
 ## Requirements
 
 - **Python 3.12 or newer.** The engine uses only the standard library. CI

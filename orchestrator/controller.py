@@ -48,14 +48,8 @@ from .runner import (
     validate_convergence,
 )
 from .retained import inspect_retained
-from .execution import DEFAULT_POLICY, ExecutionConfigError, extract_plan, review_context
+from .execution import ExecutionConfigError, extract_plan, review_context
 from .execution_runner import ConfiguredRunner
-from .pack import receipts as pack_receipts
-from .pack.envelopes import parse_framing
-from .pack.errors import EnvelopeInvalid
-from .pack.policy import PackPolicy, allowed_outcomes as pack_allowed_outcomes
-from .pack.state_machine import CONSUME as PACK_CONSUME, PackMachine
-from .pack.store import PackStore
 from .review_contract import build_packet
 from . import review_session
 
@@ -155,14 +149,6 @@ class Controller:
         # an interrupted prior controller. Do this before daemon intake scans.
         orphaned = list(self.conn.execute("SELECT * FROM tasks WHERE status='running' ORDER BY created_at"))
         for task in orphaned:
-            if self._is_pack_v1(task):
-                # pack-v1 owns its own reconcile (STATE-TABLE §5): blanket-blocking
-                # the run and clearing the lease here would destroy the very
-                # evidence that decides whether a writer is still alive.
-                counts = self.reconcile_pack(task)
-                for key, value in counts.items():
-                    summary[f"pack_{key}"] = summary.get(f"pack_{key}", 0) + value
-                continue
             self._block_orphaned_running(task)
             summary["running_blocked"] += 1
         for task in self.conn.execute("SELECT * FROM tasks ORDER BY created_at"):
@@ -285,22 +271,10 @@ class Controller:
             if task["status"] not in ACTIVE_STATUSES:
                 return self.status(task_id)
             if task["status"] == "running":
-                if self._is_pack_v1(task):
-                    # Same reason as the startup barrier: pack reconcile decides.
-                    self.reconcile_pack(task)
-                    return self.status(task_id)
                 self._block_orphaned_running(task)
                 return self.status(task_id)
             profile = self._profile_for(task)
             stage = profile.stage(task["current_stage"])
-            if self._is_pack_v1(task) and stage.name == "prerun":
-                # Ahead of the provider preflight, because prerun involves no
-                # provider: it runs the target's own verify CLI, and asking a
-                # model to report what the checks said is exactly the
-                # transcription sealed observations exist to remove.
-                self._run_pack_prerun(task)
-                self._advance_pack(task)
-                continue
             if not stage.terminal:
                 try:
                     stage_runner = self._execution_runner_for(task, stage)
@@ -315,18 +289,6 @@ class Controller:
             if claim is None:
                 return self.status(task_id)
             run_token, stage, profile, log_path = claim
-            if self._is_pack_v1(task):
-                refused = self._open_pack_operation(task, run_token, stage)
-                if refused is not None:
-                    self._stop_claimed_run(
-                        task_id, run_token, profile, stage, log_path, refused,
-                        f"pack-v1 budget refused the dispatch: {refused}",
-                    )
-                    # The stop travels the ordinary commit path, which for
-                    # pack-v1 returns the task to `queued`; the pack is held, so
-                    # the status has to be derived from it rather than left there.
-                    self._advance_pack(task)
-                    return self.status(task_id)
             self._emit_event(
                 "stage_started",
                 {
@@ -364,12 +326,9 @@ class Controller:
                     # elsewhere the provider CLI can create the directory or
                     # fail visibly in its own output.
                     pass
-            # pack-v1 scores convergence with judge-v1 over sealed envelopes
-            # (STATE-TABLE §4); running the legacy scorer as well would put two
-            # different verdicts on the same round.
             convergence = (
                 self._convergence_context(task_id, stage, profile)
-                if envelope is not None and not self._is_pack_v1(task) else None
+                if envelope is not None else None
             )
             prompt_stage = stage
             if isinstance(stage_runner, ConfiguredRunner) and stage_runner.choice.role == "reviewer":
@@ -383,10 +342,8 @@ class Controller:
                     "Treat executor reports as claims; missing evidence is UNKNOWN with an owner. "
                     "Prior conversation is context, not authority to change current scope or acceptance. "
                     "Technical review does not grant implementation or deployment approval."))
-            pack_outcomes = self._pack_outcomes(task, stage)
             prompt = self._build_prompt(
                 task_id, prompt_stage, input_text, reports_location, envelope, convergence,
-                pack_outcomes,
             )
             try:
                 raw_result = self._invoke_runner(task, stage, prompt, log_path, reports_dir, runner=stage_runner)
@@ -399,33 +356,21 @@ class Controller:
             result = classify_result(
                 raw_result.exit_code,
                 raw_result.output,
-                set(pack_outcomes if pack_outcomes is not None
-                    else allowed_outcomes(stage.outcomes, envelope is not None)),
+                set(allowed_outcomes(stage.outcomes, envelope is not None)),
                 raw_result.timed_out,
                 source=raw_result,
             )
             if convergence is not None:
                 result = self._apply_convergence(result, convergence)
             if (result.execution_receipt is not None
-                    and result.execution_receipt.get("role") == "reviewer"
-                    and not self._is_pack_v1(task)):
-                # execution-v1 routes any non-`ready` review to the user. pack-v1
-                # has typed outcomes of its own (needs_repair, blocked, ...) that
-                # the state machine consumes, so rewriting them to waiting_user
-                # would strand every ordinary repair round.
+                    and result.execution_receipt.get("role") == "reviewer"):
+                # execution-v1 routes any non-`ready` review to the user.
                 if result.classification == "success" and result.outcome != "ready":
                     result = replace(result, classification="waiting_user",
                                      reason=f"review_requires_astra_decision: {result.reason}")
                 if result.final_response is not None and reports_dir is not None:
                     self._atomic_write(reports_dir / "implement-review.md", result.final_response.encode())
-            if self._is_pack_v1(task):
-                self._seal_pack_receipt(task, run_token, result)
             self.commit_run(task_id, run_token, result, profile)
-            if self._is_pack_v1(task):
-                # After the commit, never inside it: §3.0b keeps sealing and
-                # consuming in separate transactions so exactly-once survives a
-                # crash between them.
-                self._advance_pack(task)
             if isinstance(stage_runner, ConfiguredRunner) and stage_runner.session_binding is not None:
                 sealed = self.conn.execute("SELECT manifest_path,manifest_hash FROM stage_runs WHERE run_token=?", (run_token,)).fetchone()
                 try:
@@ -686,23 +631,17 @@ class Controller:
             envelope_uncapped = (
                 self._envelope_for_task(task) is not None and self._gate_reachable(profile)
             )
-            # pack-v1 gates dispatch on its own budget policy (STATE-TABLE §3.4)
-            # and on the §3.3a decision, so the legacy caps only observe here.
-            # The counters keep counting and stay readable in `orch status`;
-            # they simply stop being the thing that refuses.
-            pack_uncapped = self._is_pack_v1(task)
             if (
                 task["transitions_count"] >= task["max_transitions"]
                 and not allowance
                 and not envelope_uncapped
-                and not pack_uncapped
             ):
                 self._stop_for_cap(task, "transition_cap", f"max_transitions={task['max_transitions']} reached")
                 self.conn.execute("COMMIT")
                 return None
 
             cycle, attempt = self._next_attempt(task_id, stage.name)
-            if attempt > stage.attempt_cap and not allowance and not pack_uncapped:
+            if attempt > stage.attempt_cap and not allowance:
                 self._stop_for_cap(task, "attempt_cap", f"{stage.name}.attempt_cap={stage.attempt_cap} reached")
                 self.conn.execute("COMMIT")
                 return None
@@ -772,11 +711,6 @@ class Controller:
             now = _now()
             duration_ms = self._duration_ms(run, result, now)
             manifest_path, manifest_hash = self._seal_run_manifest(task, run, result, stage.name, now)
-            if self._is_pack_v1(task):
-                self._commit_pack_run(task, run, result, stage, now, duration_ms,
-                                      manifest_path, manifest_hash)
-                self.conn.execute("COMMIT")
-                return
             if result.classification != "success":
                 status = result.classification
                 self.conn.execute(
@@ -1009,11 +943,7 @@ class Controller:
                     f"containment-inspect {task_id}; --rerun-stage explicitly requests a new "
                     "provider attempt, not clearance or reuse of the interrupted run"
                 )
-            # pack-v1 resumes only through an authorised A_* event that has
-            # already passed the §6.0 gate, so it must not also receive the
-            # legacy blanket allowance that skips the caps for one claim.
-            pack_v1 = self._is_pack_v1(task)
-            allowance = 1 if task["status"] == "waiting_user" and not pack_v1 else 0
+            allowance = 1 if task["status"] == "waiting_user" else 0
             now = _now()
             resumed_edge = None
             resumed_outcome = None
@@ -1031,19 +961,10 @@ class Controller:
                     "UPDATE edge_counts SET count=count+1 WHERE task_id=? AND edge=?",
                     (task_id, resumed_edge),
                 )
-            if pack_v1:
-                # The pack writer lease is owned by the pack store and says who
-                # may write the worktree; clearing it here would hand a second
-                # writer the same tree while the first may still be alive.
-                self.conn.execute(
-                    "UPDATE tasks SET status='queued',stop_reason=NULL,resume_allowance=?,revision=revision+1,updated_at=? WHERE id=?",
-                    (allowance, now, task_id),
-                )
-            else:
-                self.conn.execute(
-                    "UPDATE tasks SET status='queued',stop_reason=NULL,lease_token=NULL,resume_allowance=?,revision=revision+1,updated_at=? WHERE id=?",
-                    (allowance, now, task_id),
-                )
+            self.conn.execute(
+                "UPDATE tasks SET status='queued',stop_reason=NULL,lease_token=NULL,resume_allowance=?,revision=revision+1,updated_at=? WHERE id=?",
+                (allowance, now, task_id),
+            )
             self._insert_transition(
                 task_id,
                 operation_id or str(uuid.uuid4()),
@@ -1419,603 +1340,6 @@ class Controller:
             return hold(f"convergence_{verdict}")
         return result
 
-    @property
-    def pack_store(self) -> PackStore:
-        """Lazily attach the pack tables to the controller's own connection.
-
-        Same connection, therefore same transaction: sealing a call and marking
-        it unconsumed cannot end up in different commits (STATE-TABLE §3.0b).
-        """
-        store = getattr(self, "_pack_store", None)
-        if store is None:
-            store = PackStore(self.conn)
-            self._pack_store = store
-        return store
-
-    def _commit_pack_run(self, task: sqlite3.Row, run: sqlite3.Row, result: RunResult,
-                         stage: Any, now: int, duration_ms: int | None,
-                         manifest_path: Any, manifest_hash: str | None) -> None:
-        """pack-v1's commit: seal the call, leave the result unconsumed.
-
-        What this deliberately does *not* do is the legacy tail of `commit_run`
-        - outcome-to-edge routing, edge caps, and deriving the task's next
-        status. Those decisions belong to the pack state machine, which runs
-        against sealed results rather than inside the commit that produces them.
-        """
-        self.conn.execute(
-            """UPDATE stage_runs SET status='committed',exit_code=?,outcome=?,ended_at=?,
-               duration_ms=?,model=?,usage_input_tokens=?,usage_output_tokens=?,
-               usage_total_tokens=?,usage_unavailable_reason=?,manifest_path=?,manifest_hash=?,sealed=1
-               WHERE run_token=?""",
-            (
-                result.exit_code, result.outcome, now, duration_ms,
-                getattr(result, "model", None),
-                getattr(result, "usage_input_tokens", None),
-                getattr(result, "usage_output_tokens", None),
-                getattr(result, "usage_total_tokens", None),
-                getattr(result, "usage_unavailable_reason", None),
-                str(manifest_path) if manifest_path is not None else None,
-                manifest_hash, run["run_token"],
-            ),
-        )
-        policy = PackPolicy(self.pack_store)
-        pack_id = task["id"]
-        try:
-            self.pack_store.get_operation(run["run_token"])
-        except KeyError:
-            # The operation row is written before the spawn in the normal path;
-            # creating it here keeps a run that predates the pack store from
-            # losing its result entirely.
-            self.pack_store.create_operation(
-                run["run_token"], pack_id, type="provider", stage=stage.name,
-            )
-        policy.commit_call_result(
-            run["run_token"],
-            result="completed" if result.classification == "success" else "failed",
-            result_ref=manifest_hash,
-        )
-        # Back to queued so the daemon ticks the pack machine; the pack's own
-        # state lives in pack_packs, not in the task row.  Consuming here
-        # instead would collapse sealing and consuming into one commit, which
-        # is exactly what §3.0b separates so that exactly-once survives a crash.
-        self.conn.execute(
-            "UPDATE tasks SET status='queued',stop_reason=NULL,updated_at=?,revision=revision+1"
-            " WHERE id=?",
-            (now, task["id"]),
-        )
-
-    def pack_blobs(self) -> Any:
-        """The engine-owned content store, shared by every pack in this home."""
-        from .pack.blobs import BlobStore
-
-        store = getattr(self, "_pack_blobs", None)
-        if store is None:
-            store = BlobStore(self.home / "pack-blobs")
-            self._pack_blobs = store
-        return store
-
-    def _freeze_pack_candidate(self, task: sqlite3.Row, pack_id: str,
-                               op: dict[str, Any]) -> None:
-        """Freeze what the producer wrote: its fingerprint *and* its content.
-
-        Recording only the fingerprint notices that a candidate changed and
-        cannot put it back, which is why `A_restore_tree` had nothing to
-        restore from. The snapshot goes to the blob store and only its digest
-        is recorded, so a large tree does not land in the database.
-        """
-        from .pack import trees
-        from .pack.identities import candidate_fingerprint
-        from .profile import canonical_json
-
-        workspace = task["workspace_dir"]
-        attempt_id = op.get("attempt_id")
-        if not workspace or not attempt_id:
-            # Nothing to freeze that could later be restored; saying so beats
-            # recording a fingerprint with no content behind it.
-            return
-        root = Path(workspace)
-        attempt = self.pack_store.get_attempt(attempt_id)
-        output_id = attempt["next_output_id"]
-
-        fingerprint = candidate_fingerprint(root)
-        snapshot = trees.snapshot(self.pack_blobs(), root)
-        digest = self.pack_blobs().put(canonical_json(snapshot))
-
-        self.pack_store.freeze_output(pack_id, output_id, attempt_id, fingerprint)
-        self.pack_store.update_attempt(attempt_id, next_output_id=output_id + 1)
-        self.pack_store.update_operation(op["op_id"], produced_output_id=output_id)
-        self.pack_store.add_record(
-            f"SNAP-{pack_id}-{output_id}", self.CANDIDATE_SNAPSHOT,
-            {"output_id": output_id, "snapshot_sha256": digest,
-             "candidate_fingerprint": fingerprint}, pack_id=pack_id)
-        self.pack_store.update_pack(pack_id, state=f"submitted({output_id})")
-
-    def pack_candidate_snapshot(self, pack_id: str, output_id: int) -> dict[str, Any] | None:
-        """The stored tree of one frozen output, ready for `A_restore_tree`."""
-        import json as _json
-
-        record = self.pack_store.get_record(f"SNAP-{pack_id}-{output_id}")
-        if record is None or record["revoked"]:
-            return None
-        return _json.loads(self.pack_blobs().get(record["payload"]["snapshot_sha256"]))
-
-    def _claimed_attempt(self, pack_id: str, stage_name: str) -> dict[str, Any] | None:
-        """The work attempt a producer stage writes under, created if absent.
-
-        A producer dispatched without one freezes nothing, so the candidate is
-        never recorded and the pack stays where it was - which reads as the
-        stage having produced nothing and dispatches it again. The contract
-        review deliberately has none: it predates the attempt (§2.7).
-        """
-        attempt = self.pack_store.current_attempt(pack_id)
-        if attempt is not None or stage_name not in {"apply", "repair"}:
-            return attempt
-        from .pack.intake import current_contract
-
-        contract = current_contract(self.pack_store, pack_id)
-        pack = self.pack_store.get_pack(pack_id)
-        previous = self.pack_store.get_output(pack_id, pack["k_last"])
-        attempt_id = f"WA-{pack_id}-{uuid.uuid4().hex[:8]}"
-        self.pack_store.create_attempt(
-            attempt_id, pack_id,
-            base_revision=(contract or {}).get("base_revision", ""),
-            candidate_input=previous["candidate_fingerprint"] if previous else None,
-            next_output_id=pack["k_last"] + 1)
-        return self.pack_store.get_attempt(attempt_id)
-
-    def _settle_contract_review(self, task: sqlite3.Row, pack_id: str,
-                                machine: PackMachine, op: dict[str, Any]) -> None:
-        """Where a contract review sends the pack (STATE-TABLE §406).
-
-        Findings go back to the contract's author and the task stops; a pass
-        returns the pack to the point it was contracted from. Without this the
-        pack sat in `contracting` with a consumed pass and the loop re-issued
-        the same review until the call budget stopped it.
-        """
-        receipt = self._pack_sealed_receipt(task, op)
-        self.pack_store.bump(pack_id, "review_seq")
-        if receipt is None:
-            # Fail closed. This gate exists to keep a bad contract away from a
-            # producer, so a review whose envelope cannot be read is the one
-            # case where passing it on is least defensible - and that is
-            # exactly what reading an absent envelope as "no findings" did.
-            machine.enter_hold(pack_id, "contract_invalid", return_point="contracting",
-                               alive=lambda o: False)
-            return
-        if (receipt.get("envelope") or {}).get("contract_findings"):
-            machine.enter_hold(pack_id, "contract_hold", return_point="contracting",
-                               alive=lambda o: False)
-            return
-        pack = self.pack_store.get_pack(pack_id)
-        self.pack_store.update_pack(pack_id, state=pack["return_point"] or "claimed",
-                                    hold_reason=None)
-
-    def _pack_target(self, pack_id: str) -> Any:
-        from .pack.intake import TARGET_RECORD
-        from .pack.target import load_target
-
-        record = self.pack_store.get_record(f"TARGET-{pack_id}")
-        if record is None or record["revoked"]:
-            raise ControllerError(f"{pack_id} has no target package recorded")
-        return load_target(Path(record["payload"]["path"]))
-
-    def _run_pack_prerun(self, task: sqlite3.Row) -> str:
-        """Run the contract's prerun checks against the frozen candidate.
-
-        No provider is involved, so no call budget is reserved: §3.4 counts
-        provider calls, and charging a verify run against that budget would let
-        verification starve the dispatches it exists to inform.
-        """
-        from .pack import verify_runner
-        from .pack.blobs import BlobStore, seal_observation
-        from .pack.intake import current_record
-
-        pack_id = task["id"]
-        pack = self.pack_store.get_pack(pack_id)
-        record = current_record(self.pack_store, pack_id)
-        if record is None:
-            raise ControllerError(f"{pack_id} has no contract to verify against")
-        contract, environment = record["contract"], record.get("environment", {})
-        target = self._pack_target(pack_id)
-        attempt = self.pack_store.current_attempt(pack_id)
-        output_id = pack["k_last"]
-        frozen = self.pack_store.get_output(pack_id, output_id)
-
-        op_id = f"PRERUN-{pack_id}-{output_id}-{uuid.uuid4().hex[:8]}"
-        self.pack_store.create_operation(op_id, pack_id, type="verify", stage="prerun",
-                                         attempt_id=attempt["attempt_id"] if attempt else None)
-        base = Path(task["artifact_dir"]) / "prerun" / f"{output_id}"
-        bundle = base / "bundle"
-        blobs = BlobStore(self.home / "pack-blobs")
-        checks = {check["check_id"]: check for check in contract["approved_checks"]}
-
-        observations = []
-        for index, requested in enumerate(contract["prerun_checks"], start=1):
-            check = checks.get(requested["check_id"])
-            if check is None:
-                raise ControllerError(
-                    f"{pack_id}: prerun names {requested['check_id']!r}, which the"
-                    " contract does not approve")
-            artifacts_root = base / f"artifacts-{index}"
-            out_path = base / f"envelope-{index}.json"
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            plan = verify_runner.build_plan(
-                pack_id=pack_id, change=pack["change"], target_id=pack["target_id"],
-                contract_version=pack["contract_version"], operation_id=op_id,
-                attempt_id=attempt["attempt_id"] if attempt else "", 
-                candidate_fingerprint=frozen["candidate_fingerprint"] if frozen else "",
-                check=check, params=requested.get("params", {}),
-                subject={"kind": "obligation", "id": check["check_id"]},
-                workspace=Path(task["workspace_dir"]),
-                artifacts_root=artifacts_root,
-                target_package_digest=environment.get("target_package_digest", ""),
-                target_package_version=environment.get("target_package_version", ""),
-                tool_versions=environment.get("tool_versions", {}),
-                assigned_resources=[])
-            plan_path = base / f"plan-{index}.json"
-            plan_path.write_text(json.dumps(plan, sort_keys=True), encoding="utf-8")
-
-            def spawn(_plan, _plan_path=plan_path, _out=out_path):
-                try:
-                    target.verify(_plan_path, _out)
-                except Exception as exc:  # transport failure is a result, not a crash
-                    return {"exit_code": 1, "timed_out": False, "signal": None,
-                            "error": str(exc)}
-                return {"exit_code": 0, "timed_out": False, "signal": None}
-
-            envelope, receipt = verify_runner.run_verify(
-                plan=plan, artifacts_root=artifacts_root, out_path=out_path, spawn=spawn)
-            verdict = verify_runner.decide_usable(
-                envelope=envelope or {}, plan=plan, receipt=receipt,
-                contract_tool_versions=environment.get("tool_versions", {}),
-                contract_package_digest=environment.get("target_package_digest", ""),
-                contract_package_version=environment.get("target_package_version", ""),
-                artifacts_root=artifacts_root,
-                # No managed resources in the prerun path yet, so there is
-                # nothing released and nothing for the engine to clean up;
-                # declaring them empty is the honest input, not a stub.
-                verified_release={}, engine_cleanup={})
-            subject = {"kind": "obligation", "id": check["check_id"]}
-            observations.append(seal_observation(
-                blobs, bundle, f"OBS-{index}",
-                {"kind": "verify",
-                 "candidate_fingerprint": plan["candidate_fingerprint"],
-                 "contract_hash": pack["contract_hash"],
-                 "operation_id": op_id,
-                 "invocation_id": plan["invocation_id"],
-                 "result_kind": plan["result_kind"],
-                 # What the check reported, or UNKNOWN when the envelope is not
-                 # usable: an unusable run has no status to claim.
-                 "status": (envelope or {}).get("status") if verdict["usable"] else "UNKNOWN",
-                 "subject": subject,
-                 "produced_by": "engine"},
-                envelope, usable=bool(verdict["usable"]), subject=subject))
-
-        # Bound like any other call: consumption is decided from the binding,
-        # and a result with none cannot be told apart from one that belongs to
-        # a superseded output.
-        self.pack_store.update_operation(
-            op_id, result="completed",
-            call_binding={"stage": "prerun", "attempt_id": attempt["attempt_id"] if attempt else None,
-                          "output_id": output_id, "review_round": None,
-                          "contract_hash": pack["contract_hash"]})
-        return op_id
-
-    def _open_pack_operation(self, task: sqlite3.Row, run_token: str,
-                             stage: Any) -> str | None:
-        """Reserve the call's budget and record its operation, before the spawn.
-
-        Two reasons this cannot wait until after the provider starts. §3.4's
-        gate is the *only* thing that refuses a pack-v1 dispatch, the legacy
-        caps having been bypassed, so a reservation made afterwards refuses
-        nothing. And reconcile can only find an operation that exists: a crash
-        in the spawn window would otherwise leave a running provider with no
-        record at all.
-
-        Returns the hold reason when the dispatch is refused, else None.
-        """
-        pack_id = task["id"]
-        try:
-            self.pack_store.get_pack(pack_id)
-        except KeyError:
-            return None  # a pack-v1 task whose pack row intake has not created
-        machine = PackMachine(self.pack_store)
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            # Caps come from the contract's `budget_policy`; until intake loads
-            # one, §3.4's own defaults apply rather than no limit at all.
-            # The producer gate runs first: a refusal must not spend a call.
-            refused = (machine.dispatch_gate_for_role(pack_id, stage.name)
-                       or machine.reserve_dispatch(pack_id, budget_policy=None))
-            if refused is None:
-                pack = self.pack_store.get_pack(pack_id)
-                attempt = self._claimed_attempt(pack_id, stage.name)
-                self.pack_store.create_operation(
-                    run_token, pack_id, type="provider", stage=stage.name,
-                    attempt_id=attempt["attempt_id"] if attempt else None,
-                    reserved_counters={"call_budget": 1},
-                )
-                # Bound at dispatch, not at commit: consumption is decided by
-                # comparing this against the pack, so a call with no binding
-                # can only ever read as stale - and a stale contract review is
-                # re-dispatched, which is how one pack spent its whole call
-                # budget on the same round.
-                # A result is only consumable while the pack is in the state
-                # its stage runs in (§3.0b). Dispatching without moving the
-                # pack there leaves every result deferred for ever, which reads
-                # as the stage having produced nothing and dispatches it again.
-                if stage.name in {"apply", "repair"} and attempt is not None:
-                    self.pack_store.update_pack(
-                        pack_id, state=f"producing({attempt['next_output_id']})")
-                self.pack_store.update_operation(run_token, call_binding={
-                    "stage": stage.name,
-                    "attempt_id": attempt["attempt_id"] if attempt else None,
-                    "output_id": pack["k_last"] or None,
-                    "review_round": pack["review_round"] or None,
-                    "contract_hash": pack["contract_hash"],
-                })
-            self.conn.execute("COMMIT")
-        except BaseException:
-            if self.conn.in_transaction:
-                self.conn.execute("ROLLBACK")
-            raise
-        if refused is not None:
-            machine.enter_hold(pack_id, refused, alive=lambda op: False)
-        return refused
-
-    def _pack_review_history(self, task: sqlite3.Row, pack_id: str,
-                             exclude_op_id: str) -> list[dict[str, Any]]:
-        """Prior rounds' envelopes, read back out of their sealed receipts.
-
-        The history is not stored separately on purpose: rebuilding it from the
-        receipts means the judge folds exactly what was sealed, rather than a
-        second copy that could drift from it.
-        """
-        history: list[dict[str, Any]] = []
-        for op in self.pack_store.operations(pack_id, stage="review"):
-            if op["op_id"] == exclude_op_id or op["result"] != "completed":
-                continue
-            receipt = self._pack_sealed_receipt(task, op)
-            if receipt is not None:
-                history.append(receipt["envelope"])
-        return history
-
-    def _advance_pack(self, task: sqlite3.Row) -> None:
-        """Consume what the call sealed, then set the task status from the pack.
-
-        Without this the task went back to `queued` after every call and the run
-        loop re-dispatched the same stage for ever - the pack machine holds the
-        state that decides whether there is anything left to dispatch.
-        """
-        pack_id = task["id"]
-        try:
-            self.pack_store.get_pack(pack_id)
-        except KeyError:
-            return
-        machine = PackMachine(self.pack_store)
-        for op in list(self.pack_store.unconsumed_operations(pack_id)):
-            machine.consume_result(
-                pack_id, op["op_id"],
-                apply_fn=lambda outcome, consumed, _task=task: self._apply_pack_stage(
-                    _task, pack_id, machine, outcome, consumed),
-            )
-        pack = self.pack_store.get_pack(pack_id)
-        state = pack["state"]
-        if state == "accepted":
-            status, reason = "done", None
-        elif state.startswith("hold("):
-            status, reason = "waiting_user", state[len("hold("):-1]
-        else:
-            status, reason = "queued", None
-        # Both rows in one transaction (§8): written separately, a crash in
-        # between leaves a task queued for a stage its pack has already left.
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            PackPolicy(self.pack_store).transition_pack_task(
-                pack_id, state, task_status=status, stop_reason=reason,
-                hold_reason=pack["hold_reason"])
-            self.conn.execute("COMMIT")
-        except BaseException:
-            if self.conn.in_transaction:
-                self.conn.execute("ROLLBACK")
-            raise
-
-    def _apply_pack_stage(self, task: sqlite3.Row, pack_id: str, machine: PackMachine,
-                          outcome: str, op: dict[str, Any]) -> None:
-        """The one stage effect the machine cannot infer: judging a review.
-
-        The envelope comes from the sealed receipt rather than from provider
-        output parsed a second time, so what is judged is exactly what was
-        sealed and verified.
-        """
-        if outcome != PACK_CONSUME:
-            return
-        if op.get("stage") == "contract_review":
-            self._settle_contract_review(task, pack_id, machine, op)
-            return
-        if op.get("stage") in {"apply", "repair"}:
-            # Both produce a candidate. Freezing only `apply` left every repair
-            # round unfrozen, so the pack never advanced and the round was
-            # dispatched again.
-            self._freeze_pack_candidate(task, pack_id, op)
-            return
-        if op.get("stage") == "prerun":
-            # The observations are sealed; what they say is the reviewer's to
-            # judge, so a failing check moves the pack on rather than stopping
-            # it - a failure is evidence, not a transport error.
-            self.pack_store.update_pack(
-                pack_id, state=f"reviewing({self.pack_store.get_pack(pack_id)['k_last']})")
-            return
-        if op.get("stage") != "review":
-            return
-        receipt = self._pack_sealed_receipt(task, op)
-        if receipt is None:
-            # Same fail-closed rule, with the exit §3.4 gives this one: a
-            # redispatch spends one of the reviewer's allowance, and running
-            # out of allowance is a hold rather than a silent retry.
-            refused = machine.use_reviewer_retry(
-                pack_id, stage="review", output_id=self.pack_store.get_pack(pack_id)["k_last"],
-                cause="envelope_invalid", record_id=f"RT-{uuid.uuid4()}")
-            if refused is not None:
-                machine.enter_hold(pack_id, refused, alive=lambda o: False)
-            return
-        machine.judge_round(
-            pack_id, receipt["envelope"],
-            history=self._pack_review_history(task, pack_id, op["op_id"]),
-        )
-
-    def _pack_outcomes(self, task: sqlite3.Row, stage: Any) -> list[str] | None:
-        """pack-v1's allowed outcome set for this stage, or None for legacy.
-
-        The legacy helper derives the set from whether an envelope happens to be
-        present; pack-v1's is a policy constant per stage, so a stage that has
-        not yet produced an envelope still advertises the same outcomes.
-        """
-        if not self._is_pack_v1(task):
-            return None
-        try:
-            return sorted(pack_allowed_outcomes(stage.name))
-        except KeyError:
-            # A profile stage pack-v1 has no outcome set for is a configuration
-            # error, not a licence to fall back to the legacy derivation.
-            raise ControllerError(f"pack-v1 has no allowed outcomes for stage {stage.name!r}")
-
-    def _policy_version(self, task: sqlite3.Row) -> str:
-        """Which policy this task runs under, read from its own frozen snapshot.
-
-        Unreadable or absent means legacy, deliberately: every pack-v1 branch
-        below is an *exception* to the existing behaviour, so a task we cannot
-        classify must fall back to what the controller did before pack-v1
-        existed rather than into a path its snapshot never authorised.
-        """
-        try:
-            plan = extract_plan(self._read_verified_input(task["id"]), self._profile_for(task))
-        except Exception:
-            return DEFAULT_POLICY
-        return (plan.policy_version if plan is not None else None) or DEFAULT_POLICY
-
-    # ------------------------------------------------------------------
-    # pack-v1 reconcile (STATE-TABLE §5) - IMPLEMENTATION-PLAN step 3
-    # ------------------------------------------------------------------
-
-    CANDIDATE_SNAPSHOT = "candidate_snapshot"
-
-    def _pack_receipt_path(self, task: sqlite3.Row, op_id: str) -> Path:
-        return Path(task["artifact_dir"]) / "pack-receipts" / f"{op_id}.json"
-
-    def _seal_pack_receipt(self, task: sqlite3.Row, run_token: str, result: RunResult) -> None:
-        """Write the call's receipt *before* the commit that would record it.
-
-        §5's recovery case is precisely the window between a provider finishing
-        and the controller committing. Sealing inside `commit_run` would put the
-        receipt on the far side of the crash it exists to survive.
-
-        A call whose output carries no parseable envelope seals nothing: there
-        is no verifiable result to recover, and unknown is the honest answer.
-        """
-        # The provider's *final message*, not its whole stream. Framing requires
-        # exactly one marker block, and a reasoning provider echoes the envelope
-        # as it works - the live run saw three copies in one stdout - so parsing
-        # the stream rejects a perfectly well-formed answer. Falling back to the
-        # stream covers providers whose stdout *is* the final message.
-        authoritative = result.final_response or result.output or ""
-        try:
-            envelope, outcome = parse_framing(authoritative)
-        except EnvelopeInvalid:
-            return
-        try:
-            binding = self.pack_store.get_operation(run_token)["call_binding"] or {}
-        except KeyError:
-            # Same reason `_commit_pack_run` creates one: a run whose operation
-            # row is missing would otherwise lose its result entirely.
-            binding = {}
-        digest = pack_receipts.seal(
-            self._pack_receipt_path(task, run_token), op_id=run_token,
-            call_binding=binding, outcome=outcome, envelope=envelope,
-        )
-        # Its own transaction, committed before the run's: the expectation has
-        # to be durable *before* the commit it protects, or a crash in between
-        # leaves a receipt with nothing to verify it against.
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            try:
-                self.pack_store.get_operation(run_token)
-            except KeyError:
-                self.pack_store.create_operation(
-                    run_token, task["id"], type="provider", stage=str(task["current_stage"]))
-            self.pack_store.update_operation(run_token, receipt_ref=digest)
-            self.conn.execute("COMMIT")
-        except BaseException:
-            if self.conn.in_transaction:
-                self.conn.execute("ROLLBACK")
-            raise
-
-    @staticmethod
-    def _pack_operation_alive(op: dict[str, Any]) -> bool:
-        """Whether the operation's original process group still has members.
-
-        Not stop evidence - E-1 stopped being about liveness (D-2026-09-16-01).
-        This only decides whether reconcile waits or looks for a receipt, so
-        every uncertain answer is "alive": waiting costs time, while a wrong
-        "dead" invites a second writer onto the same tree.
-        """
-        identity = op.get("process_identity") or {}
-        pgid = identity.get("pgid")
-        if not pgid:
-            return False
-        try:
-            os.killpg(int(pgid), 0)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            return True
-        return True
-
-    def _pack_sealed_receipt(self, task: sqlite3.Row,
-                             op: dict[str, Any]) -> dict[str, Any] | None:
-        """The operation's receipt, or None when it cannot be verified.
-
-        Two checks `receipts.load` supports are not available here and are not
-        faked: the call binding is only compared when one was recorded before
-        the spawn, which the pack dispatch site does not yet do, and envelope
-        legality needs the stage's expected header and observations, which this
-        layer does not hold. Both are wired where that context exists.
-        """
-        ref = op.get("receipt_ref")
-        if not ref:
-            return None
-        try:
-            receipt = pack_receipts.load(
-                self._pack_receipt_path(task, op["op_id"]),
-                expected_sha256=ref, op_id=op["op_id"],
-                expected_binding=op.get("call_binding"),
-            )
-        except pack_receipts.ReceiptInvalid:
-            return None
-        return {**receipt, "sha256": ref}
-
-    def reconcile_pack(self, task: sqlite3.Row) -> dict[str, int]:
-        """Run the pack's own §5 reconcile for a task interrupted while running.
-
-        The legacy orphan handler is bypassed for pack-v1 so that it cannot
-        destroy the evidence; until this ran, nothing replaced it and an
-        interrupted pack task simply stayed `running` for ever.
-        """
-        pack_id = task["id"]
-        try:
-            self.pack_store.get_pack(pack_id)
-        except KeyError:
-            return {"reconcile_no_pack": 1}
-        machine = PackMachine(self.pack_store)
-        return machine.startup_scan(
-            pack_id,
-            alive=self._pack_operation_alive,
-            sealed=lambda op: self._pack_sealed_receipt(task, op),
-        )
-
-    def _is_pack_v1(self, task: sqlite3.Row) -> bool:
-        return self._policy_version(task) == "pack-v1"
-
     def _envelope_for_task(self, task: sqlite3.Row) -> dict[str, Any] | None:
         """Envelope presence, read from the hash-verified input snapshot."""
         snapshot = Path(task["input_snapshot_path"])
@@ -2375,19 +1699,13 @@ class Controller:
         reports_location: str | None = None,
         envelope: dict[str, Any] | None = None,
         convergence: dict[str, Any] | None = None,
-        outcome_set: list[str] | None = None,
     ) -> str:
         """The single prompt-composition site, and so the single injection site.
 
         Envelope additions remain conditional. The minimum-safe scope rule is
         shared by legacy and envelope tasks; it adds no transitions or calls.
         """
-        # pack-v1 passes its per-stage constant in; every other caller leaves
-        # `outcome_set` unset and gets the legacy derivation unchanged (§3.2a).
-        outcomes = ", ".join(
-            outcome_set if outcome_set is not None
-            else allowed_outcomes(stage.outcomes, envelope is not None)
-        )
+        outcomes = ", ".join(allowed_outcomes(stage.outcomes, envelope is not None))
         reports_line = (
             f"Reports directory (write stage reports here): {reports_location}\n"
             if reports_location
@@ -2591,8 +1909,6 @@ class Controller:
             return self.runner
         if type(self.runner) is not SubprocessRunner:
             raise ExecutionConfigError("custom runner cannot silently ignore execution plan")
-        if plan.policy_version == "pack-v1":
-            return self._pack_stage_runner(task, stage, plan)
         runner = ConfiguredRunner(plan.stages[stage.name], plan.digest)
         if runner.choice.role == "reviewer":
             context = review_context(self._read_verified_input(task["id"]))
@@ -2603,42 +1919,6 @@ class Controller:
                 raise ExecutionConfigError("review session binding missing or belongs to another series")
             runner.bind_session(self.home, plan.spec_series_id, expected)
         return runner
-
-    def _pack_stage_runner(self, task: sqlite3.Row, stage: Any, plan: Any) -> Any:
-        """The launcher for one pack stage, per the §3.1 role matrix.
-
-        `configured_command` picks its argv from the *role name*, which encodes
-        execution-v1's executor=codex / reviewer=claude. pack-v1 inverts that,
-        so reusing it hands a Claude producer Codex's argv - it dies on
-        `--sandbox` - and hands a Codex reviewer the *executor* argv, which is
-        `danger-full-access`: write access to the tree the reviewer is supposed
-        to be unable to touch.
-        """
-        from .execution_runner import provider_command
-        from .pack.dispatch import PackRunner
-        from .pack.provider_adapters import ClaudeAdapter, CodexAdapter
-
-        choice = plan.stages[stage.name]
-        workspace = self._workspace_for(task)
-        binary = provider_command(choice.provider)[0]
-        if choice.provider == "claude":
-            adapter = ClaudeAdapter(binary=binary, model=choice.model)
-            runner = PackRunner(adapter.command(cwd=str(workspace), single_boundary=True))
-            # Inseparable from `single_boundary`: with the provider's own
-            # permission layer off, the runner must refuse to spawn at all
-            # unless the engine's L1 sandbox is in place. One boundary, and it
-            # is the one the engine can account for.
-            runner.require_outer_sandbox = True
-            return runner
-        else:
-            adapter = CodexAdapter(binary=binary, model=choice.model,
-                                   codex_home=Path.home() / ".codex")
-            # No `--output-last-message` here. The runner owns the final-response
-            # channel and refuses to share it, which is right: two parties
-            # writing the same channel is how a typed outcome gets read out of
-            # the display stream instead of the answer.
-            argv = adapter.command(cwd=str(workspace))
-        return PackRunner(argv)
 
     def _provider_preflight(self, owner: str | None, *, runner: Any = None) -> ProviderPreflightResult:
         if owner is None:

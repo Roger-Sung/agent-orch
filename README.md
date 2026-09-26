@@ -15,6 +15,19 @@ where retries and side effects must be auditable afterwards. Published to be
 read, not adopted — see [Project status](#project-status). The engine has no
 third-party Python dependencies, and the demo needs no setup.
 
+## Canonical engine and state
+
+`agent-orch` is the single maintained orchestrator engine. It has one
+canonical lifecycle state (`tasks` and `stage_runs`), one canonical event log
+(`transitions`, with `notifications` derived from it), and one canonical run
+receipt (`stage_runs.manifest_path` plus `manifest_hash`). The engine uses one
+durable SQLite database, `ORCH_HOME/orchestrator.db`, and the only valid
+execution policy identifier is `policy_version=execution-v1`.
+
+AI-OS is a client and profile provider for this engine, not another engine.
+The T1SBE Node controller is reference-only / retired: it is historical design
+material, not a dependency, integration target, or compatibility product.
+
 ## For portfolio reviewers
 
 This project is about **control-plane engineering around fallible agents**, not

@@ -30,12 +30,6 @@ POLICIES: dict[str, dict[str, Any]] = {
         "roles": {"executor": "codex", "reviewer": "claude"},
         "model_locks": {"reviewer": "claude-fable-5-1"},
     },
-    # pack-v1 reverses the pairing: the producer is Claude and both reviewer
-    # stages are Codex, so a model never reviews its own output (D-2026-09-14-05).
-    "pack-v1": {
-        "roles": {"producer": "claude", "contract_review": "codex", "reviewer": "codex"},
-        "model_locks": {},
-    },
 }
 DEFAULT_POLICY = "execution-v1"
 ROLE_PROVIDERS = POLICIES[DEFAULT_POLICY]["roles"]

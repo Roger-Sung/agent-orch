@@ -121,12 +121,6 @@ def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.executescript(DDL)
-    # pack-v1 only adds tables (IMPLEMENTATION-PLAN §2). Creating them here,
-    # at open time, keeps them out of any caller's transaction: executescript
-    # would otherwise implicitly commit whatever the caller had open.
-    from .pack.store import SCHEMA as PACK_SCHEMA
-
-    conn.executescript(PACK_SCHEMA)
     _migrate(conn)
     return conn
 
