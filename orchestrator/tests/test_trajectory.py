@@ -9,7 +9,6 @@ import uuid
 from pathlib import Path
 
 from orchestrator.db import DDL, _migrate, connect
-from orchestrator.pack.store import SCHEMA as PACK_SCHEMA
 from orchestrator.trajectory import TrajectoryError, TrajectoryStore, canonical_event_bytes, seal_event
 
 
@@ -487,7 +486,6 @@ class TrajectoryTest(unittest.TestCase):
         legacy.row_factory = sqlite3.Row
         legacy_ddl = DDL.split("\nCREATE TABLE IF NOT EXISTS trajectory_events(", 1)[0]
         legacy.executescript(legacy_ddl)
-        legacy.executescript(PACK_SCHEMA)
         _migrate(legacy)
         legacy.execute(
             """INSERT INTO tasks(
