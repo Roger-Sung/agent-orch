@@ -10,6 +10,7 @@ import sqlite3
 import socket
 import subprocess
 import tempfile
+import threading
 import unittest
 import uuid
 from pathlib import Path
@@ -692,6 +693,89 @@ class TrajectoryTest(unittest.TestCase):
         self.assertEqual(stderr.getvalue().count("\n"), 1)
         self.assertNotIn("token-do-not-echo", stderr.getvalue())
 
+    def test_concurrent_writers_serialize_without_gaps_or_duplicate_retry(self) -> None:
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def append_transition(index: int) -> None:
+            conn = connect(self.path)
+            try:
+                barrier.wait(timeout=5)
+                conn.execute("BEGIN IMMEDIATE")
+                TrajectoryWriter(conn, "write").append(
+                    self.task_id,
+                    "task.transition.committed",
+                    recorded_at_ms=2000 + index,
+                    body={
+                        "transition_seq": index + 1,
+                        "operation_id": f"concurrent-{index}",
+                        "from_status": None,
+                        "to_status": "queued",
+                        "reason_code": "stage_completed",
+                        "reason_digest": None,
+                        "outcome_code": None,
+                        "outcome_digest": None,
+                    },
+                )
+                conn.execute("COMMIT")
+            except BaseException as exc:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        workers = [threading.Thread(target=append_transition, args=(index,)) for index in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        if errors:
+            raise errors[0]
+
+        rows = self.conn.execute(
+            "SELECT seq,event_id,event_hash,canonical_json FROM trajectory_events "
+            "WHERE trajectory_id=? ORDER BY seq",
+            (f"task:{self.task_id}",),
+        ).fetchall()
+        self.assertEqual([row["seq"] for row in rows], [1, 2])
+        self.assertEqual(len({row["event_id"] for row in rows}), 2)
+        events = [json.loads(bytes(row["canonical_json"])) for row in rows]
+        self.assertEqual(events[0]["prev_event_hash"], None)
+        self.assertEqual(events[1]["prev_event_hash"], events[0]["event_hash"])
+        for event, row in zip(events, rows, strict=True):
+            self.assertEqual(canonical_event_bytes(event), bytes(row["canonical_json"]))
+
+        retry = connect(self.path)
+        self.addCleanup(retry.close)
+        retry.execute("BEGIN IMMEDIATE")
+        with self.assertRaisesRegex(TrajectoryError, "conflicts with durable state"):
+            TrajectoryWriter(retry, "write").append(
+                self.task_id,
+                "task.transition.committed",
+                recorded_at_ms=2003,
+                event_id=rows[0]["event_id"],
+                body={
+                    "transition_seq": 3,
+                    "operation_id": "concurrent-retry",
+                    "from_status": None,
+                    "to_status": "queued",
+                    "reason_code": "stage_completed",
+                    "reason_digest": None,
+                    "outcome_code": None,
+                    "outcome_digest": None,
+                },
+            )
+        retry.execute("ROLLBACK")
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM trajectory_events WHERE trajectory_id=?",
+                (f"task:{self.task_id}",),
+            ).fetchone()[0],
+            2,
+        )
+
 
 ROOT = Path(__file__).resolve().parents[2]
 DEMO_PROFILE = ROOT / "orchestrator" / "examples" / "demo-loop.yaml"
@@ -1068,6 +1152,51 @@ class InvocationAdapterTest(unittest.TestCase):
             self.assertEqual(
                 stderr_buffer.getvalue(), "orchestrator: trajectory-r0 failed\n"
             )
+
+    def test_r0_cli_preserves_filesystem_and_sqlite_sidecar_metadata(self) -> None:
+        controller, task_id = self.completed()
+        controller.conn.execute("PRAGMA journal_mode=WAL")
+        controller.conn.execute("BEGIN IMMEDIATE")
+        controller.conn.execute(
+            "UPDATE tasks SET updated_at=updated_at WHERE id=?", (task_id,)
+        )
+        controller.conn.execute("COMMIT")
+        snapshot = freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+
+        def metadata(root: Path) -> dict[str, tuple[int, int, int, int]]:
+            result = {}
+            for path in sorted((root, *root.rglob("*"))):
+                stat = path.stat(follow_symlinks=False)
+                result[str(path.relative_to(root))] = (
+                    stat.st_mode,
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                )
+            return result
+
+        before = metadata(controller.home)
+        self.assertTrue(any(name.endswith("-wal") for name in before))
+        self.assertTrue(any(name.endswith("-shm") for name in before))
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.dict(os.environ, {
+                "ORCH_TRAJECTORY_V1": "read",
+                "ORCH_HOME": str(controller.home),
+            }),
+            patch("sys.stdin", io.StringIO(json.dumps(snapshot))),
+            patch("sys.stdout", stdout),
+            patch("sys.stderr", stderr),
+            patch("sqlite3.connect", side_effect=AssertionError("sqlite connection")),
+            patch.object(subprocess, "Popen", side_effect=AssertionError("subprocess")),
+            patch.object(socket, "socket", side_effect=AssertionError("network")),
+        ):
+            code = cli_main(["trajectory-r0"])
+        after = metadata(controller.home)
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(before, after)
 
     def test_evidence_adapter_rejects_missing_or_corrupt_manifest_and_wrong_binding(self) -> None:
         controller, task_id = self.completed()
