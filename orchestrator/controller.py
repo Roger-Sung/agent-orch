@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .containment import (
     DEFAULT_SENTINEL_EXCLUDES,
@@ -52,6 +52,14 @@ from .execution import ExecutionConfigError, extract_plan, review_context
 from .execution_runner import ConfiguredRunner
 from .review_contract import build_packet
 from . import review_session
+from .trajectory import (
+    OUTCOME_CODES,
+    TRANSITION_REASON_CODES,
+    TrajectoryWriter,
+    digest_text,
+    parity_diagnostics,
+    trajectory_mode,
+)
 
 
 ACTIVE_STATUSES = {"queued", "running"}
@@ -131,6 +139,8 @@ class Controller:
         )
         self.tasks_dir = self.home / "tasks"
         self.conn = connect(self.home / "orchestrator.db", read_only=read_only)
+        self.trajectory_mode = trajectory_mode()
+        self.trajectory = TrajectoryWriter(self.conn, self.trajectory_mode)
         self.runner = runner or SubprocessRunner()
         self.event_callback = event_callback
         # read_only: query without taking over, skipping the orphan block, so
@@ -245,7 +255,7 @@ class Controller:
                 "INSERT INTO edge_counts(task_id,edge,cap) VALUES(?,?,?)",
                 [(task_id, edge, cap) for edge, cap in profile.edge_caps.items()],
             )
-            self._insert_transition(
+            transition_seq = self._insert_transition(
                 task_id,
                 operation_id or str(uuid.uuid4()),
                 None,
@@ -257,7 +267,19 @@ class Controller:
                 "queued",
                 "submitted",
             )
-            self.conn.execute("COMMIT")
+            event_ids: list[str] = []
+            self._trajectory_add(event_ids, self.trajectory.append(
+                task_id,
+                "task.created",
+                recorded_at_ms=now,
+                body={
+                    "profile_digest": f"sha256:{profile_hash}",
+                    "input_digest": f"sha256:{input_hash}",
+                },
+                retention_class="structural",
+            ))
+            self._trajectory_transition(task_id, transition_seq, event_ids)
+            self._trajectory_commit(task_id, event_ids)
         except BaseException:
             if self.conn.in_transaction:
                 self.conn.execute("ROLLBACK")
@@ -616,6 +638,10 @@ class Controller:
             task = self._task(task_id)
             if task["status"] != "queued":
                 raise ControllerError(f"task {task_id} is not queued")
+            event_ids: list[str] = []
+            self._trajectory_add(
+                event_ids, self.trajectory.ensure_legacy_baseline(task_id, recorded_at_ms=_now())
+            )
             profile = self._profile_for(task)
             stage = profile.stage(task["current_stage"])
             if stage.terminal:
@@ -636,14 +662,14 @@ class Controller:
                 and not allowance
                 and not envelope_uncapped
             ):
-                self._stop_for_cap(task, "transition_cap", f"max_transitions={task['max_transitions']} reached")
-                self.conn.execute("COMMIT")
+                self._stop_for_cap(task, "transition_cap", f"max_transitions={task['max_transitions']} reached", event_ids)
+                self._trajectory_commit(task_id, event_ids)
                 return None
 
             cycle, attempt = self._next_attempt(task_id, stage.name)
             if attempt > stage.attempt_cap and not allowance:
-                self._stop_for_cap(task, "attempt_cap", f"{stage.name}.attempt_cap={stage.attempt_cap} reached")
-                self.conn.execute("COMMIT")
+                self._stop_for_cap(task, "attempt_cap", f"{stage.name}.attempt_cap={stage.attempt_cap} reached", event_ids)
+                self._trajectory_commit(task_id, event_ids)
                 return None
 
             run_token = str(uuid.uuid4())
@@ -691,7 +717,11 @@ class Controller:
             )
             if updated.rowcount != 1:
                 raise ControllerError("claim_stage CAS conflict")
-            self.conn.execute("COMMIT")
+            claimed_run = self.conn.execute(
+                "SELECT * FROM stage_runs WHERE run_token=?", (run_token,)
+            ).fetchone()
+            self._trajectory_stage_claimed(task_id, claimed_run, stage_runner, event_ids)
+            self._trajectory_commit(task_id, event_ids)
             return run_token, stage, profile, log_path
         except BaseException:
             if self.conn.in_transaction:
@@ -701,6 +731,7 @@ class Controller:
     def commit_run(self, task_id: str, run_token: str, result: RunResult, profile: Profile) -> None:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            event_ids: list[str] = []
             task = self._task(task_id)
             run = self.conn.execute("SELECT * FROM stage_runs WHERE run_token=?", (run_token,)).fetchone()
             if not run or run["task_id"] != task_id or run["status"] != "running" or task["status"] != "running":
@@ -755,7 +786,9 @@ class Controller:
                     raise ControllerError("commit_run CAS conflict")
                 self._notify(task_id, seq, result.reason, f"task {task_id} {status}: {result.reason}")
                 self._write_evidence_index(task_id)
-                self.conn.execute("COMMIT")
+                self._trajectory_run_settled(task_id, run_token, result, event_ids)
+                self._trajectory_transition(task_id, seq, event_ids)
+                self._trajectory_commit(task_id, event_ids)
                 return
 
             outcome = result.outcome
@@ -816,7 +849,9 @@ class Controller:
                     f"task {task_id} waiting_user: user decision required ({result.reason})",
                 )
                 self._write_evidence_index(task_id)
-                self.conn.execute("COMMIT")
+                self._trajectory_run_settled(task_id, run_token, result, event_ids)
+                self._trajectory_transition(task_id, seq, event_ids)
+                self._trajectory_commit(task_id, event_ids)
                 return
 
             target_name = stage.outcomes[outcome]
@@ -910,7 +945,9 @@ class Controller:
             elif next_status in {"done", "failed"}:
                 self._notify(task_id, seq, next_status, f"task {task_id} {next_status}: terminal stage {target_name}")
                 self._write_evidence_index(task_id)
-            self.conn.execute("COMMIT")
+            self._trajectory_run_settled(task_id, run_token, result, event_ids)
+            self._trajectory_transition(task_id, seq, event_ids)
+            self._trajectory_commit(task_id, event_ids)
         except BaseException:
             if self.conn.in_transaction:
                 self.conn.execute("ROLLBACK")
@@ -932,6 +969,10 @@ class Controller:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             task = self._task(task_id)
+            event_ids: list[str] = []
+            self._trajectory_add(
+                event_ids, self.trajectory.ensure_legacy_baseline(task_id, recorded_at_ms=_now())
+            )
             if task["status"] not in RESUMABLE_STATUSES:
                 raise ControllerError(
                     f"task {task_id} cannot resume from {task['status']}; "
@@ -965,7 +1006,7 @@ class Controller:
                 "UPDATE tasks SET status='queued',stop_reason=NULL,lease_token=NULL,resume_allowance=?,revision=revision+1,updated_at=? WHERE id=?",
                 (allowance, now, task_id),
             )
-            self._insert_transition(
+            transition_seq = self._insert_transition(
                 task_id,
                 operation_id or str(uuid.uuid4()),
                 None,
@@ -977,7 +1018,8 @@ class Controller:
                 "queued",
                 "manual_rerun_stage" if rerun_stage else "manual_resume",
             )
-            self.conn.execute("COMMIT")
+            self._trajectory_transition(task_id, transition_seq, event_ids)
+            self._trajectory_commit(task_id, event_ids)
         except BaseException:
             if self.conn.in_transaction:
                 self.conn.execute("ROLLBACK")
@@ -1363,7 +1405,9 @@ class Controller:
             return row["cycle"], row["attempt"] + 1
         return row["cycle"] + 1, 1
 
-    def _stop_for_cap(self, task: sqlite3.Row, reason: str, detail: str) -> None:
+    def _stop_for_cap(
+        self, task: sqlite3.Row, reason: str, detail: str, event_ids: list[str]
+    ) -> None:
         seq = self._insert_transition(
             task["id"],
             str(uuid.uuid4()),
@@ -1383,10 +1427,15 @@ class Controller:
         )
         self._notify(task["id"], seq, reason, f"task {task['id']} waiting_user: {detail}")
         self._write_evidence_index(task["id"])
+        self._trajectory_transition(task["id"], seq, event_ids)
 
     def _block_orphaned_running(self, task: sqlite3.Row) -> None:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            event_ids: list[str] = []
+            self._trajectory_add(
+                event_ids, self.trajectory.ensure_legacy_baseline(task["id"], recorded_at_ms=_now())
+            )
             run = self.conn.execute(
                 "SELECT * FROM stage_runs WHERE task_id=? AND status='running'", (task["id"],)
             ).fetchone()
@@ -1400,6 +1449,9 @@ class Controller:
                 self.conn.execute(
                     "UPDATE stage_runs SET status='blocked',ended_at=? WHERE run_token=?", (now, run["run_token"])
                 )
+                run = self.conn.execute(
+                    "SELECT * FROM stage_runs WHERE run_token=?", (run["run_token"],)
+                ).fetchone()
             seq = self._insert_transition(
                 task["id"], str(uuid.uuid4()), run["run_token"] if run else None,
                 task["current_stage"], task["owner"], None, None, "running", "blocked", reason,
@@ -1410,11 +1462,451 @@ class Controller:
             )
             self._notify(task["id"], seq, reason, f"task {task['id']} blocked: unknown runner interruption")
             self._write_evidence_index(task["id"])
-            self.conn.execute("COMMIT")
+            if run is not None:
+                self._trajectory_unsealed_run(
+                    task["id"], run, classification="blocked",
+                    recorded_at_ms=now, event_ids=event_ids,
+                )
+            self._trajectory_transition(task["id"], seq, event_ids)
+            self._trajectory_commit(task["id"], event_ids)
         except BaseException:
             if self.conn.in_transaction:
                 self.conn.execute("ROLLBACK")
             raise
+
+    #: Canonical `transitions.reason` strings that mean exactly one v1 code.
+    #: Anything absent here — `attempt_cap`, `provider_preflight_timeout`,
+    #: `runner_nonzero`, a containment stop — becomes `other` plus a digest.
+    #: Mapping a near-miss onto a neighbouring code (attempt cap onto the
+    #: transition cap) would misreport why a task stopped, which is worse than
+    #: an honest opaque digest.
+    TRAJECTORY_REASON_ALIASES = {
+        "submitted": "task_created",
+        "manual_resume": "resumed",
+        "manual_rerun_stage": "resumed",
+        "user_decision_required": "needs_user_decision",
+    }
+
+    @staticmethod
+    def _trajectory_code(
+        value: str | None,
+        allowed: frozenset[str],
+        aliases: Mapping[str, str] | None = None,
+    ) -> tuple[str | None, str | None]:
+        if value is None:
+            return None, None
+        code = (aliases or {}).get(value, value)
+        if code in allowed:
+            return code, None
+        return "other", digest_text(value)
+
+    @staticmethod
+    def _trajectory_usage(result: RunResult) -> dict[str, Any]:
+        values = (result.usage_input_tokens, result.usage_output_tokens, result.usage_total_tokens)
+        if any(value is not None for value in values):
+            return {
+                "basis": "per-turn",
+                "input_tokens": result.usage_input_tokens,
+                "output_tokens": result.usage_output_tokens,
+                "total_tokens": result.usage_total_tokens,
+                "unavailable_reason_code": None,
+                "unavailable_reason_digest": None,
+            }
+        raw = result.usage_unavailable_reason or "runner_usage_unavailable"
+        allowed = {
+            "provider_cli_usage_not_reported",
+            "runner_usage_unavailable",
+            "not_applicable_provider_preflight_failed",
+        }
+        code = raw if raw in allowed else "other"
+        return {
+            "basis": "unavailable",
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+            "unavailable_reason_code": code,
+            "unavailable_reason_digest": None if code != "other" else digest_text(raw),
+        }
+
+    @staticmethod
+    def _trajectory_identifier(value: str | None, fallback: str) -> str:
+        if not value:
+            return fallback
+        candidate = "".join(
+            character.lower() if character.isalnum() or character in "._:-" else "-"
+            for character in value
+        )[:128]
+        if not candidate or not candidate[0].isalnum():
+            return fallback
+        return candidate
+
+    def _trajectory_commit(self, task_id: str, event_ids: list[str]) -> None:
+        diagnostics = parity_diagnostics(self.conn, task_id, event_ids)
+        if diagnostics:
+            raise ControllerError(f"trajectory parity failed before commit: {diagnostics[0]['code']}")
+        self.conn.execute("COMMIT")
+        diagnostics = parity_diagnostics(self.conn, task_id, event_ids)
+        if diagnostics:
+            raise ControllerError(f"trajectory parity failed after commit: {diagnostics[0]['code']}")
+
+    @staticmethod
+    def _trajectory_add(event_ids: list[str], event_id: str | None) -> None:
+        if event_id is not None:
+            event_ids.append(event_id)
+
+    def _trajectory_transition(self, task_id: str, transition_seq: int, event_ids: list[str]) -> None:
+        if not self.trajectory.enabled:
+            return
+        row = self.conn.execute(
+            "SELECT * FROM transitions WHERE task_id=? AND seq=?", (task_id, transition_seq)
+        ).fetchone()
+        reason_code, reason_digest = self._trajectory_code(
+            row["reason"], TRANSITION_REASON_CODES, self.TRAJECTORY_REASON_ALIASES
+        )
+        outcome_code, outcome_digest = self._trajectory_code(row["outcome"], OUTCOME_CODES)
+        event_id = self.trajectory.append(
+            task_id,
+            "task.transition.committed",
+            recorded_at_ms=int(row["at"]),
+            body={
+                "transition_seq": int(row["seq"]),
+                "operation_id": row["operation_id"],
+                "from_status": row["from_status"],
+                "to_status": row["to_status"],
+                "reason_code": reason_code,
+                "reason_digest": reason_digest,
+                "outcome_code": outcome_code,
+                "outcome_digest": outcome_digest,
+            },
+        )
+        self._trajectory_add(event_ids, event_id)
+
+    def _trajectory_stage_claimed(
+        self, task_id: str, run: sqlite3.Row, runner: Any, event_ids: list[str]
+    ) -> None:
+        role = "reviewer" if isinstance(runner, ConfiguredRunner) and runner.choice.role == "reviewer" else "executor"
+        event_id = self.trajectory.append(
+            task_id,
+            "stage.claimed",
+            recorded_at_ms=int(run["started_at"]),
+            run=run,
+            body={"lease_digest": digest_text(run["lease_token"]), "owner_role": role},
+        )
+        self._trajectory_add(event_ids, event_id)
+        policy = {
+            "owner": run["owner"],
+            "model": run["model"] or "unspecified",
+            "role": role,
+        }
+        capability = {
+            "runner": type(runner).__name__,
+            "protected_roots": bool(self.protected_roots),
+        }
+        event_id = self.trajectory.append(
+            task_id,
+            "provider.dispatch_intent",
+            recorded_at_ms=int(run["started_at"]),
+            run=run,
+            invocation_id=run["run_token"],
+            actor_provider=run["owner"],
+            actor_model=self._trajectory_identifier(run["model"], "unspecified"),
+            session_ref=self._trajectory_session_ref_for_runner(runner),
+            body={
+                "policy_digest": "sha256:" + hashlib.sha256(canonical_json(policy)).hexdigest(),
+                "capability_digest": "sha256:" + hashlib.sha256(canonical_json(capability)).hexdigest(),
+            },
+            retention_class="structural",
+        )
+        self._trajectory_add(event_ids, event_id)
+
+    @staticmethod
+    def _trajectory_session_ref(value: str | None) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        return "session-" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+    @classmethod
+    def _trajectory_session_ref_for_runner(cls, runner: Any) -> str | None:
+        binding = getattr(runner, "session_binding", None)
+        if isinstance(binding, dict):
+            return cls._trajectory_session_ref(binding.get("session_id"))
+        return None
+
+    def _trajectory_evidence_ref(
+        self,
+        task: sqlite3.Row,
+        run: sqlite3.Row,
+        path: Path,
+        *,
+        kind: str,
+        sensitivity: str,
+        seal_kind: str,
+        manifest_hash: str | None,
+    ) -> dict[str, Any]:
+        root = Path(task["artifact_dir"]).resolve(strict=True)
+
+        def task_local(candidate: Path) -> Path:
+            if not candidate.is_absolute():
+                raise ControllerError("trajectory evidence path is not controller-generated")
+            try:
+                lexical_relative = candidate.relative_to(root)
+            except ValueError as exc:
+                raise ControllerError("trajectory evidence escaped the task artifact root") from exc
+            if any(part in {"", ".", ".."} for part in lexical_relative.parts):
+                raise ControllerError("trajectory evidence path is not normalized")
+            cursor = root
+            for part in lexical_relative.parts:
+                cursor = cursor / part
+                if cursor.is_symlink():
+                    raise ControllerError("trajectory evidence path contains a symlink")
+            if not candidate.is_file():
+                raise ControllerError("trajectory evidence is not a regular task artifact")
+            resolved_candidate = candidate.resolve(strict=True)
+            if not resolved_candidate.is_relative_to(root):
+                raise ControllerError("trajectory evidence escaped the task artifact root")
+            return resolved_candidate
+
+        resolved = task_local(path)
+        if manifest_hash is None or manifest_hash != run["manifest_hash"]:
+            raise ControllerError("trajectory evidence is not bound to the committed run manifest")
+        manifest_path = Path(run["manifest_path"] or "")
+        task_local(manifest_path)
+        manifest_raw = manifest_path.read_bytes()
+        if hashlib.sha256(manifest_raw).hexdigest() != manifest_hash:
+            raise ControllerError("trajectory evidence manifest hash mismatch")
+        try:
+            manifest = json.loads(manifest_raw)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
+            raise ControllerError("trajectory evidence manifest is invalid") from exc
+        version = manifest.get("schema_version") if isinstance(manifest, dict) else None
+        if type(version) is not int or version not in SUPPORTED_MANIFEST_VERSIONS:
+            raise ControllerError("trajectory evidence manifest version is unsupported")
+        if manifest.get("task_id") != task["id"] or manifest.get("run_token") != run["run_token"]:
+            raise ControllerError("trajectory evidence manifest binding mismatch")
+
+        if kind == "final-response":
+            try:
+                boundary = validate_sealed_boundary(manifest)
+            except BoundaryMetadataError as exc:
+                raise ControllerError("trajectory evidence final response seal is invalid") from exc
+            expected_path = Path(boundary.path)
+            expected_hash = boundary.digest
+        elif kind in {"run-manifest", "transport-receipt", "session-binding", "checkpoint"}:
+            expected_path = manifest_path
+            expected_hash = manifest_hash
+        else:
+            raise ControllerError("trajectory evidence kind is unsupported")
+        if task_local(expected_path) != resolved:
+            raise ControllerError("trajectory evidence path does not match its committed seal")
+
+        relative = resolved.relative_to(root).as_posix()
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != expected_hash:
+            raise ControllerError("trajectory evidence payload hash mismatch")
+        return {
+            "ref_id": "evref:" + str(uuid.uuid4()),
+            "kind": kind,
+            "relative_path": relative,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size_bytes": len(raw),
+            "media_type": "application/json" if path.suffix == ".json" else "text/plain",
+            "seal": {
+                "kind": seal_kind,
+                "schema_version": version,
+                "run_token": run["run_token"],
+                "manifest_hash": manifest_hash,
+            },
+            "sensitivity": sensitivity,
+            "retention_class": "sealed-evidence",
+            "availability_at_append": "present",
+        }
+
+    def _trajectory_run_settled(
+        self,
+        task_id: str,
+        run_token: str,
+        result: RunResult,
+        event_ids: list[str],
+    ) -> None:
+        if not self.trajectory.enabled:
+            return
+        task = self._task(task_id)
+        run = self.conn.execute("SELECT * FROM stage_runs WHERE run_token=?", (run_token,)).fetchone()
+        manifest_path = Path(run["manifest_path"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_ref = self._trajectory_evidence_ref(
+            task, run, manifest_path, kind="run-manifest", sensitivity="internal",
+            seal_kind="db-committed-run-manifest", manifest_hash=run["manifest_hash"],
+        )
+        receipt_ref = self._trajectory_evidence_ref(
+            task, run, manifest_path, kind="transport-receipt", sensitivity="internal",
+            seal_kind="controller-receipt", manifest_hash=run["manifest_hash"],
+        )
+        final_path = Path(manifest["final_response_path"])
+        final_ref = self._trajectory_evidence_ref(
+            task, run, final_path, kind="final-response", sensitivity="sensitive",
+            seal_kind="db-committed-run-manifest", manifest_hash=run["manifest_hash"],
+        )
+        receipt = result.execution_receipt if isinstance(result.execution_receipt, dict) else {}
+        session_binding = receipt.get("session_binding") if isinstance(receipt, dict) else None
+        session_ref = None
+        if isinstance(session_binding, dict):
+            session_ref = session_binding.get("session_id")
+        if session_ref is None and isinstance(receipt, dict):
+            session_ref = receipt.get("provider_session_id")
+        session_ref = self._trajectory_session_ref(
+            session_ref if isinstance(session_ref, str) else None
+        )
+        provider = run["owner"]
+        model = self._trajectory_identifier(result.model or run["model"], "unspecified")
+        invoked = receipt.get("invocation_verified") if receipt else None
+        dispatched = bool(invoked) if invoked is not None else (
+            result.started_at_ms is not None and result.containment_stop is None
+        )
+        if dispatched:
+            event_id = self.trajectory.append(
+                task_id,
+                "provider.dispatched",
+                recorded_at_ms=int(result.started_at_ms or run["started_at"]),
+                run=run,
+                invocation_id=run_token,
+                session_ref=session_ref,
+                actor_provider=provider,
+                actor_model=model,
+                body={"transport_receipt_ref": receipt_ref["ref_id"]},
+                evidence_refs=[receipt_ref],
+            )
+            self._trajectory_add(event_ids, event_id)
+        classification = result.classification
+        # ``waiting_user`` is a controller disposition applied after a
+        # reviewer returned a valid, sealed result.  The provider invocation
+        # did settle successfully; projecting it as ``unknown`` would falsely
+        # turn a deliberate review hold into a crash-window signal.
+        result_class = (
+            "success" if classification == "waiting_user" else classification
+            if classification in {"success", "blocked", "paused", "failed"}
+            else "unknown"
+        )
+        event_id = self.trajectory.append(
+            task_id,
+            "provider.settled",
+            recorded_at_ms=int(result.ended_at_ms or run["ended_at"] or _now()),
+            run=run,
+            invocation_id=run_token,
+            session_ref=session_ref,
+            actor_kind="provider",
+            actor_id=provider,
+            actor_provider=provider,
+            actor_model=model,
+            body={
+                "result_class": result_class,
+                "elapsed_ms": int(run["duration_ms"] or 0),
+                "usage": self._trajectory_usage(result),
+                "final_response_ref": final_ref["ref_id"],
+            },
+            evidence_refs=[final_ref],
+        )
+        self._trajectory_add(event_ids, event_id)
+        session_ref_evidence = None
+        if session_ref is not None:
+            prior_rows = self.conn.execute(
+                "SELECT canonical_json FROM trajectory_events WHERE trajectory_id=? "
+                "AND event_type IN ('session.bound','session.rebound') ORDER BY seq",
+                (f"task:{task_id}",),
+            ).fetchall()
+            prior = [json.loads(bytes(row["canonical_json"])) for row in prior_rows]
+            latest = prior[-1] if prior else None
+            if latest is None or latest["session_ref"] != session_ref:
+                session_ref_evidence = self._trajectory_evidence_ref(
+                    task, run, manifest_path,
+                    kind="session-binding" if latest is None else "checkpoint",
+                    sensitivity="sensitive",
+                    seal_kind="session-binding" if latest is None else "checkpoint",
+                    manifest_hash=run["manifest_hash"],
+                )
+                if latest is None:
+                    body = {"role": "reviewer" if receipt.get("role") == "reviewer" else "executor",
+                            "binding_ref": session_ref_evidence["ref_id"]}
+                    event_type = "session.bound"
+                else:
+                    body = {
+                        "predecessor_event_id": latest["event_id"],
+                        "reason_code": "resume",
+                        "reason_digest": None,
+                        "checkpoint_ref": session_ref_evidence["ref_id"],
+                    }
+                    event_type = "session.rebound"
+                event_id = self.trajectory.append(
+                    task_id, event_type, recorded_at_ms=int(run["ended_at"] or _now()),
+                    session_ref=session_ref, body=body,
+                    evidence_refs=[session_ref_evidence], retention_class="sealed-evidence",
+                )
+                self._trajectory_add(event_ids, event_id)
+        sealed_refs = [manifest_ref, receipt_ref, final_ref]
+        if session_ref_evidence is not None:
+            sealed_refs.append(session_ref_evidence)
+        event_id = self.trajectory.append(
+            task_id,
+            "evidence.sealed",
+            recorded_at_ms=int(run["ended_at"] or _now()),
+            run=run,
+            body={"seal_version": RUN_MANIFEST_SCHEMA_VERSION},
+            evidence_refs=sealed_refs,
+            retention_class="sealed-evidence",
+        )
+        self._trajectory_add(event_ids, event_id)
+        outcome_code, outcome_digest = self._trajectory_code(result.outcome, OUTCOME_CODES)
+        # `sealed` is read back from the canonical row, not asserted, and it
+        # carries the manifest ref that proves it: R4 refuses a settled stage
+        # that claims a seal without pointing at the DB-committed manifest.
+        stage_sealed = bool(run["sealed"])
+        event_id = self.trajectory.append(
+            task_id,
+            "stage.settled",
+            recorded_at_ms=int(run["ended_at"] or _now()),
+            run=run,
+            body={
+                "classification": result.classification,
+                "outcome_code": outcome_code,
+                "outcome_digest": outcome_digest,
+                "elapsed_ms": int(run["duration_ms"] or 0),
+                "usage": self._trajectory_usage(result),
+                "sealed": stage_sealed,
+            },
+            evidence_refs=[manifest_ref] if stage_sealed else [],
+        )
+        self._trajectory_add(event_ids, event_id)
+
+    def _trajectory_unsealed_run(
+        self, task_id: str, run: sqlite3.Row, *, classification: str,
+        recorded_at_ms: int, event_ids: list[str],
+        unavailable_reason_code: str = "runner_usage_unavailable",
+    ) -> None:
+        if not self.trajectory.enabled:
+            return
+        outcome_code, outcome_digest = self._trajectory_code(run["outcome"], OUTCOME_CODES)
+        event_id = self.trajectory.append(
+            task_id,
+            "stage.settled",
+            recorded_at_ms=recorded_at_ms,
+            run=run,
+            body={
+                "classification": classification,
+                "outcome_code": outcome_code,
+                "outcome_digest": outcome_digest,
+                "elapsed_ms": int(run["duration_ms"] or 0),
+                "usage": {
+                    "basis": "unavailable",
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "total_tokens": None,
+                    "unavailable_reason_code": unavailable_reason_code,
+                    "unavailable_reason_digest": None,
+                },
+                "sealed": False,
+            },
+        )
+        self._trajectory_add(event_ids, event_id)
 
     def _insert_transition(
         self,
@@ -1934,6 +2426,10 @@ class Controller:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             task = self._task(task_id)
+            event_ids: list[str] = []
+            self._trajectory_add(
+                event_ids, self.trajectory.ensure_legacy_baseline(task_id, recorded_at_ms=_now())
+            )
             if task["status"] != "queued":
                 self.conn.execute("ROLLBACK")
                 return
@@ -1986,7 +2482,16 @@ class Controller:
             )
             self._notify(task_id, seq, preflight.reason, f"task {task_id} {status}: provider preflight {preflight.reason}")
             self._write_evidence_index(task_id)
-            self.conn.execute("COMMIT")
+            run = self.conn.execute(
+                "SELECT * FROM stage_runs WHERE run_token=?", (run_token,)
+            ).fetchone()
+            self._trajectory_unsealed_run(
+                task_id, run, classification=status, recorded_at_ms=now,
+                event_ids=event_ids,
+                unavailable_reason_code="not_applicable_provider_preflight_failed",
+            )
+            self._trajectory_transition(task_id, seq, event_ids)
+            self._trajectory_commit(task_id, event_ids)
         except BaseException:
             if self.conn.in_transaction:
                 self.conn.execute("ROLLBACK")

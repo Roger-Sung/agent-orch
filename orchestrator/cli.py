@@ -16,6 +16,8 @@ from .doctor import run_doctor
 from .runner import ALLOW_UNSANDBOXED_ENV, UnattendedConsentError
 from .ipc import IPCError, daemon_is_running, enqueue_request, wait_for_result
 from .profile import ProfileError
+from .trajectory import TrajectoryError, trajectory_mode
+from .trajectory_replay import projection_bytes, reduce_snapshot, render_projection
 from .watch import (
     WATCH_DEFAULT_BYTES,
     WATCH_MIN_BYTES,
@@ -191,6 +193,19 @@ def build_parser() -> argparse.ArgumentParser:
             f"{WATCH_MIN_BYTES}, refused rather than clamped below it). It does NOT bound the "
             "response, which is roughly 4/3 of the raw bytes plus envelope overhead."
         ),
+    )
+
+    trajectory_r0 = subparsers.add_parser(
+        "trajectory-r0",
+        help="pure R0 projection from an explicit frozen snapshot; stdout only",
+    )
+    trajectory_r0.add_argument(
+        "--snapshot", default="-",
+        help="snapshot JSON path, or - for stdin (default)",
+    )
+    trajectory_r0.add_argument(
+        "--audience", action="append", choices=["public", "internal", "sensitive"],
+        help="explicit render audience; repeatable (default: public + internal)",
     )
 
     resume = subparsers.add_parser("resume", help="resume through the daemon and wait for its result")
@@ -378,6 +393,33 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         except (ControllerError, IPCError, OSError) as exc:
             print(f"orchestrator: {exc}", file=sys.stderr)
+            return 2
+
+    if args.command == "trajectory-r0":
+        try:
+            if trajectory_mode() != "read":
+                raise TrajectoryError("trajectory R0 is disabled; ORCH_TRAJECTORY_V1=read is required")
+            if args.snapshot == "-":
+                raw = sys.stdin.read()
+            else:
+                raw = Path(args.snapshot).read_text(encoding="utf-8")
+            snapshot = json.loads(raw)
+            audiences = tuple(args.audience or ("public", "internal"))
+            result = reduce_snapshot(snapshot, audience_policy=audiences)
+            rendered = render_projection(snapshot, result, audiences=audiences)
+            sys.stdout.write(projection_bytes(rendered).decode("utf-8"))
+            return 2 if result.integrity_status in {"corrupt", "mismatch"} else 0
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            KeyError,
+            RecursionError,
+            TrajectoryError,
+            TypeError,
+            ValueError,
+        ):
+            print(f"orchestrator: trajectory-r0 failed", file=sys.stderr)
             return 2
 
     if args.command == "watch":

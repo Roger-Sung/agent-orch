@@ -1,15 +1,42 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import os
+import copy
+import shutil
 import sqlite3
+import socket
+import subprocess
 import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
+from orchestrator.controller import Controller, ControllerError
+from orchestrator.cli import main as cli_main
 from orchestrator.db import DDL, _migrate, connect
-from orchestrator.trajectory import TrajectoryError, TrajectoryStore, canonical_event_bytes, seal_event
+from orchestrator.runner import RunResult
+from orchestrator.trajectory import (
+    BASELINE_NAMESPACE,
+    MISSING_DOMAINS,
+    TrajectoryError,
+    TrajectoryStore,
+    TrajectoryWriter,
+    canonical_event_bytes,
+    digest_text,
+    seal_event,
+    trajectory_mode,
+)
+from orchestrator.trajectory_replay import (
+    canonical_json_bytes,
+    freeze_snapshot,
+    projection_bytes,
+    reduce_snapshot,
+    render_projection,
+)
 
 
 SHA = "sha256:" + "a" * 64
@@ -23,6 +50,8 @@ class TrajectoryTest(unittest.TestCase):
         self.conn = connect(self.path)
         self.addCleanup(self.conn.close)
         self.task_id = "task-a"
+        self.artifact_dir = Path(self.tmp.name) / "artifacts"
+        self.artifact_dir.mkdir()
         self.conn.execute(
             """INSERT INTO tasks(
                    id,type,status,current_stage,owner,revision,profile_hash,input_hash,
@@ -30,7 +59,7 @@ class TrajectoryTest(unittest.TestCase):
                    created_at,updated_at
                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (self.task_id, "propose", "queued", "draft", "codex", 0, "p" * 64, "i" * 64,
-             "/tmp/profile", "/tmp/input", "/tmp/artifact", 10, 1, 1),
+             "/tmp/profile", "/tmp/input", str(self.artifact_dir), 10, 1, 1),
         )
 
     def event(self, *, seq: int = 1, previous: str | None = None, event_type: str = "task.created") -> dict:
@@ -99,7 +128,7 @@ class TrajectoryTest(unittest.TestCase):
         elif event_type == "provider.dispatched":
             ref_id = "evref:" + str(uuid.uuid4())
             event["body"] = {"transport_receipt_ref": ref_id}
-            event["evidence_refs"] = [self.evidence_ref(ref_id)]
+            event["evidence_refs"] = [self.evidence_ref(ref_id, run_token)]
         elif event_type == "provider.settled":
             event["body"] = {
                 "result_class": "success",
@@ -119,7 +148,7 @@ class TrajectoryTest(unittest.TestCase):
         return event
 
     @staticmethod
-    def evidence_ref(ref_id: str) -> dict:
+    def evidence_ref(ref_id: str, run_token: str = "fixture-run") -> dict:
         return {
             "ref_id": ref_id,
             "kind": "transport-receipt",
@@ -127,7 +156,7 @@ class TrajectoryTest(unittest.TestCase):
             "sha256": "c" * 64,
             "size_bytes": 2,
             "media_type": "application/json",
-            "seal": {"kind": "controller-receipt", "schema_version": 1, "run_token": None, "manifest_hash": None},
+            "seal": {"kind": "controller-receipt", "schema_version": 1, "run_token": run_token, "manifest_hash": "d" * 64},
             "sensitivity": "internal",
             "retention_class": "sealed-evidence",
             "availability_at_append": "present",
@@ -201,9 +230,11 @@ class TrajectoryTest(unittest.TestCase):
         self.conn.execute("ROLLBACK")
 
     def test_reserved_future_type_and_future_schema_are_rejected(self) -> None:
-        reserved = self.event(event_type="tool.requested")
-        with self.assertRaisesRegex(TrajectoryError, "unsupported event_type"):
-            seal_event(reserved)
+        for event_type in ("tool.requested", "approval.requested", "subagent.spawned", "join.decided"):
+            with self.subTest(event_type=event_type):
+                reserved = self.event(event_type=event_type)
+                with self.assertRaisesRegex(TrajectoryError, "unsupported event_type"):
+                    seal_event(reserved)
         future = self.event()
         future["schema_version"] = 2
         with self.assertRaisesRegex(TrajectoryError, "schema_version"):
@@ -282,6 +313,7 @@ class TrajectoryTest(unittest.TestCase):
                 "unavailable_reason_code": "other",
                 "unavailable_reason_digest": SHA,
             },
+            "sealed": False,
         }
         with self.assertRaisesRegex(TrajectoryError, "unsupported .*classification"):
             seal_event(stage)
@@ -346,6 +378,14 @@ class TrajectoryTest(unittest.TestCase):
         with self.assertRaisesRegex(TrajectoryError, "already has a dispatch intent"):
             TrajectoryStore(self.conn).append(duplicate)
         self.conn.execute("ROLLBACK")
+        wrong_session = self.provider_event(
+            "provider.dispatched", run_token, invocation_id, seq=2, previous=intent["event_hash"]
+        )
+        wrong_session["session_ref"] = "session-b"
+        self.conn.execute("BEGIN IMMEDIATE")
+        with self.assertRaisesRegex(TrajectoryError, "session changed after binding"):
+            TrajectoryStore(self.conn).append(seal_event(wrong_session))
+        self.conn.execute("ROLLBACK")
 
         settled_event = self.provider_event(
             "provider.settled", run_token, invocation_id, seq=2, previous=intent["event_hash"]
@@ -358,6 +398,57 @@ class TrajectoryTest(unittest.TestCase):
         with self.assertRaisesRegex(TrajectoryError, "duplicate provider.settled"):
             TrajectoryStore(self.conn).append(duplicate_settled)
         self.conn.execute("ROLLBACK")
+
+    def test_dispatch_intent_crash_window_projects_unknown_without_retry(self) -> None:
+        first = self.append(self.event())
+        run_token = self.add_run()
+        intent = self.provider_event(
+            "provider.dispatch_intent", run_token, "invocation-crash",
+            seq=2, previous=first["event_hash"],
+        )
+        self.append(intent)
+
+        snapshot = freeze_snapshot(self.conn, self.task_id, captured_at_ms=2000)
+        projection = reduce_snapshot(snapshot)
+        self.assertEqual(projection.integrity_status, "incomplete")
+        self.assertEqual(len(projection.invocations), 1)
+        self.assertEqual(projection.invocations[0]["dispatch_state"], "unknown")
+        self.assertEqual(projection.invocations[0]["result_state"], "unknown")
+        self.assertEqual(
+            {item["code"] for item in projection.unknowns},
+            {"provider_handoff_unknown", "provider_result_unknown"},
+        )
+
+    def test_evidence_ref_path_seal_and_run_binding_fail_closed(self) -> None:
+        run_token = self.add_run()
+        event = self.provider_event("provider.dispatched", run_token, "invocation-a")
+
+        for path in ("../receipt.json", "/tmp/receipt.json", "runs//receipt.json", "runs/./receipt.json"):
+            with self.subTest(path=path):
+                candidate = json.loads(json.dumps(event))
+                candidate["evidence_refs"][0]["relative_path"] = path
+                with self.assertRaisesRegex(TrajectoryError, "relative_path"):
+                    seal_event(candidate)
+
+        wrong_run = json.loads(json.dumps(event))
+        wrong_run["evidence_refs"][0]["seal"]["run_token"] = "another-run"
+        with self.assertRaisesRegex(TrajectoryError, "run binding"):
+            seal_event(wrong_run)
+
+        unsupported = json.loads(json.dumps(event))
+        unsupported["evidence_refs"][0]["seal"]["schema_version"] = 4
+        with self.assertRaisesRegex(TrajectoryError, "unsupported .*schema_version"):
+            seal_event(unsupported)
+
+        wrong_kind = json.loads(json.dumps(event))
+        wrong_kind["evidence_refs"][0]["seal"]["kind"] = "checkpoint"
+        with self.assertRaisesRegex(TrajectoryError, "does not match evidence kind"):
+            seal_event(wrong_kind)
+
+        wrong_availability = json.loads(json.dumps(event))
+        wrong_availability["evidence_refs"][0]["availability_at_append"] = "expired"
+        with self.assertRaisesRegex(TrajectoryError, "unsupported .*availability"):
+            seal_event(wrong_availability)
 
     def test_provider_settled_requires_complete_usage_contract(self) -> None:
         run_token = self.add_run()
@@ -539,3 +630,742 @@ class TrajectoryTest(unittest.TestCase):
             "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'trajectory_events_no_%'"
         )}
         self.assertEqual(triggers, {"trajectory_events_no_update", "trajectory_events_no_delete"})
+
+    def test_mixed_legacy_baseline_is_seq_gt_one_deterministic_and_idempotent(self) -> None:
+        writer = TrajectoryWriter(self.conn, "write")
+        self.conn.execute("BEGIN IMMEDIATE")
+        writer.append(
+            self.task_id,
+            "task.created",
+            recorded_at_ms=1000,
+            body={"profile_digest": "sha256:" + "a" * 64, "input_digest": "sha256:" + "b" * 64},
+            retention_class="structural",
+        )
+        self.conn.execute("COMMIT")
+
+        # Simulate a canonical transition committed while the gate was off.
+        self.conn.execute(
+            """INSERT INTO transitions(
+                   task_id,seq,operation_id,run_token,stage,owner,edge,outcome,
+                   from_status,to_status,reason,at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (self.task_id, 1, "legacy-operation", None, None, None, None, None,
+             None, "queued", "submitted", 1001),
+        )
+        self.conn.execute(
+            "UPDATE tasks SET revision=1,transitions_count=1,updated_at=1001 WHERE id=?",
+            (self.task_id,),
+        )
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        baseline_id = writer.ensure_legacy_baseline(self.task_id, recorded_at_ms=1002)
+        self.conn.execute("COMMIT")
+        expected = str(uuid.uuid5(BASELINE_NAMESPACE, f"task:{self.task_id}"))
+        self.assertEqual(baseline_id, expected)
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        repeated = writer.ensure_legacy_baseline(self.task_id, recorded_at_ms=1003)
+        self.conn.execute("COMMIT")
+        self.assertIsNone(repeated)
+        rows = self.conn.execute(
+            "SELECT canonical_json FROM trajectory_events WHERE trajectory_id=? ORDER BY seq",
+            (f"task:{self.task_id}",),
+        ).fetchall()
+        events = [json.loads(bytes(row["canonical_json"])) for row in rows]
+        self.assertEqual([event["seq"] for event in events], [1, 2])
+        baseline = events[1]
+        self.assertEqual(baseline["event_id"], expected)
+        self.assertEqual(baseline["body"]["completeness"], "partial")
+        self.assertEqual(baseline["body"]["missing_domains"], sorted(MISSING_DOMAINS))
+        self.assertEqual(baseline["body"]["coverage_through_transition_seq"], 1)
+
+        snapshot = freeze_snapshot(self.conn, self.task_id, captured_at_ms=1004)
+        projection = reduce_snapshot(snapshot)
+        self.assertEqual(projection.integrity_status, "ok")
+        self.assertEqual(projection.completeness, "partial")
+
+    def test_unknown_gate_value_fails_closed_without_echoing_the_value(self) -> None:
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr):
+            mode = trajectory_mode({"ORCH_TRAJECTORY_V1": "token-do-not-echo"})
+        self.assertEqual(mode, "off")
+        self.assertEqual(stderr.getvalue().count("\n"), 1)
+        self.assertNotIn("token-do-not-echo", stderr.getvalue())
+
+
+ROOT = Path(__file__).resolve().parents[2]
+DEMO_PROFILE = ROOT / "orchestrator" / "examples" / "demo-loop.yaml"
+DEMO_INPUT = ROOT / "orchestrator" / "examples" / "demo-input.md"
+
+#: The five canonical lifecycle emit points. Every other v1 type is either a
+#: provider/session detail or the migration baseline, and none of them stands
+#: in a one-to-one relation with a canonical row.
+CANONICAL_EMIT_POINTS = (
+    "task.created",
+    "task.transition.committed",
+    "stage.claimed",
+    "stage.settled",
+    "evidence.sealed",
+)
+
+
+class _ScriptedRunner:
+    """A runner that never leaves this process: it writes the outcome line."""
+
+    def __init__(self, outcomes: list[str]):
+        self.outcomes = iter(outcomes)
+
+    def run(self, owner: str, prompt: str, timeout: int, log_path: Path) -> RunResult:
+        output = f"ORCHESTRATOR_OUTCOME: {next(self.outcomes)}\n"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(output, encoding="utf-8")
+        return RunResult(0, output, None, "raw", "raw")
+
+
+SECRET_CANARY = "token:trajectory-canary-12345678"
+PROVIDER_SESSION = "provider-native-session-should-not-persist"
+
+
+class _ReceiptRunner:
+    def __init__(self, outcomes: list[str]):
+        self.outcomes = iter(outcomes)
+        self.session_binding = {"session_id": PROVIDER_SESSION}
+        self.tick = 1000
+
+    def run(self, owner: str, prompt: str, timeout: int, log_path: Path) -> RunResult:
+        outcome = next(self.outcomes)
+        output = f"{SECRET_CANARY}\nORCHESTRATOR_OUTCOME: {outcome}\n"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(output, encoding="utf-8")
+        started = self.tick
+        self.tick += 10
+        return RunResult(
+            0,
+            output,
+            None,
+            "raw",
+            "raw",
+            started_at_ms=started,
+            ended_at_ms=started + 5,
+            duration_ms=5,
+            usage_unavailable_reason="provider_cli_usage_not_reported",
+            execution_receipt={
+                "schema_version": 1,
+                "invocation_verified": True,
+                "provider_session_id": PROVIDER_SESSION,
+                "session_binding": self.session_binding,
+                "role": "executor",
+            },
+        )
+
+
+class InvocationAdapterTest(unittest.TestCase):
+    def controller(self) -> Controller:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        with patch.dict(os.environ, {"ORCH_TRAJECTORY_V1": "write"}):
+            controller = Controller(
+                Path(directory.name) / "runtime",
+                runner=_ReceiptRunner(["submit", "allow"]),
+            )
+        self.addCleanup(controller.close)
+        return controller
+
+    @staticmethod
+    def events(controller: Controller, task_id: str) -> list[dict]:
+        return [
+            json.loads(bytes(row["canonical_json"]))
+            for row in controller.conn.execute(
+                "SELECT canonical_json FROM trajectory_events WHERE task_id=? ORDER BY seq",
+                (task_id,),
+            )
+        ]
+
+    def completed(self) -> tuple[Controller, str]:
+        controller = self.controller()
+        task_id = controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        status = controller.run_until_stop(task_id)
+        self.assertEqual(status["task"]["status"], "done")
+        return controller, task_id
+
+    def test_valid_provider_session_and_seal_chain_is_opaque_and_secret_free(self) -> None:
+        controller, task_id = self.completed()
+        events = self.events(controller, task_id)
+        encoded = json.dumps(events, ensure_ascii=False, sort_keys=True)
+        expected_session = Controller._trajectory_session_ref(PROVIDER_SESSION)
+
+        self.assertNotIn(PROVIDER_SESSION, encoded)
+        self.assertNotIn(SECRET_CANARY, encoded)
+        invocations: dict[str, list[dict]] = {}
+        for event in events:
+            if event["event_type"].startswith("provider."):
+                invocations.setdefault(event["invocation_id"], []).append(event)
+        self.assertEqual(len(invocations), 2)
+        for invocation in invocations.values():
+            self.assertEqual(
+                [event["event_type"] for event in invocation],
+                ["provider.dispatch_intent", "provider.dispatched", "provider.settled"],
+            )
+            self.assertEqual(
+                {event["run"]["run_token"] for event in invocation},
+                {invocation[0]["invocation_id"]},
+            )
+            self.assertEqual({event["session_ref"] for event in invocation}, {expected_session})
+            dispatched = invocation[1]
+            settled = invocation[2]
+            self.assertEqual(
+                dispatched["body"]["transport_receipt_ref"],
+                dispatched["evidence_refs"][0]["ref_id"],
+            )
+            self.assertEqual(
+                settled["body"]["final_response_ref"],
+                settled["evidence_refs"][0]["ref_id"],
+            )
+
+        sessions = [event for event in events if event["event_type"] == "session.bound"]
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["session_ref"], expected_session)
+        self.assertTrue(any(event["event_type"] == "evidence.sealed" for event in events))
+        for event in events:
+            for ref in event["evidence_refs"]:
+                self.assertFalse(Path(ref["relative_path"]).is_absolute())
+                self.assertNotIn("..", Path(ref["relative_path"]).parts)
+                run = controller.conn.execute(
+                    "SELECT task_id,manifest_hash FROM stage_runs WHERE run_token=?",
+                    (ref["seal"]["run_token"],),
+                ).fetchone()
+                self.assertEqual(run["task_id"], task_id)
+                self.assertEqual(run["manifest_hash"], ref["seal"]["manifest_hash"])
+
+        snapshot = freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+        projection = reduce_snapshot(snapshot)
+        self.assertEqual(projection.integrity_status, "ok")
+        self.assertEqual(
+            {item["dispatch_state"] for item in projection.invocations}, {"dispatched"}
+        )
+        self.assertEqual(
+            {item["result_state"] for item in projection.invocations}, {"success"}
+        )
+        rendered = json.dumps(
+            render_projection(snapshot, projection), ensure_ascii=False, sort_keys=True
+        )
+        self.assertNotIn(PROVIDER_SESSION, rendered)
+        self.assertNotIn(SECRET_CANARY, rendered)
+
+    def test_waiting_user_review_is_a_settled_provider_result_not_a_crash_unknown(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        with patch.dict(os.environ, {"ORCH_TRAJECTORY_V1": "write"}):
+            controller = Controller(
+                Path(directory.name) / "runtime", runner=_ScriptedRunner([]),
+            )
+        self.addCleanup(controller.close)
+        task_id = controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        run_token, _, profile, _ = controller.claim_stage(task_id)
+        controller.commit_run(
+            task_id,
+            run_token,
+            RunResult(
+                0,
+                "ORCHESTRATOR_OUTCOME: needs_user_decision\n",
+                "needs_user_decision",
+                "waiting_user",
+                "review_requires_astra_decision",
+                started_at_ms=1000,
+                ended_at_ms=1005,
+                duration_ms=5,
+                usage_unavailable_reason="provider_cli_usage_not_reported",
+            ),
+            profile,
+        )
+
+        events = self.events(controller, task_id)
+        settled = [event for event in events if event["event_type"] == "provider.settled"]
+        self.assertEqual(len(settled), 1)
+        self.assertEqual(settled[0]["body"]["result_class"], "success")
+        snapshot = freeze_snapshot(controller.conn, task_id, captured_at_ms=2000)
+        projection = reduce_snapshot(snapshot)
+        self.assertEqual(projection.invocations[0]["result_state"], "success")
+        self.assertNotIn(
+            "provider_result_unknown", {item["code"] for item in projection.unknowns}
+        )
+
+    @staticmethod
+    def rehash_snapshot(snapshot: dict) -> None:
+        snapshot["manifest"]["evidence_inventory_digest"] = (
+            "sha256:" + hashlib.sha256(canonical_json_bytes(snapshot["evidence_inventory"])).hexdigest()
+        )
+        unhashed = {key: value for key, value in snapshot.items() if key != "snapshot_digest"}
+        snapshot["snapshot_digest"] = (
+            "sha256:" + hashlib.sha256(canonical_json_bytes(unhashed)).hexdigest()
+        )
+
+    def test_snapshot_isolation_stays_frozen_across_a_concurrent_writer_commit(self) -> None:
+        controller = self.controller()
+        controller.conn.execute("PRAGMA journal_mode=WAL")
+        task_id = controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        reader = connect(controller.home / "orchestrator.db", read_only=True)
+        self.addCleanup(reader.close)
+        reader.execute("BEGIN")
+        before = freeze_snapshot(reader, task_id, captured_at_ms=3000)
+
+        status = controller.run_until_stop(task_id)
+        self.assertEqual(status["task"]["status"], "done")
+        during = freeze_snapshot(reader, task_id, captured_at_ms=3000)
+        self.assertEqual(before, during)
+
+        reader.execute("ROLLBACK")
+        after = freeze_snapshot(reader, task_id, captured_at_ms=3000)
+        self.assertNotEqual(before["snapshot_digest"], after["snapshot_digest"])
+        self.assertGreater(len(after["ordered_events"]), len(before["ordered_events"]))
+
+    def test_snapshot_survives_missing_artifact_root_and_reports_unavailable_refs(self) -> None:
+        controller, task_id = self.completed()
+        artifact_dir = Path(controller._task(task_id)["artifact_dir"])
+        shutil.rmtree(artifact_dir)
+        snapshot = freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+        self.assertTrue(snapshot["evidence_inventory"])
+        self.assertTrue(all(
+            item["availability"] in {"unavailable", "expired"}
+            for item in snapshot["evidence_inventory"]
+        ))
+        projection = reduce_snapshot(snapshot)
+        self.assertEqual(projection.integrity_status, "incomplete")
+
+    def test_inventory_must_exactly_match_event_evidence_refs(self) -> None:
+        controller, task_id = self.completed()
+        snapshot = freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+        snapshot["evidence_inventory"].pop()
+        self.rehash_snapshot(snapshot)
+        projection = reduce_snapshot(snapshot)
+        self.assertEqual(projection.integrity_status, "corrupt")
+        self.assertIn(
+            "evidence_inventory_mismatch",
+            {item["code"] for item in projection.diagnostics},
+        )
+
+    def test_rehashed_malformed_canonical_state_still_fails_closed(self) -> None:
+        controller, task_id = self.completed()
+        snapshot = freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+        snapshot["canonical_state"] = {}
+        source_hash = "sha256:" + hashlib.sha256(canonical_json_bytes({})).hexdigest()
+        snapshot["source_db_snapshot_hash"] = source_hash
+        snapshot["manifest"]["source_db_snapshot_hash"] = source_hash
+        self.rehash_snapshot(snapshot)
+        projection = reduce_snapshot(snapshot)
+        self.assertEqual(projection.integrity_status, "corrupt")
+        self.assertEqual(
+            {item["code"] for item in projection.diagnostics}, {"snapshot_invalid"}
+        )
+
+    def test_default_render_compacts_sensitive_evidence_metadata(self) -> None:
+        controller, task_id = self.completed()
+        snapshot = freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+        projection = reduce_snapshot(snapshot)
+        rendered = render_projection(snapshot, projection)
+        sensitive_ids = {
+            item["ref_id"]
+            for item in snapshot["evidence_inventory"]
+            if item["sensitivity"] == "sensitive"
+        }
+        compact = [
+            item for item in rendered["projection"]["evidence_graph"]
+            if item["ref_id"] in sensitive_ids
+        ]
+        self.assertTrue(compact)
+        self.assertTrue(all(
+            set(item) == {"ref_id", "sha256", "availability"} for item in compact
+        ))
+
+    def test_r0_core_has_no_io_or_process_side_effects_for_required_input_classes(self) -> None:
+        controller, task_id = self.completed()
+        valid = freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+        corrupt = copy.deepcopy(valid)
+        corrupt["snapshot_digest"] = "sha256:" + "0" * 64
+        missing = copy.deepcopy(valid)
+        for item in missing["evidence_inventory"]:
+            item["availability"] = "unavailable"
+        self.rehash_snapshot(missing)
+        future = copy.deepcopy(valid)
+        future["snapshot_version"] = 2
+        self.rehash_snapshot(future)
+
+        with (
+            patch("builtins.open", side_effect=AssertionError("filesystem read/write")),
+            patch("sqlite3.connect", side_effect=AssertionError("sqlite connection")),
+            patch.object(subprocess, "Popen", side_effect=AssertionError("subprocess")),
+            patch.object(socket, "socket", side_effect=AssertionError("network")),
+            patch.object(tempfile, "NamedTemporaryFile", side_effect=AssertionError("tempfile")),
+        ):
+            outputs = []
+            for candidate in (valid, corrupt, missing, future):
+                result = reduce_snapshot(candidate)
+                outputs.append(projection_bytes(render_projection(candidate, result)))
+        self.assertEqual(len(outputs), 4)
+
+    def test_trajectory_r0_cli_is_stdout_only_and_fails_closed(self) -> None:
+        controller, task_id = self.completed()
+        snapshot = freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+
+        def invoke(payload: object, mode: str = "read") -> tuple[int, str, str]:
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch.dict(os.environ, {
+                    "ORCH_TRAJECTORY_V1": mode,
+                    "ORCH_HOME": str(controller.home),
+                }),
+                patch("sys.stdin", io.StringIO(json.dumps(payload))),
+                patch("sys.stdout", stdout),
+                patch("sys.stderr", stderr),
+            ):
+                code = cli_main(["trajectory-r0"])
+            return code, stdout.getvalue(), stderr.getvalue()
+
+        code, stdout, stderr = invoke(snapshot)
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(json.loads(stdout)["projection"]["integrity_status"], "ok")
+
+        code, stdout, stderr = invoke({})
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(stdout)["projection"]["integrity_status"], "corrupt")
+        self.assertNotIn("Traceback", stderr)
+
+        corrupt = copy.deepcopy(snapshot)
+        corrupt["snapshot_digest"] = "sha256:" + "0" * 64
+        code, stdout, stderr = invoke(corrupt)
+        self.assertEqual(code, 2)
+        self.assertTrue(stdout)
+        self.assertEqual(stderr, "")
+
+        code, stdout, stderr = invoke(snapshot, mode="write")
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "orchestrator: trajectory-r0 failed\n")
+
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        deeply_nested = "[" * 2000 + "0" + "]" * 2000
+        with (
+            patch.dict(os.environ, {
+                "ORCH_TRAJECTORY_V1": "read",
+                "ORCH_HOME": str(controller.home),
+            }),
+            patch("sys.stdin", io.StringIO(deeply_nested)),
+            patch("sys.stdout", stdout_buffer),
+            patch("sys.stderr", stderr_buffer),
+        ):
+            code = cli_main(["trajectory-r0"])
+        self.assertEqual(code, 2)
+        if stdout_buffer.getvalue():
+            self.assertEqual(
+                json.loads(stdout_buffer.getvalue())["projection"]["integrity_status"],
+                "corrupt",
+            )
+            self.assertEqual(stderr_buffer.getvalue(), "")
+        else:
+            self.assertEqual(
+                stderr_buffer.getvalue(), "orchestrator: trajectory-r0 failed\n"
+            )
+
+    def test_evidence_adapter_rejects_missing_or_corrupt_manifest_and_wrong_binding(self) -> None:
+        controller, task_id = self.completed()
+        task = controller._task(task_id)
+        run = controller.conn.execute(
+            "SELECT * FROM stage_runs WHERE task_id=? ORDER BY started_at,rowid LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        manifest_path = Path(run["manifest_path"])
+        original_manifest = manifest_path.read_bytes()
+        original_hash = run["manifest_hash"]
+        manifest = json.loads(original_manifest)
+        final_path = Path(manifest["final_response_path"])
+        original_final = final_path.read_bytes()
+
+        valid = controller._trajectory_evidence_ref(
+            task,
+            run,
+            final_path,
+            kind="final-response",
+            sensitivity="sensitive",
+            seal_kind="db-committed-run-manifest",
+            manifest_hash=original_hash,
+        )
+        self.assertEqual(valid["availability_at_append"], "present")
+
+        outside = controller.home.parent / "outside-evidence.txt"
+        outside.write_text("outside", encoding="utf-8")
+        with self.assertRaisesRegex(ControllerError, "escaped the task artifact root"):
+            controller._trajectory_evidence_ref(
+                task, run, outside, kind="run-manifest", sensitivity="internal",
+                seal_kind="db-committed-run-manifest", manifest_hash=original_hash,
+            )
+
+        symlink = Path(task["artifact_dir"]) / "manifest-link.json"
+        symlink.symlink_to(manifest_path)
+        with self.assertRaisesRegex(ControllerError, "symlink"):
+            controller._trajectory_evidence_ref(
+                task, run, symlink, kind="run-manifest", sensitivity="internal",
+                seal_kind="db-committed-run-manifest", manifest_hash=original_hash,
+            )
+
+        manifest_path.unlink()
+        with self.assertRaisesRegex(ControllerError, "regular task artifact"):
+            controller._trajectory_evidence_ref(
+                task, run, final_path, kind="final-response", sensitivity="sensitive",
+                seal_kind="db-committed-run-manifest", manifest_hash=original_hash,
+            )
+        manifest_path.write_bytes(original_manifest)
+
+        manifest_path.write_bytes(original_manifest + b"\n")
+        with self.assertRaisesRegex(ControllerError, "manifest hash mismatch"):
+            controller._trajectory_evidence_ref(
+                task, run, final_path, kind="final-response", sensitivity="sensitive",
+                seal_kind="db-committed-run-manifest", manifest_hash=original_hash,
+            )
+        manifest_path.write_bytes(original_manifest)
+
+        for field, value, message in (
+            ("schema_version", 4, "version is unsupported"),
+            ("task_id", "other-task", "manifest binding mismatch"),
+            ("run_token", "other-run", "manifest binding mismatch"),
+        ):
+            with self.subTest(field=field):
+                changed = dict(manifest)
+                changed[field] = value
+                raw = json.dumps(changed, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+                manifest_path.write_bytes(raw)
+                changed_hash = hashlib.sha256(raw).hexdigest()
+                controller.conn.execute(
+                    "UPDATE stage_runs SET manifest_hash=? WHERE run_token=?",
+                    (changed_hash, run["run_token"]),
+                )
+                changed_run = controller.conn.execute(
+                    "SELECT * FROM stage_runs WHERE run_token=?", (run["run_token"],)
+                ).fetchone()
+                with self.assertRaisesRegex(ControllerError, message) as caught:
+                    controller._trajectory_evidence_ref(
+                        task, changed_run, manifest_path, kind="run-manifest",
+                        sensitivity="internal", seal_kind="db-committed-run-manifest",
+                        manifest_hash=changed_hash,
+                    )
+                self.assertNotIn(SECRET_CANARY, str(caught.exception))
+                manifest_path.write_bytes(original_manifest)
+                controller.conn.execute(
+                    "UPDATE stage_runs SET manifest_hash=? WHERE run_token=?",
+                    (original_hash, run["run_token"]),
+                )
+
+        final_path.write_bytes(original_final + b"tampered")
+        with self.assertRaisesRegex(ControllerError, "payload hash mismatch") as caught:
+            controller._trajectory_evidence_ref(
+                task, run, final_path, kind="final-response", sensitivity="sensitive",
+                seal_kind="db-committed-run-manifest", manifest_hash=original_hash,
+
+            )
+        self.assertNotIn(SECRET_CANARY, str(caught.exception))
+        final_path.write_bytes(original_final)
+
+class CanonicalEmitPointTest(unittest.TestCase):
+    """The controller's emit points against the canonical rows they mirror.
+
+    These drive the real controller transactions rather than the store alone,
+    because the property under test is not "an event validates" — the tests
+    above already prove that — but "one canonical mutation produces exactly one
+    event, in the same transaction that produced the row".
+    """
+
+    def controller(self, outcomes: list[str], *, mode: str = "write") -> Controller:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        with patch.dict(os.environ, {"ORCH_TRAJECTORY_V1": mode}):
+            controller = Controller(Path(directory.name) / "runtime", runner=_ScriptedRunner(outcomes))
+        self.addCleanup(controller.close)
+        return controller
+
+    @staticmethod
+    def events(controller: Controller, task_id: str) -> list[dict]:
+        return [
+            json.loads(bytes(row["canonical_json"]))
+            for row in controller.conn.execute(
+                "SELECT canonical_json FROM trajectory_events WHERE trajectory_id=? ORDER BY seq",
+                (f"task:{task_id}",),
+            )
+        ]
+
+    @staticmethod
+    def of_type(events: list[dict], event_type: str) -> list[dict]:
+        return [event for event in events if event["event_type"] == event_type]
+
+    def assert_exactly_once(self, controller: Controller, task_id: str) -> None:
+        """Each canonical row is mirrored by exactly one event, and vice versa."""
+        events = self.events(controller, task_id)
+        rows = lambda sql: controller.conn.execute(sql, (task_id,)).fetchall()
+
+        # task.created: one per task, carrying that task's frozen digests.
+        created = self.of_type(events, "task.created")
+        self.assertEqual(len(created), 1)
+        task = controller.conn.execute(
+            "SELECT profile_hash,input_hash FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        self.assertEqual(
+            created[0]["body"],
+            {
+                "profile_digest": f"sha256:{task['profile_hash']}",
+                "input_digest": f"sha256:{task['input_hash']}",
+            },
+        )
+
+        # task.transition.committed: the multiset of mirrored sequences is the
+        # set of committed transition sequences — no duplicate, no gap.
+        committed = [
+            event["body"]["transition_seq"]
+            for event in self.of_type(events, "task.transition.committed")
+        ]
+        transition_seqs = [row["seq"] for row in rows("SELECT seq FROM transitions WHERE task_id=? ORDER BY seq")]
+        self.assertEqual(sorted(committed), transition_seqs)
+        self.assertEqual(len(set(committed)), len(committed))
+
+        # stage.claimed: one per *leased* run. A run that never took a lease —
+        # a provider-preflight stop writes one — was never claimed, so it
+        # correctly has no claim event and no lease digest to carry.
+        run_rows = rows(
+            "SELECT run_token,lease_token,sealed,status FROM stage_runs WHERE task_id=? ORDER BY started_at,rowid"
+        )
+        leased = {row["run_token"]: row["lease_token"] for row in run_rows if row["lease_token"]}
+        claimed = self.of_type(events, "stage.claimed")
+        self.assertEqual(
+            sorted(event["run"]["run_token"] for event in claimed), sorted(leased)
+        )
+        for event in claimed:
+            self.assertEqual(
+                event["body"]["lease_digest"], digest_text(leased[event["run"]["run_token"]])
+            )
+
+        # stage.settled / evidence.sealed: one per run that reached a terminal
+        # status, and the seal event only for a run the DB records as sealed.
+        settled_runs = {row["run_token"] for row in run_rows if row["status"] != "running"}
+        sealed_runs = {row["run_token"] for row in run_rows if row["sealed"]}
+        settled = self.of_type(events, "stage.settled")
+        sealed = self.of_type(events, "evidence.sealed")
+        self.assertEqual(sorted(event["run"]["run_token"] for event in settled), sorted(settled_runs))
+        self.assertEqual(sorted(event["run"]["run_token"] for event in sealed), sorted(sealed_runs))
+        for event in settled:
+            self.assertEqual(event["body"]["sealed"], event["run"]["run_token"] in sealed_runs)
+
+        # The chain itself stays contiguous across every emit point.
+        self.assertEqual([event["seq"] for event in events], list(range(1, len(events) + 1)))
+
+    def test_a_completed_task_emits_each_canonical_event_exactly_once(self):
+        controller = self.controller(["submit", "allow"])
+        task_id = controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        status = controller.run_until_stop(task_id)
+
+        self.assertEqual(status["task"]["status"], "done")
+        self.assert_exactly_once(controller, task_id)
+        present = {
+            event["event_type"] for event in self.events(controller, task_id)
+        } & set(CANONICAL_EMIT_POINTS)
+        self.assertEqual(present, set(CANONICAL_EMIT_POINTS))
+
+    def test_a_capped_task_still_emits_one_event_per_canonical_transition(self):
+        """The cap stop commits a transition from inside `claim_stage`.
+
+        It is the one canonical transition written outside `commit_run`, so it
+        is also the one most likely to be missed by an emit point bolted onto
+        the success path.
+        """
+        controller = self.controller(["submit", "block", "submit", "block"])
+        task_id = controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        status = controller.run_until_stop(task_id)
+
+        self.assertEqual(status["task"]["stop_reason"], "edge_cap")
+        self.assert_exactly_once(controller, task_id)
+
+    def test_the_gate_off_leaves_the_lifecycle_and_the_event_table_untouched(self):
+        controller = self.controller(["submit", "allow"], mode="off")
+        task_id = controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        status = controller.run_until_stop(task_id)
+
+        self.assertEqual(status["task"]["status"], "done")
+        self.assertEqual(self.events(controller, task_id), [])
+
+
+class SameTransactionRollbackTest(unittest.TestCase):
+    """A trajectory failure must take the canonical mutation down with it.
+
+    The event store is additive audit state, so the dangerous failure is not a
+    lost event: it is a committed canonical row whose event never landed, or an
+    event whose row was rolled back. Both are tested here by failing the write
+    at the last emit point of a `commit_run` that has already mutated
+    `stage_runs`, `transitions` and `tasks`.
+    """
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        with patch.dict(os.environ, {"ORCH_TRAJECTORY_V1": "write"}):
+            self.controller = Controller(
+                Path(directory.name) / "runtime", runner=_ScriptedRunner([]),
+            )
+        self.addCleanup(self.controller.close)
+        self.task_id = self.controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        self.run_token, self.stage, self.profile, _ = self.controller.claim_stage(self.task_id)
+        self.result = RunResult(
+            0, "ORCHESTRATOR_OUTCOME: submit\n", "submit", "success", "stage_completed"
+        )
+
+    def snapshot(self) -> dict:
+        def table(sql: str) -> list[dict]:
+            return [dict(row) for row in self.controller.conn.execute(sql, (self.task_id,))]
+
+        return {
+            "tasks": table("SELECT * FROM tasks WHERE id=?"),
+            "stage_runs": table("SELECT * FROM stage_runs WHERE task_id=? ORDER BY rowid"),
+            "transitions": table("SELECT * FROM transitions WHERE task_id=? ORDER BY seq"),
+            "events": table("SELECT * FROM trajectory_events WHERE task_id=? ORDER BY seq"),
+        }
+
+    def assert_rolled_back(self, before: dict) -> None:
+        self.assertFalse(self.controller.conn.in_transaction)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_failed_event_append_rolls_the_canonical_mutation_back(self):
+        before = self.snapshot()
+        real_append = TrajectoryStore.append
+
+        def fail_at_seal(store, event):
+            if event["event_type"] == "evidence.sealed":
+                raise TrajectoryError("injected append failure")
+            return real_append(store, event)
+
+        with patch.object(TrajectoryStore, "append", fail_at_seal):
+            with self.assertRaisesRegex(TrajectoryError, "injected append failure"):
+                self.controller.commit_run(
+                    self.task_id, self.run_token, self.result, self.profile
+                )
+        self.assert_rolled_back(before)
+
+        # The same run then commits cleanly, which proves the rollback left no
+        # half-written chain behind: a stale seq or prev hash would fail here.
+        self.controller.commit_run(self.task_id, self.run_token, self.result, self.profile)
+        after = self.snapshot()
+        self.assertEqual(after["stage_runs"][0]["status"], "committed")
+        self.assertEqual(len(after["transitions"]), len(before["transitions"]) + 1)
+        self.assertEqual(
+            [row["seq"] for row in after["events"]], list(range(1, len(after["events"]) + 1))
+        )
+
+    def test_a_parity_mismatch_rolls_back_before_the_commit(self):
+        """Parity is checked while the transaction can still be abandoned."""
+        before = self.snapshot()
+        with patch(
+            "orchestrator.controller.parity_diagnostics",
+            return_value=[{"code": "transition_mismatch", "event_id": "x", "event_seq": 1}],
+        ):
+            with self.assertRaisesRegex(ControllerError, "parity failed before commit"):
+                self.controller.commit_run(
+                    self.task_id, self.run_token, self.result, self.profile
+                )
+        self.assert_rolled_back(before)

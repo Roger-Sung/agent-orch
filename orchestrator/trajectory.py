@@ -15,12 +15,13 @@ import sqlite3
 import unicodedata
 import uuid
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Mapping
 
 
 SCHEMA_VERSION = 1
 EVENT_VERSION = 1
 NORMALIZER_VERSION = "trajectory-v1"
+BASELINE_NAMESPACE = uuid.UUID("b6a71f4d-cdb7-5f04-a808-49df5d731c01")
 
 SUPPORTED_EVENT_TYPES = frozenset(
     {
@@ -163,6 +164,14 @@ EVIDENCE_KINDS = frozenset(
 SEAL_KINDS = frozenset(
     {"db-committed-run-manifest", "controller-receipt", "session-binding", "checkpoint"}
 )
+SUPPORTED_EVIDENCE_SEAL_VERSIONS = frozenset({1, 2, 3})
+EVIDENCE_SEAL_KINDS = {
+    "run-manifest": "db-committed-run-manifest",
+    "transport-receipt": "controller-receipt",
+    "session-binding": "session-binding",
+    "checkpoint": "checkpoint",
+    "final-response": "db-committed-run-manifest",
+}
 
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -201,6 +210,12 @@ def _nullable_integer(value: Any, label: str) -> int | None:
     if value is None:
         return None
     return _integer(value, label)
+
+
+def _boolean(value: Any, label: str) -> bool:
+    if type(value) is not bool:
+        raise TrajectoryError(f"{label} must be a boolean")
+    return value
 
 
 def _text(value: Any, label: str) -> str:
@@ -393,7 +408,13 @@ def _validate_evidence_ref(value: Any, label: str) -> str:
     _enum(value["kind"], EVIDENCE_KINDS, f"{label}.kind")
     path = _text(value["relative_path"], f"{label}.relative_path")
     pure = PurePosixPath(path)
-    if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
+    components = path.split("/")
+    if (
+        pure.is_absolute()
+        or not pure.parts
+        or any(part in {"", ".", ".."} for part in components)
+        or pure.as_posix() != path
+    ):
         raise TrajectoryError(f"{label}.relative_path must stay below the task artifact root")
     if any(PATH_SEGMENT.fullmatch(part) is None for part in pure.parts):
         raise TrajectoryError(f"{label}.relative_path contains an unsafe segment")
@@ -405,20 +426,23 @@ def _validate_evidence_ref(value: Any, label: str) -> str:
     if MEDIA_TYPE.fullmatch(media_type) is None:
         raise TrajectoryError(f"{label}.media_type is invalid")
     seal = _keys(value["seal"], {"kind", "schema_version", "run_token", "manifest_hash"}, f"{label}.seal")
-    _enum(seal["kind"], SEAL_KINDS, f"{label}.seal.kind")
-    _integer(seal["schema_version"], f"{label}.seal.schema_version", minimum=1)
-    _nullable_identifier(seal["run_token"], f"{label}.seal.run_token")
-    if seal["manifest_hash"] is not None:
-        manifest_hash = _text(seal["manifest_hash"], f"{label}.seal.manifest_hash")
-        if HEX_DIGEST.fullmatch(manifest_hash) is None:
-            raise TrajectoryError(f"{label}.seal.manifest_hash must be lowercase hex")
+    seal_kind = _enum(seal["kind"], SEAL_KINDS, f"{label}.seal.kind")
+    if seal_kind != EVIDENCE_SEAL_KINDS[value["kind"]]:
+        raise TrajectoryError(f"{label}.seal.kind does not match evidence kind")
+    seal_version = _integer(seal["schema_version"], f"{label}.seal.schema_version", minimum=1)
+    if seal_version not in SUPPORTED_EVIDENCE_SEAL_VERSIONS:
+        raise TrajectoryError(f"unsupported {label}.seal.schema_version")
+    _identifier(seal["run_token"], f"{label}.seal.run_token")
+    manifest_hash = _text(seal["manifest_hash"], f"{label}.seal.manifest_hash")
+    if HEX_DIGEST.fullmatch(manifest_hash) is None:
+        raise TrajectoryError(f"{label}.seal.manifest_hash must be lowercase hex")
     _enum(value["sensitivity"], SENSITIVITIES, f"{label}.sensitivity")
     _enum(value["retention_class"], RETENTION_CLASSES, f"{label}.retention_class")
     _enum(value["availability_at_append"], AVAILABILITY, f"{label}.availability_at_append")
     return ref_id
 
 
-def _validate_body(event_type: str, body: Any, refs: set[str]) -> None:
+def _validate_body(event_type: str, body: Any, refs: Mapping[str, Mapping[str, Any]]) -> None:
     label = f"body[{event_type}]"
     if event_type == "task.created":
         body = _keys(body, {"profile_digest", "input_digest"}, label)
@@ -458,7 +482,7 @@ def _validate_body(event_type: str, body: Any, refs: set[str]) -> None:
         _digest(body["lease_digest"], f"{label}.lease_digest")
         _enum(body["owner_role"], OWNER_ROLES, f"{label}.owner_role")
     elif event_type == "stage.settled":
-        body = _keys(body, {"classification", "outcome_code", "outcome_digest", "elapsed_ms", "usage"}, label)
+        body = _keys(body, {"classification", "outcome_code", "outcome_digest", "elapsed_ms", "usage", "sealed"}, label)
         _enum(body["classification"], STAGE_CLASSIFICATIONS, f"{label}.classification")
         outcome = body["outcome_code"]
         if outcome is not None:
@@ -472,7 +496,18 @@ def _validate_body(event_type: str, body: Any, refs: set[str]) -> None:
         elif body["outcome_digest"] is not None:
             raise TrajectoryError(f"{label}.outcome_digest requires outcome_code")
         _integer(body["elapsed_ms"], f"{label}.elapsed_ms")
+        _boolean(body["sealed"], f"{label}.sealed")
         _validate_usage(body["usage"], f"{label}.usage")
+        # R4: a settled stage may only claim "sealed" while pointing at the
+        # DB-committed run manifest that proves it. An unsealed or blocked run
+        # says so explicitly instead of producing usable success evidence.
+        if body["sealed"] and not any(
+            ref["kind"] == "run-manifest" and ref["seal"]["kind"] == "db-committed-run-manifest"
+            for ref in refs.values()
+        ):
+            raise TrajectoryError(
+                f"{label}.sealed requires a db-committed run-manifest evidence ref"
+            )
     elif event_type == "provider.dispatch_intent":
         body = _keys(body, {"policy_digest", "capability_digest"}, label)
         _digest(body["policy_digest"], f"{label}.policy_digest")
@@ -590,12 +625,14 @@ def _validate_event(event: Any, *, require_hash: bool) -> dict[str, Any]:
     evidence = event["evidence_refs"]
     if not isinstance(evidence, list):
         raise TrajectoryError("evidence_refs must be a list")
-    ref_ids: set[str] = set()
+    ref_ids: dict[str, Mapping[str, Any]] = {}
     for index, item in enumerate(evidence):
         ref_id = _validate_evidence_ref(item, f"evidence_refs[{index}]")
         if ref_id in ref_ids:
             raise TrajectoryError("duplicate evidence ref_id")
-        ref_ids.add(ref_id)
+        ref_ids[ref_id] = item
+        if run is not None and item["seal"]["run_token"] != run["run_token"]:
+            raise TrajectoryError("evidence ref run binding does not match event run")
     _validate_body(event_type, event["body"], ref_ids)
 
     _enum(event["sensitivity"], SENSITIVITIES, "sensitivity")
@@ -688,11 +725,18 @@ class TrajectoryStore:
                 intent = intents[0]
                 if (
                     intent["run"] != event["run"]
-                    or intent["session_ref"] != event["session_ref"]
                     or intent["actor"]["provider"] != event["actor"]["provider"]
                     or intent["actor"]["model"] != event["actor"]["model"]
                 ):
                     raise TrajectoryError("provider invocation identity changed after dispatch intent")
+                known_sessions = {
+                    candidate["session_ref"] for candidate in prior
+                    if candidate["session_ref"] is not None
+                }
+                if intent["session_ref"] is not None:
+                    known_sessions.add(intent["session_ref"])
+                if known_sessions and event["session_ref"] not in known_sessions:
+                    raise TrajectoryError("provider invocation session changed after binding")
                 if event_type in prior_types:
                     raise TrajectoryError(f"duplicate {event_type} for invocation_id")
                 if event_type == "provider.dispatched" and "provider.settled" in prior_types:
@@ -750,3 +794,284 @@ class TrajectoryStore:
             )
         except sqlite3.IntegrityError as exc:
             raise TrajectoryError("trajectory event conflicts with durable state") from exc
+
+
+
+def digest_text(value: str) -> str:
+    """Return the v1 digest form without ever retaining the source text."""
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+TRAJECTORY_MODES = frozenset({"off", "write", "read"})
+TRAJECTORY_ENV = "ORCH_TRAJECTORY_V1"
+#: The one line an operator sees for an unusable gate value. It deliberately
+#: does not echo the rejected value: the gate is read from an environment that
+#: also carries credentials, and a misdirected variable must not be reflected.
+TRAJECTORY_CONFIG_ERROR = (
+    f"orchestrator: {TRAJECTORY_ENV} is not a supported value; trajectory is disabled "
+    "(expected off, write, or read)"
+)
+
+
+def trajectory_mode(env: Mapping[str, str] | None = None) -> str:
+    """Read the rollout gate. The absent value is deliberately ``off``.
+
+    An unknown value fails closed to ``off`` and reports a configuration error
+    on stderr rather than raising: the gate guards an additive audit surface,
+    so a typo must not take the lifecycle down with it.
+    """
+    import os
+    import sys
+
+    source = os.environ if env is None else env
+    value = source.get(TRAJECTORY_ENV, "off").strip().lower()
+    if value not in TRAJECTORY_MODES:
+        print(TRAJECTORY_CONFIG_ERROR, file=sys.stderr)
+        return "off"
+    return value
+
+
+def _row_dict(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
+
+
+def _canonical_state_snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """Bounded canonical input for a legacy baseline; contains no artifact payloads."""
+    task = conn.execute(
+        "SELECT id,type,status,stop_reason,current_stage,owner,revision,profile_hash,input_hash,"
+        "transitions_count,max_transitions,resume_allowance,created_at,updated_at "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        raise TrajectoryError("trajectory task does not exist")
+    runs = [
+        _row_dict(row)
+        for row in conn.execute(
+            "SELECT run_token,stage,cycle,attempt,owner,status,exit_code,outcome,sealed,model,"
+            "duration_ms,usage_input_tokens,usage_output_tokens,usage_total_tokens,"
+            "usage_unavailable_reason,started_at,ended_at FROM stage_runs WHERE task_id=? "
+            "ORDER BY started_at,rowid",
+            (task_id,),
+        )
+    ]
+    transitions = [
+        _row_dict(row)
+        for row in conn.execute(
+            "SELECT seq,operation_id,run_token,stage,owner,edge,outcome,from_status,to_status,reason,at "
+            "FROM transitions WHERE task_id=? ORDER BY seq",
+            (task_id,),
+        )
+    ]
+    return {"task": _row_dict(task), "stage_runs": runs, "transitions": transitions}
+
+
+class TrajectoryWriter:
+    """Build and append v1 events inside an existing canonical transaction.
+
+    The writer deliberately receives only typed, already-normalized fields. It
+    never accepts provider output or an arbitrary mapping as an event body.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, mode: str):
+        if mode not in TRAJECTORY_MODES:
+            raise TrajectoryError("invalid trajectory writer mode")
+        self.conn = conn
+        self.mode = mode
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode in {"write", "read"}
+
+    def has_events(self, task_id: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM trajectory_events WHERE trajectory_id=? LIMIT 1", (f"task:{task_id}",)
+        ).fetchone() is not None
+
+    def ensure_legacy_baseline(self, task_id: str, *, recorded_at_ms: int) -> str | None:
+        if not self.enabled:
+            return None
+        rows = self.conn.execute(
+            "SELECT event_type,canonical_json FROM trajectory_events WHERE trajectory_id=? ORDER BY seq",
+            (f"task:{task_id}",),
+        ).fetchall()
+        event_types = {row["event_type"] for row in rows}
+        if "migration.baseline" in event_types:
+            return None
+        live_transition_seqs = {
+            int(json.loads(bytes(row["canonical_json"]))["body"]["transition_seq"])
+            for row in rows
+            if row["event_type"] == "task.transition.committed"
+        }
+        canonical_transition_seqs = {
+            int(row["seq"])
+            for row in self.conn.execute(
+                "SELECT seq FROM transitions WHERE task_id=?", (task_id,)
+            )
+        }
+        # A task born with the writer enabled needs no baseline only while its
+        # complete canonical transition history is represented by live events.
+        # If the gate was temporarily off, the gap is covered once by the same
+        # deterministic partial baseline used for a fully legacy task.
+        if (
+            "task.created" in event_types
+            and canonical_transition_seqs.issubset(live_transition_seqs)
+        ):
+            return None
+        snapshot = _canonical_state_snapshot(self.conn, task_id)
+        coverage = snapshot["transitions"][-1]["seq"] if snapshot["transitions"] else 0
+        baseline_id = str(uuid.uuid5(BASELINE_NAMESPACE, f"task:{task_id}"))
+        return self.append(
+            task_id,
+            "migration.baseline",
+            recorded_at_ms=recorded_at_ms,
+            event_id=baseline_id,
+            actor_kind="migrator",
+            actor_id="native-orchestrator",
+            body={
+                "baseline_id": baseline_id,
+                "source_snapshot_digest": "sha256:" + hashlib.sha256(_canonical_json(snapshot)).hexdigest(),
+                "completeness": "partial",
+                "missing_domains": sorted(MISSING_DOMAINS),
+                "coverage_through_transition_seq": int(coverage),
+            },
+            retention_class="structural",
+        )
+
+    def append(
+        self,
+        task_id: str,
+        event_type: str,
+        *,
+        recorded_at_ms: int,
+        body: dict[str, Any],
+        run: Mapping[str, Any] | None = None,
+        invocation_id: str | None = None,
+        workflow_attempt_ref: str | None = None,
+        session_ref: str | None = None,
+        actor_kind: str = "controller",
+        actor_id: str = "native-orchestrator",
+        actor_provider: str | None = None,
+        actor_model: str | None = None,
+        evidence_refs: list[dict[str, Any]] | None = None,
+        sensitivity: str = "internal",
+        retention_class: str = "task-lifecycle",
+        parent_event_id: str | None = None,
+        causal_event_ids: list[str] | None = None,
+        event_id: str | None = None,
+    ) -> str | None:
+        if not self.enabled:
+            return None
+        if not self.conn.in_transaction:
+            raise TrajectoryError("trajectory writer requires an existing transaction")
+        task = self.conn.execute("SELECT revision FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task is None:
+            raise TrajectoryError("trajectory task does not exist")
+        last = self.conn.execute(
+            "SELECT seq,event_id,event_hash FROM trajectory_events WHERE trajectory_id=? "
+            "ORDER BY seq DESC LIMIT 1",
+            (f"task:{task_id}",),
+        ).fetchone()
+        seq = 1 if last is None else int(last["seq"]) + 1
+        previous_hash = None if last is None else last["event_hash"]
+        if parent_event_id is None and last is not None:
+            parent_event_id = last["event_id"]
+        run_identity = None
+        if run is not None:
+            run_identity = {
+                "run_token": run["run_token"],
+                "stage": run["stage"],
+                "cycle": int(run["cycle"]),
+                "attempt": int(run["attempt"]),
+            }
+        event = {
+            "schema_version": SCHEMA_VERSION,
+            "trajectory_id": f"task:{task_id}",
+            "seq": seq,
+            "event_id": event_id or str(uuid.uuid4()),
+            "event_type": event_type,
+            "event_version": EVENT_VERSION,
+            "recorded_at_ms": int(recorded_at_ms),
+            "task": {"task_id": task_id, "revision": int(task["revision"])},
+            "run": run_identity,
+            "invocation_id": invocation_id,
+            "workflow_attempt_ref": workflow_attempt_ref,
+            "session_ref": session_ref,
+            "parent_event_id": parent_event_id,
+            "causal_event_ids": sorted(set(causal_event_ids or [])),
+            "actor": {
+                "kind": actor_kind,
+                "id": actor_id,
+                "provider": actor_provider,
+                "model": actor_model,
+            },
+            "body": body,
+            "evidence_refs": evidence_refs or [],
+            "sensitivity": sensitivity,
+            "retention_class": retention_class,
+            "normalizer_version": NORMALIZER_VERSION,
+            "prev_event_hash": previous_hash,
+        }
+        sealed = seal_event(event)
+        TrajectoryStore(self.conn).append(sealed)
+        return sealed["event_id"]
+
+
+def parity_diagnostics(
+    conn: sqlite3.Connection, task_id: str, event_ids: list[str]
+) -> list[dict[str, Any]]:
+    """Compare newly appended events with canonical rows using closed diagnostics."""
+    diagnostics: list[dict[str, Any]] = []
+    for event_id in event_ids:
+        row = conn.execute(
+            "SELECT canonical_json FROM trajectory_events WHERE task_id=? AND event_id=?",
+            (task_id, event_id),
+        ).fetchone()
+        if row is None:
+            diagnostics.append({"code": "event_missing", "event_id": event_id, "event_seq": None})
+            continue
+        try:
+            event = json.loads(bytes(row["canonical_json"]))
+            canonical_event_bytes(event)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            diagnostics.append({"code": "event_invalid", "event_id": event_id, "event_seq": None})
+            continue
+        seq = event["seq"]
+        code = None
+        if event["event_type"] == "task.created":
+            canonical = conn.execute(
+                "SELECT profile_hash,input_hash FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if canonical is None or event["body"] != {
+                "profile_digest": f"sha256:{canonical['profile_hash']}",
+                "input_digest": f"sha256:{canonical['input_hash']}",
+            }:
+                code = "task_created_mismatch"
+        elif event["event_type"] == "task.transition.committed":
+            canonical = conn.execute(
+                "SELECT operation_id,from_status,to_status,reason,outcome FROM transitions "
+                "WHERE task_id=? AND seq=?",
+                (task_id, event["body"]["transition_seq"]),
+            ).fetchone()
+            if canonical is None or canonical["operation_id"] != event["body"]["operation_id"] \
+                    or canonical["from_status"] != event["body"]["from_status"] \
+                    or canonical["to_status"] != event["body"]["to_status"]:
+                code = "transition_mismatch"
+        elif event["run"] is not None:
+            canonical = conn.execute(
+                "SELECT stage,cycle,attempt FROM stage_runs WHERE task_id=? AND run_token=?",
+                (task_id, event["run"]["run_token"]),
+            ).fetchone()
+            if canonical is None or (
+                canonical["stage"], int(canonical["cycle"]), int(canonical["attempt"])
+            ) != (
+                event["run"]["stage"], event["run"]["cycle"], event["run"]["attempt"]
+            ):
+                code = "run_mismatch"
+        task = conn.execute("SELECT revision FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if code is None and (task is None or int(task["revision"]) != event["task"]["revision"]):
+            if task is None or int(event["task"]["revision"]) > int(task["revision"]):
+                code = "task_revision_mismatch"
+        if code is not None:
+            diagnostics.append({"code": code, "event_id": event_id, "event_seq": seq})
+    return diagnostics

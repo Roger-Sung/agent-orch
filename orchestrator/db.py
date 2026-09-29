@@ -117,6 +117,15 @@ CREATE TABLE IF NOT EXISTS trajectory_events(
   PRIMARY KEY(trajectory_id, seq)
 );
 
+-- The primary key already answers "this trajectory, in order" and the UNIQUE
+-- event_id answers "this one event". These two cover the remaining lookups the
+-- writer and the parity check make on every canonical mutation: the post-commit
+-- parity read is keyed on (task_id, event_id), and run-bound events are read
+-- back by run_token.
+CREATE INDEX IF NOT EXISTS ix_trajectory_events_task ON trajectory_events(task_id, event_id);
+CREATE INDEX IF NOT EXISTS ix_trajectory_events_run ON trajectory_events(run_token)
+  WHERE run_token IS NOT NULL;
+
 CREATE TRIGGER IF NOT EXISTS trajectory_events_no_update
 BEFORE UPDATE ON trajectory_events
 BEGIN
