@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from orchestrator.controller import Controller, ControllerError
+from orchestrator.controller import Controller, ControllerError, PostCommitTrajectoryError
 from orchestrator.cli import main as cli_main
 from orchestrator.db import DDL, _migrate, connect
 from orchestrator.runner import RunResult
@@ -420,6 +420,27 @@ class TrajectoryTest(unittest.TestCase):
             {"provider_handoff_unknown", "provider_result_unknown"},
         )
 
+    def test_dispatched_without_settled_keeps_result_unknown(self) -> None:
+        first = self.append(self.event())
+        run_token = self.add_run()
+        intent = self.append(self.provider_event(
+            "provider.dispatch_intent", run_token, "invocation-dispatched",
+            seq=2, previous=first["event_hash"],
+        ))
+        self.append(self.provider_event(
+            "provider.dispatched", run_token, "invocation-dispatched",
+            seq=3, previous=intent["event_hash"],
+        ))
+        projection = reduce_snapshot(
+            freeze_snapshot(self.conn, self.task_id, captured_at_ms=2000)
+        )
+        invocation = projection.invocations[0]
+        self.assertEqual(invocation["dispatch_state"], "dispatched")
+        self.assertEqual(invocation["result_state"], "unknown")
+        codes = {item["code"] for item in projection.unknowns}
+        self.assertIn("provider_result_unknown", codes)
+        self.assertNotIn("provider_handoff_unknown", codes)
+
     def test_evidence_ref_path_seal_and_run_binding_fail_closed(self) -> None:
         run_token = self.add_run()
         event = self.provider_event("provider.dispatched", run_token, "invocation-a")
@@ -680,10 +701,45 @@ class TrajectoryTest(unittest.TestCase):
         self.assertEqual(baseline["body"]["missing_domains"], sorted(MISSING_DOMAINS))
         self.assertEqual(baseline["body"]["coverage_through_transition_seq"], 1)
 
-        snapshot = freeze_snapshot(self.conn, self.task_id, captured_at_ms=1004)
+        # Live recording resumes after the partial coverage window.  The
+        # baseline covers only transition 1; transition 2 remains a normal,
+        # independently verified live event.
+        self.conn.execute("BEGIN IMMEDIATE")
+        self.conn.execute(
+            """INSERT INTO transitions(
+                   task_id,seq,operation_id,run_token,stage,owner,edge,outcome,
+                   from_status,to_status,reason,at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (self.task_id, 2, "live-operation", None, None, None, None, "allow",
+             "queued", "done", "stage_completed", 1004),
+        )
+        self.conn.execute(
+            "UPDATE tasks SET status='done',revision=2,transitions_count=2,updated_at=1004 WHERE id=?",
+            (self.task_id,),
+        )
+        writer.append(
+            self.task_id,
+            "task.transition.committed",
+            recorded_at_ms=1004,
+            body={
+                "transition_seq": 2,
+                "operation_id": "live-operation",
+                "from_status": "queued",
+                "to_status": "done",
+                "reason_code": "stage_completed",
+                "reason_digest": None,
+                "outcome_code": "allow",
+                "outcome_digest": None,
+            },
+        )
+        self.conn.execute("COMMIT")
+
+        snapshot = freeze_snapshot(self.conn, self.task_id, captured_at_ms=1005)
         projection = reduce_snapshot(snapshot)
         self.assertEqual(projection.integrity_status, "ok")
         self.assertEqual(projection.completeness, "partial")
+        self.assertEqual(projection.task_lifecycle["status"], "done")
+        self.assertEqual(projection.task_lifecycle["transition_seq"], 2)
 
     def test_unknown_gate_value_fails_closed_without_echoing_the_value(self) -> None:
         stderr = io.StringIO()
@@ -843,6 +899,49 @@ class _ReceiptRunner:
         )
 
 
+class _RebindingReceiptRunner:
+    """Two explicit provider sessions whose counters are session-cumulative."""
+
+    def __init__(self) -> None:
+        self.outcomes = iter(("submit", "allow"))
+        self.sessions = ("provider-session-a", "provider-session-b")
+        self.index = 0
+        self.session_binding = {"session_id": self.sessions[0]}
+
+    def run(self, owner: str, prompt: str, timeout: int, log_path: Path) -> RunResult:
+        outcome = next(self.outcomes)
+        session_id = self.sessions[self.index]
+        total = (self.index + 1) * 100
+        output = f"ORCHESTRATOR_OUTCOME: {outcome}\n"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(output, encoding="utf-8")
+        self.index += 1
+        if self.index < len(self.sessions):
+            self.session_binding = {"session_id": self.sessions[self.index]}
+        return RunResult(
+            0,
+            output,
+            None,
+            "raw",
+            "raw",
+            started_at_ms=1000 + self.index * 10,
+            ended_at_ms=1005 + self.index * 10,
+            duration_ms=5,
+            model="unspecified",
+            usage_input_tokens=total - 10,
+            usage_output_tokens=10,
+            usage_total_tokens=total,
+            execution_receipt={
+                "schema_version": 1,
+                "invocation_verified": True,
+                "provider_session_id": session_id,
+                "session_binding": {"session_id": session_id},
+                "usage_basis": "cumulative",
+                "role": "executor",
+            },
+        )
+
+
 class InvocationAdapterTest(unittest.TestCase):
     def controller(self) -> Controller:
         directory = tempfile.TemporaryDirectory()
@@ -974,6 +1073,120 @@ class InvocationAdapterTest(unittest.TestCase):
             "provider_result_unknown", {item["code"] for item in projection.unknowns}
         )
 
+    def test_in_flight_claim_matches_canonical_running_revision(self) -> None:
+        controller = self.controller()
+        task_id = controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        controller.claim_stage(task_id)
+        snapshot = freeze_snapshot(controller.conn, task_id, captured_at_ms=2000)
+        projection = reduce_snapshot(snapshot)
+        canonical = snapshot["canonical_state"]["task"]
+        self.assertEqual(projection.task_lifecycle["status"], "running")
+        self.assertEqual(projection.task_lifecycle["revision"], canonical["revision"])
+        self.assertNotIn(
+            "canonical_mismatch", {item["code"] for item in projection.diagnostics}
+        )
+        self.assertEqual(projection.integrity_status, "incomplete")
+
+    def test_stage_attempt_projection_matches_canonical_identity_and_seal(self) -> None:
+        controller, task_id = self.completed()
+        snapshot = freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+        projection = reduce_snapshot(snapshot)
+        projected = {item["run_token"]: item for item in projection.stage_attempts}
+        for canonical in snapshot["canonical_state"]["stage_runs"]:
+            attempt = projected[canonical["run_token"]]
+            self.assertEqual(
+                (attempt["stage"], attempt["cycle"], attempt["attempt"]),
+                (canonical["stage"], canonical["cycle"], canonical["attempt"]),
+            )
+            self.assertEqual(attempt["status"], canonical["status"])
+            self.assertEqual(attempt["sealed"], bool(canonical["sealed"]))
+            self.assertEqual(attempt["manifest_hash"], canonical["manifest_hash"])
+
+    def test_reducer_fails_closed_on_canonical_run_identity_and_seal_mismatch(self) -> None:
+        controller, task_id = self.completed()
+        identity = freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+        identity["canonical_state"]["stage_runs"][0]["attempt"] += 1
+        source_hash = "sha256:" + hashlib.sha256(
+            canonical_json_bytes(identity["canonical_state"])
+        ).hexdigest()
+        identity["source_db_snapshot_hash"] = source_hash
+        identity["manifest"]["source_db_snapshot_hash"] = source_hash
+        self.rehash_snapshot(identity)
+        projection = reduce_snapshot(identity)
+        self.assertEqual(projection.integrity_status, "corrupt")
+        self.assertIn(
+            "run_identity_mismatch", {item["code"] for item in projection.diagnostics}
+        )
+
+        seal = freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+        seal["canonical_state"]["stage_runs"][0]["manifest_hash"] = "0" * 64
+        source_hash = "sha256:" + hashlib.sha256(
+            canonical_json_bytes(seal["canonical_state"])
+        ).hexdigest()
+        seal["source_db_snapshot_hash"] = source_hash
+        seal["manifest"]["source_db_snapshot_hash"] = source_hash
+        self.rehash_snapshot(seal)
+        projection = reduce_snapshot(seal)
+        self.assertEqual(projection.integrity_status, "mismatch")
+        self.assertIn(
+            "canonical_mismatch", {item["code"] for item in projection.diagnostics}
+        )
+
+    def test_resumed_session_lineage_cumulative_usage_and_boundaries_are_golden(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        with patch.dict(os.environ, {"ORCH_TRAJECTORY_V1": "write"}):
+            controller = Controller(
+                Path(directory.name) / "runtime", runner=_RebindingReceiptRunner(),
+            )
+        self.addCleanup(controller.close)
+        task_id = controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+        self.assertEqual(controller.run_until_stop(task_id)["task"]["status"], "done")
+        projection = reduce_snapshot(
+            freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+        )
+        self.assertEqual(projection.integrity_status, "ok")
+        self.assertEqual(
+            [item["event_type"] for item in projection.sessions],
+            ["session.bound", "session.rebound"],
+        )
+        self.assertEqual(
+            projection.sessions[1]["predecessor_event_id"],
+            projection.sessions[0]["event_id"],
+        )
+        self.assertEqual(
+            projection.sessions[1]["reason_code"], "provider_session_replaced"
+        )
+        self.assertEqual(set(projection.usage_by_basis), {"cumulative"})
+        self.assertEqual(
+            [item["total_tokens"] for item in projection.usage_by_basis["cumulative"]],
+            [100, 200],
+        )
+        self.assertEqual(len(projection.model_visible_boundary_index), 2)
+        self.assertEqual(
+            {item["provider"] for item in projection.invocations}, {"codex", "claude"}
+        )
+        self.assertEqual(
+            {item["model"] for item in projection.invocations}, {"unspecified"}
+        )
+
+    def test_counts_without_an_adapter_basis_are_not_labeled_per_turn(self) -> None:
+        result = RunResult(
+            0, "", None, "success", "success",
+            usage_input_tokens=10, usage_output_tokens=5, usage_total_tokens=15,
+        )
+        self.assertEqual(
+            Controller._trajectory_usage(result),
+            {
+                "basis": "unavailable",
+                "input_tokens": None,
+                "output_tokens": None,
+                "total_tokens": None,
+                "unavailable_reason_code": "usage_basis_unverified",
+                "unavailable_reason_digest": None,
+            },
+        )
+
     @staticmethod
     def rehash_snapshot(snapshot: dict) -> None:
         snapshot["manifest"]["evidence_inventory_digest"] = (
@@ -982,6 +1195,48 @@ class InvocationAdapterTest(unittest.TestCase):
         unhashed = {key: value for key, value in snapshot.items() if key != "snapshot_digest"}
         snapshot["snapshot_digest"] = (
             "sha256:" + hashlib.sha256(canonical_json_bytes(unhashed)).hexdigest()
+        )
+
+    @classmethod
+    def reseal_event_chain(cls, snapshot: dict, events: list[dict]) -> None:
+        previous = None
+        encoded = []
+        for event in events:
+            candidate = copy.deepcopy(event)
+            candidate.pop("event_hash", None)
+            candidate["prev_event_hash"] = previous
+            sealed = seal_event(candidate)
+            previous = sealed["event_hash"]
+            encoded.append(canonical_event_bytes(sealed).decode("utf-8"))
+        snapshot["ordered_events"] = encoded
+        snapshot["event_head_hash"] = previous
+        snapshot["manifest"].update(
+            event_count=len(events),
+            first_seq=events[0]["seq"] if events else None,
+            last_seq=events[-1]["seq"] if events else None,
+            event_head_hash=previous,
+            ordered_events_digest="sha256:" + hashlib.sha256(
+                canonical_json_bytes(encoded)
+            ).hexdigest(),
+        )
+        cls.rehash_snapshot(snapshot)
+
+    def test_reducer_detects_task_revision_regression(self) -> None:
+        controller, task_id = self.completed()
+        snapshot = freeze_snapshot(controller.conn, task_id, captured_at_ms=3000)
+        events = [json.loads(raw) for raw in snapshot["ordered_events"]]
+        target = next(
+            index for index in range(1, len(events))
+            if max(item["task"]["revision"] for item in events[:index]) > 0
+        )
+        events[target]["task"]["revision"] = (
+            max(item["task"]["revision"] for item in events[:target]) - 1
+        )
+        self.reseal_event_chain(snapshot, events)
+        projection = reduce_snapshot(snapshot)
+        self.assertEqual(projection.integrity_status, "corrupt")
+        self.assertIn(
+            "task_revision_regression", {item["code"] for item in projection.diagnostics}
         )
 
     def test_snapshot_isolation_stays_frozen_across_a_concurrent_writer_commit(self) -> None:
@@ -1419,6 +1674,24 @@ class CanonicalEmitPointTest(unittest.TestCase):
 
         self.assertEqual(status["task"]["status"], "done")
         self.assertEqual(self.events(controller, task_id), [])
+
+    def test_submit_preserves_committed_artifacts_on_post_commit_parity_failure(self):
+        controller = self.controller([])
+        failure = [{"code": "task_created_mismatch", "event_id": "x", "event_seq": 1}]
+        with patch(
+            "orchestrator.controller.parity_diagnostics", side_effect=[[], failure]
+        ):
+            with self.assertRaisesRegex(
+                PostCommitTrajectoryError, "parity failed after commit"
+            ):
+                controller.submit("demo-loop", DEMO_PROFILE, DEMO_INPUT)
+
+        task = controller.conn.execute("SELECT * FROM tasks").fetchone()
+        self.assertIsNotNone(task)
+        self.assertFalse(controller.conn.in_transaction)
+        self.assertTrue(Path(task["artifact_dir"]).is_dir())
+        self.assertTrue(Path(task["profile_snapshot_path"]).is_file())
+        self.assertTrue(Path(task["input_snapshot_path"]).is_file())
 
 
 class SameTransactionRollbackTest(unittest.TestCase):

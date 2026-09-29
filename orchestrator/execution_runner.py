@@ -176,6 +176,11 @@ class ConfiguredRunner(SubprocessRunner):
                 raise ValueError("resume_failed: provider session mismatch")
             receipt["provider_reported_model"] = self.choice.model
             receipt["provider_session_id"] = payload.get("session_id")
+            # Claude's modelUsage is scoped to the provider session.  A resumed
+            # reviewer therefore reports a cumulative counter, not a turn
+            # delta.  Carry that adapter-owned fact explicitly so trajectory
+            # normalization never has to infer a basis from token-shaped keys.
+            receipt["usage_basis"] = "cumulative"
             if self.review_packet is not None:
                 try:
                     receipt["review"] = validate_review(text, self.review_packet)

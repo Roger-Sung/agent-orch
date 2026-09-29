@@ -9,11 +9,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
 from .trajectory import (
+    OUTCOME_CODES,
     SENSITIVITIES,
     SUPPORTED_EVENT_TYPES,
     TOP_LEVEL_KEYS,
     TrajectoryError,
     canonical_event_bytes,
+    digest_text,
 )
 
 SNAPSHOT_VERSION = 1
@@ -39,9 +41,11 @@ DIAGNOSTIC_CODES = frozenset(
         "parent_invalid",
         "provider_event_duplicate",
         "provider_event_unpaired",
+        "run_identity_mismatch",
         "sequence_gap",
         "session_predecessor_invalid",
         "snapshot_invalid",
+        "task_revision_regression",
         "snapshot_version_unsupported",
         "trajectory_mismatch",
     }
@@ -446,11 +450,30 @@ def reduce_snapshot(
     usage: dict[str, list[dict[str, Any]]] = {}
     task_lifecycle: dict[str, Any] | None = None
     baseline: dict[str, Any] | None = None
+    canonical_runs: dict[str, dict[str, Any]] = {}
+    for item in canonical_state["stage_runs"]:
+        run_token = item.get("run_token")
+        if not isinstance(run_token, str) or not run_token or run_token in canonical_runs:
+            diagnostics.append(_diagnostic("snapshot_invalid"))
+            continue
+        canonical_runs[run_token] = item
+    last_task_revision: int | None = None
 
     for event in events:
         kind = event["event_type"]
         body = event["body"]
         run = event["run"]
+        revision = event["task"]["revision"]
+        if last_task_revision is not None and revision < last_task_revision:
+            diagnostics.append(_diagnostic("task_revision_regression", event))
+        last_task_revision = revision
+        if run is not None:
+            canonical_run = canonical_runs.get(run["run_token"])
+            if canonical_run is None or any(
+                canonical_run.get(key) != run[key]
+                for key in ("run_token", "stage", "cycle", "attempt")
+            ):
+                diagnostics.append(_diagnostic("run_identity_mismatch", event))
         if kind == "task.created":
             task_lifecycle = {
                 "task_id": event["task"]["task_id"],
@@ -498,17 +521,34 @@ def reduce_snapshot(
                 "status": "running",
                 "classification": None,
                 "outcome_code": None,
+                "outcome_digest": None,
                 "sealed": False,
+                "manifest_hash": None,
             }
+            if task_lifecycle is not None:
+                task_lifecycle.update(revision=revision, status="running")
         elif kind == "stage.settled":
             item = attempts.setdefault(run["run_token"], {**run})
+            manifest_hashes = {
+                ref["seal"]["manifest_hash"]
+                for ref in event["evidence_refs"]
+                if ref["kind"] == "run-manifest"
+                and ref["seal"]["kind"] == "db-committed-run-manifest"
+            }
+            manifest_hash = next(iter(manifest_hashes)) if len(manifest_hashes) == 1 else None
             item.update(
-                status="settled",
+                status=(
+                    "committed"
+                    if body["classification"] in {"success", "waiting_user"}
+                    else body["classification"]
+                ),
                 classification=body["classification"],
                 outcome_code=body["outcome_code"],
+                outcome_digest=body["outcome_digest"],
                 elapsed_ms=body["elapsed_ms"],
                 usage=body["usage"],
                 sealed=body["sealed"],
+                manifest_hash=manifest_hash,
             )
             bucket = body["usage"]["basis"]
             usage.setdefault(bucket, []).append(
@@ -577,9 +617,48 @@ def reduce_snapshot(
                 "session_ref": event["session_ref"],
                 "predecessor_event_id": body.get("predecessor_event_id"),
                 "role": body.get("role"),
+                "reason_code": body.get("reason_code"),
+                "binding_ref": body.get("binding_ref"),
+                "checkpoint_ref": body.get("checkpoint_ref"),
             }
             sessions.append(item)
             session_events[event["event_id"]] = item
+
+    for run_token, attempt in attempts.items():
+        canonical_run = canonical_runs.get(run_token)
+        if canonical_run is None:
+            continue
+        canonical_outcome = canonical_run.get("outcome")
+        expected_outcome_code = (
+            canonical_outcome
+            if canonical_outcome is None or canonical_outcome in OUTCOME_CODES
+            else "other"
+        )
+        expected_outcome_digest = (
+            digest_text(canonical_outcome)
+            if canonical_outcome is not None and expected_outcome_code == "other"
+            else None
+        )
+        expected = {
+            "run_token": canonical_run.get("run_token"),
+            "stage": canonical_run.get("stage"),
+            "cycle": canonical_run.get("cycle"),
+            "attempt": canonical_run.get("attempt"),
+            "status": canonical_run.get("status"),
+            "outcome_code": expected_outcome_code,
+            "outcome_digest": expected_outcome_digest,
+            "sealed": bool(canonical_run.get("sealed")),
+            "manifest_hash": canonical_run.get("manifest_hash"),
+        }
+        actual = {key: attempt.get(key) for key in expected}
+        if actual != expected:
+            diagnostics.append(
+                _diagnostic(
+                    "canonical_mismatch",
+                    expected_digest=_sha(expected),
+                    actual_digest=_sha(actual),
+                )
+            )
 
     unknowns: list[dict[str, Any]] = []
     event_for_invocation = {
@@ -732,9 +811,11 @@ def reduce_snapshot(
         "parent_invalid",
         "provider_event_duplicate",
         "provider_event_unpaired",
+        "run_identity_mismatch",
         "sequence_gap",
         "session_predecessor_invalid",
         "snapshot_invalid",
+        "task_revision_regression",
         "trajectory_mismatch",
     }
     codes = {item["code"] for item in diagnostics}

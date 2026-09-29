@@ -118,6 +118,12 @@ class ControllerError(RuntimeError):
     pass
 
 
+class PostCommitTrajectoryError(ControllerError):
+    """Parity failed after SQLite committed canonical state and trajectory."""
+
+    pass
+
+
 class Controller:
     """Single-process, single-writer orchestrator for the frozen MVP."""
 
@@ -280,10 +286,14 @@ class Controller:
             ))
             self._trajectory_transition(task_id, transition_seq, event_ids)
             self._trajectory_commit(task_id, event_ids)
-        except BaseException:
+        except BaseException as exc:
             if self.conn.in_transaction:
                 self.conn.execute("ROLLBACK")
-            shutil.rmtree(artifact_dir, ignore_errors=True)
+            # Once _trajectory_commit has committed, deleting this directory
+            # would destroy the profile/input snapshots for a durable task.
+            # Surface the parity failure, but preserve all committed evidence.
+            if not isinstance(exc, PostCommitTrajectoryError):
+                shutil.rmtree(artifact_dir, ignore_errors=True)
             raise
         return task_id
 
@@ -1503,19 +1513,28 @@ class Controller:
     @staticmethod
     def _trajectory_usage(result: RunResult) -> dict[str, Any]:
         values = (result.usage_input_tokens, result.usage_output_tokens, result.usage_total_tokens)
-        if any(value is not None for value in values):
+        receipt = result.execution_receipt if isinstance(result.execution_receipt, dict) else {}
+        basis = receipt.get("usage_basis")
+        if any(value is not None for value in values) and basis in {
+            "per-turn", "cumulative", "delta-from-cumulative"
+        }:
             return {
-                "basis": "per-turn",
+                "basis": basis,
                 "input_tokens": result.usage_input_tokens,
                 "output_tokens": result.usage_output_tokens,
                 "total_tokens": result.usage_total_tokens,
                 "unavailable_reason_code": None,
                 "unavailable_reason_digest": None,
             }
-        raw = result.usage_unavailable_reason or "runner_usage_unavailable"
+        raw = (
+            "usage_basis_unverified"
+            if any(value is not None for value in values)
+            else result.usage_unavailable_reason or "runner_usage_unavailable"
+        )
         allowed = {
             "provider_cli_usage_not_reported",
             "runner_usage_unavailable",
+            "usage_basis_unverified",
             "not_applicable_provider_preflight_failed",
         }
         code = raw if raw in allowed else "other"
@@ -1547,7 +1566,9 @@ class Controller:
         self.conn.execute("COMMIT")
         diagnostics = parity_diagnostics(self.conn, task_id, event_ids)
         if diagnostics:
-            raise ControllerError(f"trajectory parity failed after commit: {diagnostics[0]['code']}")
+            raise PostCommitTrajectoryError(
+                f"trajectory parity failed after commit: {diagnostics[0]['code']}"
+            )
 
     @staticmethod
     def _trajectory_add(event_ids: list[str], event_id: str | None) -> None:
@@ -1831,7 +1852,7 @@ class Controller:
                 else:
                     body = {
                         "predecessor_event_id": latest["event_id"],
-                        "reason_code": "resume",
+                        "reason_code": "provider_session_replaced",
                         "reason_digest": None,
                         "checkpoint_ref": session_ref_evidence["ref_id"],
                     }

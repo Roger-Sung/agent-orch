@@ -143,6 +143,7 @@ USAGE_UNAVAILABLE_REASON_CODES = frozenset(
     {
         "provider_cli_usage_not_reported",
         "runner_usage_unavailable",
+        "usage_basis_unverified",
         "not_applicable_provider_preflight_failed",
         "other",
     }

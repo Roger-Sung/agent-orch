@@ -1,6 +1,6 @@
 # Trajectory R0 v1 implementation provenance
 
-Status: T1-T7 implemented and locally verified; not merged or deployed
+Status: T1-T7 plus T8 review repairs implemented and locally verified; not merged or deployed
 
 ## Frozen authority
 
@@ -11,6 +11,7 @@ Status: T1-T7 implemented and locally verified; not merged or deployed
 - Agent-orch implementation base: `0b2629e734d8d9a3fabaa1222349874639ece392`
 - T1 commits: `e058c05`, `fa14f2a`
 - T2-T6 commit: `5902b0dafa05092a463106bfe31a48f428083934`
+- T7 commit: `d50d2e4caf8fa009e3b54ce68f71f6f22995ba0e`
 - Implementation branch: `codex/trajectory-r0-rollout`
 - Independent spec review: Claude Fable round 2 `APPROVE`; all three axes `PASS`
 
@@ -35,11 +36,24 @@ All commands ran in `/private/tmp/agent-orch-trajectory-r0-rollout` on 2026-09-2
 - `python3 -m unittest orchestrator.tests.test_trajectory` — exit 0; `Ran 40 tests in 0.443s`; `OK`.
 - `python3 -m unittest discover -s orchestrator/tests` — exit 0; `Ran 619 tests in 112.310s`; `OK (skipped=1)`.
 
+After the first T8 review, the candidate additionally closed five Medium findings: in-flight
+task revision projection, reducer-owned run/revision/seal validation, explicit usage-basis
+provenance and session-replacement reason, preservation of committed artifacts on a
+post-commit parity failure, and the missing R13 golden cases. The repaired candidate passed:
+
+- `python3 -m unittest orchestrator.tests.test_trajectory` — exit 0; `Ran 48 tests in 0.511s`; `OK`.
+- `python3 -m unittest discover -s orchestrator/tests -p 'test_*.py'` — exit 0;
+  `Ran 627 tests in 109.089s`; `OK (skipped=1)`. The valid full run used the test suite's
+  required host fixture directory and local Unix sockets; an earlier sandboxed attempt was
+  invalid because those operations were denied.
+
 Focused fixtures cover schema/canonicalization/hash-chain corruption, reserved/future types,
 atomic rollback, provider crash-window unknowns, session/evidence binding, secret canaries,
 retention availability, snapshot isolation, malformed/future/missing R0 inputs, sensitive
 rendering, stdout-only CLI behavior, side-effect traps, gate rollback, mixed legacy baseline,
-and additive migration.
+additive migration, in-flight canonical parity, task-revision regression, canonical run/seal
+identity, cumulative resumed-session usage, post-dispatch interruption, and post-commit
+artifact preservation.
 
 Production-shaped fixtures additionally establish:
 
@@ -66,7 +80,7 @@ trajectory code.
 
 ## Remaining gates
 
-- T8: independent three-axis implementation review against this exact candidate and evidence.
+- T8: final independent three-axis delta review against the repaired exact candidate and evidence.
 - T9: canonical stop-gate, then operator-controlled additive migration, dark launch parity
   observation, rollback drill, daemon restart and real task smoke.
 - Production `ORCH_TRAJECTORY_V1` remains unset/off until T9 ALLOW.
