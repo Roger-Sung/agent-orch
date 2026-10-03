@@ -917,9 +917,84 @@ class StartPhaseTests(unittest.TestCase):
             self.assertIn("stop_reason=terminal_done", inbox_text)
             self.assertEqual(sorted((home / "inbox").glob("*.json")), inbox_requests_before)
 
-            synced_again = run_start_sync(home, started["task_id"])
+            # Force a different wall-clock value: synced_at alone must not
+            # make a replay new, even when the calls are seconds apart.
+            with patch("orchestrator.start._now", return_value="2099-01-01T00:00:00+08:00"):
+                synced_again = run_start_sync(home, started["task_id"])
             self.assertEqual(synced_again["status"], "done")
             self.assertEqual(synced_again["routing"]["execution_result"]["processed_result_path"], str(result_path))
+            self.assertEqual(synced_again["routing"]["execution_result"], execution_result)
+            self.assertEqual((home / "inbox.md").read_text(encoding="utf-8"), inbox_text)
+
+    def test_start_sync_notifies_new_result_fields_and_dedupes_their_replay(self):
+        cases = [
+            {"status": "done", "stop_reason": "terminal_done"},
+            {"stop_reason": "new_failure_reason"},
+            {"error": "new failure detail"},
+            {"evidence_path": "/new/evidence.json"},
+            {"request_id": "resume-request"},
+        ]
+        for delta in cases:
+            with self.subTest(delta=delta), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                started = self._enqueued_propose_start(home)
+                request_id = started["routing"]["execution"]["request_id"]
+                payload = {"request_id": request_id, "task_id": "controller-task",
+                           "status": "blocked", "stop_reason": "runner_nonzero"}
+                self._write_processed_result(home, request_id, payload)
+                run_start_sync(home, started["task_id"])
+                first_inbox = (home / "inbox.md").read_text(encoding="utf-8")
+                self._write_processed_result(home, request_id, {**payload, **delta})
+                changed = run_start_sync(home, started["task_id"])
+                changed_inbox = (home / "inbox.md").read_text(encoding="utf-8")
+                self.assertEqual(changed_inbox.count("synced daemon result"),
+                                 first_inbox.count("synced daemon result") + 1)
+                repeated = run_start_sync(home, started["task_id"])
+                self.assertEqual(repeated["routing"]["execution_result"], changed["routing"]["execution_result"])
+                self.assertEqual((home / "inbox.md").read_text(encoding="utf-8"), changed_inbox)
+
+    def test_start_sync_notification_failure_leaves_result_retryable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            started = self._enqueued_propose_start(home)
+            request_id = started["routing"]["execution"]["request_id"]
+            self._write_processed_result(home, request_id, {"request_id": request_id,
+                                         "task_id": request_id, "status": "done"})
+            with patch("orchestrator.start._notify", side_effect=OSError("inbox unavailable")):
+                with self.assertRaisesRegex(OSError, "inbox unavailable"):
+                    run_start_sync(home, started["task_id"])
+            for suffix in (".yaml", "-routing.yaml"):
+                self.assertNotIn("execution_result", _read_yaml(home / "tasks" / f"{started['task_id']}{suffix}"))
+            run_start_sync(home, started["task_id"])
+            inbox = (home / "inbox.md").read_text(encoding="utf-8")
+            self.assertEqual(inbox.count("synced daemon result"), 1)
+            run_start_sync(home, started["task_id"])
+            self.assertEqual((home / "inbox.md").read_text(encoding="utf-8"), inbox)
+
+    def test_start_sync_persistence_failure_keeps_notification_retryable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            started = self._enqueued_propose_start(home)
+            request_id = started["routing"]["execution"]["request_id"]
+            self._write_processed_result(home, request_id, {"request_id": request_id,
+                                         "task_id": request_id, "status": "done"})
+            # First YAML succeeds, routing YAML fails: routing remains the
+            # result-comparison source, so the next sync safely re-notifies.
+            write_yaml = _write_yaml
+            routing_path = home / "tasks" / f"{started['task_id']}-routing.yaml"
+            def fail_routing(path, value):
+                if path == routing_path:
+                    raise OSError("routing unavailable")
+                write_yaml(path, value)
+            with patch("orchestrator.start._write_yaml", side_effect=fail_routing):
+                with self.assertRaisesRegex(OSError, "routing unavailable"):
+                    run_start_sync(home, started["task_id"])
+            self.assertEqual((home / "inbox.md").read_text(encoding="utf-8").count("synced daemon result"), 1)
+            run_start_sync(home, started["task_id"])
+            inbox = (home / "inbox.md").read_text(encoding="utf-8")
+            self.assertEqual(inbox.count("synced daemon result"), 2)
+            run_start_sync(home, started["task_id"])
+            self.assertEqual((home / "inbox.md").read_text(encoding="utf-8"), inbox)
 
     def test_start_sync_uses_latest_resume_result_for_same_controller_task(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1157,6 +1232,10 @@ class StartPhaseTests(unittest.TestCase):
                 synced = run_start_sync(home, started["task_id"])
                 self.assertEqual(synced["status"], expected_stage)
                 self.assertEqual(synced["routing"]["execution_result"]["lifecycle_stage"], expected_stage)
+                inbox_after_first = (home / "inbox.md").read_text(encoding="utf-8")
+                replay = run_start_sync(home, started["task_id"])
+                self.assertEqual(replay["routing"]["execution_result"], synced["routing"]["execution_result"])
+                self.assertEqual((home / "inbox.md").read_text(encoding="utf-8"), inbox_after_first)
 
     def test_start_sync_stop_gate_ignored_for_non_done_statuses(self):
         cases = [

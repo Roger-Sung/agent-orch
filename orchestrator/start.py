@@ -515,16 +515,16 @@ def run_start_sync(home: Path, task_id: str) -> dict[str, Any]:
                     "decision_artifact_path": existing_gate_decision.get("decision_artifact_path"),
                 }
             )
-    if (
-        _is_stop_gate_pending(execution_result)
-        and isinstance(existing_execution_result, dict)
+    same_result = (
+        isinstance(existing_execution_result, dict)
         and _same_execution_result_except_synced_at(existing_execution_result, execution_result)
-    ):
+    )
+    if same_result:
         execution_result["synced_at"] = existing_execution_result.get("synced_at")
     task_record["stage"] = execution_result["lifecycle_stage"]
     task_record["execution_result"] = execution_result
     routing["execution_result"] = execution_result
-    notify = True
+    notify = not same_result
     if decided_gate is not None:
         task_record["gate"] = decided_gate
         routing["gate"] = decided_gate
@@ -537,8 +537,11 @@ def run_start_sync(home: Path, task_id: str) -> dict[str, Any]:
         task_record["gate"] = gate_summary
         routing["gate"] = gate_summary
         notify = not (isinstance(existing_gate, dict) and existing_gate == gate_summary)
-    _write_yaml(task_path, task_record)
-    _write_yaml(routing_path, routing)
+    gate_sync = decided_gate is not None or _is_stop_gate_pending(execution_result)
+    if gate_sync:
+        # Keep the established gate persistence and notification order.
+        _write_yaml(task_path, task_record)
+        _write_yaml(routing_path, routing)
 
     if notify:
         notification_summary = (
@@ -556,6 +559,12 @@ def run_start_sync(home: Path, task_id: str) -> dict[str, Any]:
             notification_summary,
             result_path,
         )
+    if not gate_sync:
+        # A failed append must not persist the dedupe result: a later sync
+        # retries it. A persistence failure can re-notify, so this remains
+        # at-least-once, not a crash-atomic or concurrent exactly-once claim.
+        _write_yaml(task_path, task_record)
+        _write_yaml(routing_path, routing)
     return _result(task_id, task_path, routing_path, task_record, routing)
 
 
