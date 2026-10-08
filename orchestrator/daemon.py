@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import sqlite3
+from types import SimpleNamespace
 import os
 import signal
 import threading
@@ -12,6 +15,7 @@ from typing import Any
 from .containment import protected_roots_from_env, validate_home_outside_protected
 from .controller import Controller, ControllerError
 from .ipc import IPCError, atomic_write_json, atomic_write_text, hold_daemon_lock
+from .kanban.commands import handle_request as handle_kanban_request, KanbanError
 from .profile import ProfileError
 from .runner import require_unattended_consent
 
@@ -21,7 +25,7 @@ from .runner import require_unattended_consent
 STARTUP_TEMP_GRACE_SECONDS = 60.0
 
 
-def run_daemon(home: Path, poll_interval: float = 3.0) -> None:
+def run_daemon(home: Path, poll_interval: float = 3.0, *, mode: str | None = None) -> None:
     """The long-running service: watch home/inbox/*.json, run each request, write
     results to processed/.
 
@@ -35,6 +39,9 @@ def run_daemon(home: Path, poll_interval: float = 3.0) -> None:
     """
     if poll_interval <= 0:
         raise ValueError("poll interval must be positive")
+    mode = daemon_mode(mode)
+    if mode == "progress-management":
+        return _run_progress(home, poll_interval)
     # Checked here rather than only in the launcher: a deployment with its own
     # launcher would otherwise skip the acknowledgement without noticing.
     require_unattended_consent()
@@ -100,7 +107,14 @@ def _handle(controller: Controller, req_path: Path, processed: Path) -> None:
         if str(uuid.UUID(request_id)) != request_id:
             raise ValueError(f"invalid request_id: {request_id!r}")
         action = req.get("action", "run")
-        if action == "resume":
+        if action == "kanban":
+            kanban = handle_kanban_request(controller, req)
+            outcome = {"request": req, "request_id": request_id, "kanban": kanban}
+            stamp = uuid.uuid4().hex[:8]
+            atomic_write_json(processed / f"{req_path.stem}.{stamp}.result.json", outcome)
+            os.replace(req_path, processed / f"{req_path.stem}.{stamp}.request.json")
+            return
+        elif action == "resume":
             task_id = req["task_id"]
             print(f"[orchestrator-daemon] picked up {req_path.name}: resume {task_id}", flush=True)
             result = controller.resume(task_id, operation_id=request_id, rerun_stage=req.get("rerun_stage", False))
@@ -139,7 +153,7 @@ def _handle(controller: Controller, req_path: Path, processed: Path) -> None:
             "notifications": result["notifications"],
         }
         print(f"[orchestrator-daemon] done {task_id}: {task['status']} ({task['stop_reason']})", flush=True)
-    except (ControllerError, ProfileError, IPCError, OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+    except (ControllerError, ProfileError, IPCError, KanbanError, sqlite3.Error, OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
         outcome = {"request_path": str(req_path), "error": f"{type(exc).__name__}: {exc}"}
         print(f"[orchestrator-daemon] request failed {req_path.name}: {exc}", flush=True)
 
@@ -223,3 +237,122 @@ def _print_controller_event(event: str, payload: dict[str, Any]) -> None:
         )
         return
     print(f"[orchestrator-daemon] event {event}: {payload}", flush=True)
+
+
+PROGRESS_COMMANDS = frozenset({"create", "edit", "report-progress", "archive"})
+
+
+def daemon_mode(mode: str | None = None) -> str:
+    value = os.environ.get("ORCH_DAEMON_MODE", "full") if mode is None else mode
+    if value not in {"full", "progress-management"}:
+        raise ValueError("invalid ORCH_DAEMON_MODE / daemon mode")
+    return value
+
+
+def _progress_request(path: Path) -> tuple[dict | None, str]:
+    """Classify before claim or completed-result lookup; never log payloads."""
+    if path.name.startswith(".") or path.suffix != ".json" or not path.is_file() or path.is_symlink():
+        return None, "non_request"
+    try:
+        request = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None, "unreadable_or_bad_json"
+    if not isinstance(request, dict) or request.get("action") != "kanban" or not isinstance(request.get("command"), str) or request["command"] not in PROGRESS_COMMANDS:
+        return None, "not_allowed"
+    return request, "allowed"
+
+
+def _progress_handle(context, path: Path, processed: Path, request: dict) -> bool:
+    result_path = processed / (path.stem + ".progress.result.json")
+    request_path = processed / (path.stem + ".progress.request.json")
+    if result_path.exists():
+        try:
+            existing = json.loads(result_path.read_text(encoding="utf-8"))
+            if existing.get("request") != request:
+                return False
+        except (OSError, ValueError, AttributeError):
+            return False
+    else:
+        try:
+            request_id = request["request_id"]
+            if not isinstance(request_id, str) or str(uuid.UUID(request_id)) != request_id:
+                raise ValueError("invalid request id")
+            kanban = handle_kanban_request(context, request)
+            outcome = {"request": request, "request_id": request_id, "kanban": kanban}
+        except (KanbanError, KeyError, TypeError, ValueError, sqlite3.Error) as exc:
+            # Exception strings may contain actor-supplied text. Keep diagnostics
+            # and IPC error categories finite; original bytes stay in request.
+            outcome = {"request": request, "request_id": request.get("request_id"), "error": type(exc).__name__}
+        atomic_write_json(result_path, outcome)
+    if request_path.exists() and request_path.read_bytes() != path.read_bytes():
+        return False
+    os.replace(path, request_path)
+    return True
+
+
+def _progress_scan(context, inbox: Path, processing: Path, processed: Path) -> dict[str, int]:
+    counts = {"handled": 0, "not_allowed": 0, "non_request": 0, "unreadable_or_bad_json": 0, "collision": 0}
+    for directory in (processing, inbox):
+        for path in sorted(directory.iterdir()):
+            request, category = _progress_request(path)
+            if request is None:
+                counts[category] += 1
+                continue
+            if directory == inbox:
+                claimed = processing / path.name
+                if claimed.exists():
+                    counts["collision"] += 1
+                    continue
+                try:
+                    os.replace(path, claimed)
+                except FileNotFoundError:
+                    continue
+                path = claimed
+            if _progress_handle(context, path, processed, request):
+                counts["handled"] += 1
+            else:
+                counts["collision"] += 1
+    return counts
+
+
+def _progress_code_hash() -> str:
+    root = Path(__file__).parent
+    digest = hashlib.sha256()
+    for name in ("cli.py", "daemon.py", "db.py", "kanban/__init__.py", "kanban/store.py", "kanban/commands.py", "kanban/quota.py", "kanban/read.py", "kanban/view.py"):
+        digest.update(name.encode() + b"\0" + (root / name).read_bytes())
+    return digest.hexdigest()
+
+
+def _run_progress(home: Path, poll_interval: float) -> None:
+    from .db import connect_progress
+    home = home.resolve()
+    validate_home_outside_protected(home, protected_roots_from_env())
+    pid_path = home / "daemon.pid"
+    with hold_daemon_lock(home):
+        conn = connect_progress(home / "orchestrator.db")
+        context = SimpleNamespace(conn=conn, home=home)
+        stop = threading.Event()
+        previous = {}
+        try:
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous[signum] = signal.signal(signum, lambda *_: stop.set())
+            for name in ("inbox", "processing", "processed"):
+                (home / name).mkdir(exist_ok=True)
+            atomic_write_text(pid_path, f"{os.getpid()}\n")
+            print(f"[orchestrator-daemon] mode=progress-management code_sha256={_progress_code_hash()} pid={os.getpid()}", flush=True)
+            last_counts = None
+            while not stop.is_set():
+                counts = _progress_scan(context, home / "inbox", home / "processing", home / "processed")
+                if counts != last_counts:
+                    print(f"[orchestrator-daemon] progress queue categories={counts}", flush=True)
+                    last_counts = counts
+                stop.wait(poll_interval)
+        finally:
+            conn.close()
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+            try:
+                if pid_path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    pid_path.unlink()
+            except OSError:
+                pass

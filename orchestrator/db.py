@@ -159,6 +159,8 @@ def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(DDL)
     _migrate(conn)
+    from .kanban.store import ensure_schema
+    ensure_schema(conn)
     return conn
 
 
@@ -186,3 +188,52 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for name, definition in columns.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE stage_runs ADD COLUMN {name} {definition}")
+
+
+def connect_progress(path: Path) -> sqlite3.Connection:
+    """Existing DB only: one preflight + four-table transaction, no legacy init."""
+    from .kanban.store import ensure_schema, create_schema_in_transaction
+    import re
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=rw", timeout=5, isolation_level=None, uri=True)
+    conn.row_factory = sqlite3.Row
+    reference = sqlite3.connect(":memory:", isolation_level=None)
+    reference.row_factory = sqlite3.Row
+    try:
+        # Reference schema lives only in memory. Never run DDL/_migrate on
+        # legacy state in the target connection.
+        reference.executescript(DDL)
+        ensure_schema(reference)
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        for table in ("tasks", "stage_runs", "transitions", "edge_counts", "notifications", "quarantine", "trajectory_events"):
+            expected = {r["name"]: tuple(r)[2:] for r in reference.execute("PRAGMA table_info(" + table + ")")}
+            actual = {r["name"]: tuple(r)[2:] for r in conn.execute("PRAGMA table_info(" + table + ")")}
+            if not expected or any(actual.get(k) != v for k, v in expected.items()):
+                raise ValueError("incompatible legacy schema: " + table)
+        def normalize(sql):
+            return re.sub(r"\s+", " ", sql.lower()).strip().replace(" if not exists", "")
+        required = reference.execute("SELECT name,sql FROM sqlite_master WHERE type IN ('index','trigger') AND sql IS NOT NULL AND name NOT LIKE 'kanban_%'").fetchall()
+        for obj in required:
+            actual = conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (obj["name"],)).fetchone()
+            if actual is None or normalize(actual["sql"]) != normalize(obj["sql"]):
+                raise ValueError("incompatible legacy schema object: " + obj["name"])
+        expected = {r["name"]: (r["type"], normalize(r["sql"])) for r in reference.execute("SELECT name,type,sql FROM sqlite_master WHERE name LIKE 'kanban_%' AND sql IS NOT NULL")}
+        actual = {r["name"]: (r["type"], normalize(r["sql"])) for r in conn.execute("SELECT name,type,sql FROM sqlite_master WHERE (name LIKE 'kanban_%' OR tbl_name LIKE 'kanban_%') AND sql IS NOT NULL")}
+        if actual and actual != expected:
+            raise ValueError("incompatible kanban schema")
+        if conn.execute("SELECT count(*) FROM tasks WHERE status IS NULL OR status NOT IN ('waiting_user','blocked','done','failed','paused')").fetchone()[0]:
+            raise ValueError("active or unknown task state")
+        if conn.execute("SELECT count(*) FROM stage_runs WHERE status IS NULL OR status NOT IN ('committed','paused','blocked')").fetchone()[0]:
+            raise ValueError("active or unknown stage state")
+        if actual and conn.execute("SELECT count(*) FROM kanban_nights WHERE phase IS NULL OR phase <> 'stopped'").fetchone()[0]:
+            raise ValueError("active or unknown night state")
+        create_schema_in_transaction(conn)
+        conn.execute("COMMIT")
+        return conn
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        conn.close()
+        raise
+    finally:
+        reference.close()

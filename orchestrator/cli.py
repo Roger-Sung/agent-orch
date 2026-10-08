@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sqlite3
@@ -11,7 +12,7 @@ from pathlib import Path
 from .config import ConfigFileError, load_config_into_env
 from .containment import ContainmentError
 from .controller import Controller, ControllerError
-from .daemon import run_daemon
+from .daemon import run_daemon, daemon_mode, PROGRESS_COMMANDS
 from .doctor import run_doctor
 from .runner import ALLOW_UNSANDBOXED_ENV, UnattendedConsentError
 from .ipc import IPCError, daemon_is_running, enqueue_request, wait_for_result
@@ -120,7 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # The long-running service: watch the inbox and execute (the only Controller,
     # and the single writer).
-    subparsers.add_parser("daemon", help="run the always-on service that watches the inbox")
+    daemon = subparsers.add_parser("daemon", help="run the always-on service that watches the inbox")
+    daemon.add_argument("--mode", choices=("full", "progress-management"))
     session_register = subparsers.add_parser("review-session-register", help="register a new or explicitly imported same-host Fable session; no model call")
     session_register.add_argument("series")
     session_register.add_argument("--cwd", required=True, type=Path)
@@ -217,7 +219,289 @@ def build_parser() -> argparse.ArgumentParser:
         help="run locally only when the daemon is stopped (trusted terminal/debugging)",
     )
     resume.add_argument("--wait-timeout", type=float, default=_default_wait_timeout())
+    _add_kanban_parsers(subparsers)
     return parser
+
+
+# ---------------------------------------------------------------------------
+# kanban (T1.8 slices T1-T2): manual card and quota commands
+# ---------------------------------------------------------------------------
+
+#: CLI flag -> card column.  Spelled out rather than derived so adding a card
+#: column never silently becomes an operator-writable field.
+KANBAN_TEXT_FIELDS = (
+    ("--title", "title"),
+    ("--note", "note"),
+    ("--priority", "priority"),
+    ("--repo", "repo_path"),
+    ("--worktree", "worktree_path"),
+    ("--git-common-dir", "git_common_dir"),
+    ("--change", "change_name"),
+    ("--spec", "spec_path"),
+    ("--acceptance", "acceptance_path"),
+    ("--spec-review", "spec_review_pointer"),
+    ("--spec-review-hash", "spec_review_hash"),
+    ("--base-head", "base_head"),
+    ("--candidate", "candidate_fingerprint"),
+    ("--card-profile", "profile_name"),
+    ("--provider", "provider"),
+    ("--model", "model"),
+    ("--effort", "effort"),
+    ("--routing-digest", "routing_digest"),
+    ("--config-digest", "config_digest"),
+)
+KANBAN_JSON_FIELDS = (
+    ("--risk", "risk"),
+    ("--estimate", "estimate_by_pool"),
+    ("--allowed-commands", "allowed_commands"),
+)
+
+
+def _add_kanban_parsers(subparsers: argparse._SubParsersAction) -> None:
+    kanban = subparsers.add_parser(
+        "kanban",
+        help="manual kanban card commands (metadata only; the daemon applies them)",
+        description=(
+            "Every card command is written to the daemon inbox and applied by the daemon's "
+            "single writer, so a queued request is not a successful operation. Each mutating "
+            "command carries --expected-revision (compare-and-swap) and an --operation-id "
+            "(idempotency key): resending the same operation id with the same payload replays "
+            "the recorded result, and resending it with a different payload is refused. "
+            "Nothing here runs a provider, submits a task or claims a night."
+        ),
+    )
+    commands = kanban.add_subparsers(dest="kanban_command", required=True)
+    for action in ("list", "show", "render"):
+        reader = commands.add_parser(action, help="read-only snapshot; no daemon")
+        if action in {"list", "show"}:
+            reader.add_argument("--json", action="store_true")
+        if action == "show":
+            reader.add_argument("--card", required=True)
+        if action == "render":
+            reader.add_argument("--output", type=Path, required=True)
+
+    def common(parser: argparse.ArgumentParser, *, revision: bool = True) -> None:
+        parser.add_argument(
+            "--actor",
+            help="operator identity recorded on the event; defaults to the local login user",
+        )
+        parser.add_argument(
+            "--operation-id",
+            help="idempotency key; defaults to this request's own id (one-shot use)",
+        )
+        parser.add_argument("--wait-timeout", type=float, default=_default_wait_timeout())
+        if revision:
+            parser.add_argument("--expected-revision", type=int, required=True)
+
+    def fields(parser: argparse.ArgumentParser) -> None:
+        for flag, dest in KANBAN_TEXT_FIELDS:
+            parser.add_argument(flag, dest=dest)
+        for flag, dest in KANBAN_JSON_FIELDS:
+            parser.add_argument(flag, dest=dest, help="a JSON object or array, as appropriate")
+
+    create = commands.add_parser("create", help="create a card in Inbox")
+    create.add_argument("--card", required=True, help="card id, chosen by the caller so a resend is exact")
+    common(create, revision=False)
+    fields(create)
+
+    edit = commands.add_parser(
+        "edit",
+        help="edit card fields; a scope-bearing field invalidates the approval",
+    )
+    edit.add_argument("--card", required=True)
+    common(edit)
+    fields(edit)
+
+    from .kanban.commands import PROGRESS_STATUSES
+    report = commands.add_parser("report-progress", help="append an assistant report; never change task/card lifecycle")
+    report.add_argument("--card", required=True)
+    common(report)
+    report.add_argument("--report-status", required=True, choices=PROGRESS_STATUSES)
+    report.add_argument("--summary", required=True)
+    report.add_argument("--blocker")
+    report.add_argument("--decision")
+    report.add_argument("--next-step")
+    report.add_argument("--source-ref", action="append", default=[], dest="source_refs",
+                        help="source pointer as text only; repeat as needed")
+
+    approve = commands.add_parser(
+        "approve", help="operator approval: freeze the scope and move the card to Ready")
+    approve.add_argument("--card", required=True)
+    common(approve)
+
+    for name, help_text in (
+        ("withdraw", "withdraw an approval; the card returns to Inbox"),
+        ("return", "return the card for clarification; the approval is invalidated"),
+        ("archive", "archive the card; this is not a success claim"),
+        ("pause", "record a pause that applies at the next stage boundary"),
+    ):
+        parser = commands.add_parser(name, help=help_text)
+        parser.add_argument("--card", required=True)
+        common(parser)
+
+    done = commands.add_parser(
+        "done",
+        help="accept the card as Done against its evidence and, when required, a manual gate ALLOW",
+    )
+    done.add_argument("--card", required=True)
+    common(done)
+    done.add_argument("--binding", type=Path, required=True,
+                      help="JSON file holding the closeout binding (T7 generates it from committed rows)")
+    done.add_argument("--final-candidate", required=True,
+                      help="the final candidate fingerprint as observed now")
+    done.add_argument("--gate-decision", type=Path,
+                      help="path to the operator's <closeout>-gate-decision.yaml")
+    done.add_argument("--gate-decision-hash", help="sha256 of that artifact")
+
+    snapshot = commands.add_parser(
+        "quota-snapshot",
+        help="record a human-observed seven-day remaining quota snapshot",
+    )
+    common(snapshot, revision=False)
+    snapshot.add_argument("--snapshot", required=True, help="caller-chosen stable ID for exact retry")
+    snapshot.add_argument(
+        "--pool",
+        required=True,
+        help="non-sensitive lowercase pool alias; never an email, token, key, or credential",
+    )
+    snapshot.add_argument("--remaining-bp", required=True, type=int)
+    snapshot.add_argument("--observed-at-ms", required=True, type=int)
+    snapshot.add_argument("--reset-at-ms", required=True, type=int)
+
+    invalidate = commands.add_parser(
+        "quota-invalidate", help="mark one exact manual snapshot stale without deleting it"
+    )
+    common(invalidate, revision=False)
+    invalidate.add_argument("--snapshot", required=True)
+
+
+def _kanban_payload(args: argparse.Namespace) -> dict:
+    payload: dict = {"actor": args.actor or f"local:{getpass.getuser()}"}
+    command = args.kanban_command
+    if command not in {"create", "quota-snapshot", "quota-invalidate"}:
+        payload["expected_revision"] = args.expected_revision
+    if command in {"quota-snapshot", "quota-invalidate"}:
+        payload["snapshot_id"] = args.snapshot
+        if command == "quota-snapshot":
+            payload.update(
+                {
+                    "pool_key": args.pool,
+                    "weekly_remaining_bp": args.remaining_bp,
+                    "observed_at": args.observed_at_ms,
+                    "reset_at": args.reset_at_ms,
+                }
+            )
+        return payload
+    payload["card_id"] = args.card
+    if command in {"create", "edit"}:
+        collected: dict = {}
+        for _flag, dest in KANBAN_TEXT_FIELDS:
+            value = getattr(args, dest)
+            if value is not None:
+                collected[dest] = value
+        for flag, dest in KANBAN_JSON_FIELDS:
+            value = getattr(args, dest)
+            if value is None:
+                continue
+            try:
+                collected[dest] = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ControllerError(f"{flag} is not valid JSON: {exc}") from exc
+        payload["fields"] = collected
+    if command == "report-progress":
+        payload.update({key: getattr(args, key) for key in (
+            "report_status", "summary", "blocker", "decision", "next_step", "source_refs")})
+    if command == "done":
+        try:
+            binding = json.loads(args.binding.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ControllerError(f"cannot read --binding: {exc}") from exc
+        payload["binding"] = binding
+        payload["final_candidate_fingerprint"] = args.final_candidate
+        if args.gate_decision is not None:
+            payload["gate_decision_path"] = str(args.gate_decision.resolve())
+        if args.gate_decision_hash is not None:
+            payload["gate_decision_hash"] = args.gate_decision_hash
+    return payload
+
+
+def _kanban(home: Path, args: argparse.Namespace) -> int:
+    if args.kanban_command in {"list", "show", "render"}:
+        from .kanban.read import snapshot, Unavailable
+        from .kanban.view import project, render
+        try:
+            data = snapshot(home, card_id=args.card if args.kanban_command == "show" else None)
+            cards = project(data)
+            if args.kanban_command == "show":
+                cards = [c for c in cards if c["card"]["card_id"] == args.card]
+                if not cards:
+                    raise Unavailable("unknown card: " + args.card)
+                task_id = cards[0]["card"].get("task_id")
+                data = {**data, "cards": [cards[0]["card"]],
+                        "tasks": [t for t in data["tasks"] if t["id"] == task_id],
+                        "events": [e for e in data["events"] if e.get("card_id") == args.card],
+                        "nights": [n for n in data["nights"] if n.get("card_id") == args.card]}
+            if args.kanban_command == "render":
+                # Reject state paths and aliases before opening the destination.
+                state_files = [home / name for name in (
+                    "orchestrator.db", "orchestrator.db-wal", "orchestrator.db-shm",
+                    "orch.db", "orch.db-wal", "orch.db-shm")]
+                destination = args.output.resolve()
+                if destination.is_relative_to(home.resolve()) or any(
+                    destination == state.resolve() or (
+                        args.output.exists() and state.exists() and args.output.samefile(state)
+                    ) for state in state_files
+                ):
+                    raise Unavailable("render output must be outside ORCH_HOME and not alias state")
+                args.output.write_text(render(data), encoding="utf-8")
+                print(str(args.output))
+            else:
+                print(json.dumps({**data, "projection": cards}, ensure_ascii=False, indent=2))
+            return 0
+        except (Unavailable, OSError) as exc:
+            print(json.dumps({"available": False, "error": "unavailable: " + str(exc)}, ensure_ascii=False))
+            return 2
+    from .kanban.commands import KanbanError, build_request
+    try:
+        if daemon_mode() == "progress-management" and args.kanban_command not in PROGRESS_COMMANDS:
+            raise KanbanError("command unavailable in progress-management")
+    except (ValueError, KanbanError) as exc:
+        print(f"orchestrator: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        request = build_request(
+            args.kanban_command,
+            _kanban_payload(args),
+            operation_id=args.operation_id,
+        )
+    except (ControllerError, KanbanError, OSError) as exc:
+        print(f"orchestrator: {exc}", file=sys.stderr)
+        return 2
+    if not daemon_is_running(home):
+        # A card command is only ever applied by the daemon's single writer;
+        # there is deliberately no --in-process escape hatch, because a second
+        # writer is exactly what the revision CAS cannot defend against.
+        print(
+            "orchestrator: orchestrator daemon is not running; a kanban command is applied "
+            "only by the daemon",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        path = enqueue_request(home, request)
+        result = wait_for_result(home, path, args.wait_timeout)
+    except (IPCError, OSError) as exc:
+        print(f"orchestrator: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    kanban = result.get("kanban")
+    if not isinstance(kanban, dict):
+        return 2
+    # A recorded rejection is a real answer, not a crash, but the operator
+    # still needs a non-zero exit so a script does not treat it as applied.
+    return 0 if kanban.get("result") == "accepted" else 2
+
 
 
 def _enqueue(home: Path, args: argparse.Namespace) -> dict:
@@ -276,6 +560,14 @@ def main(argv: list[str] | None = None) -> int:
         # started with the flag keeps the opt-out and a stage never has to
         # guess. It is deliberately noisy to set.
         os.environ[ALLOW_UNSANDBOXED_ENV] = "1"
+    try:
+        mode = daemon_mode(getattr(args, "mode", None))
+    except ValueError as exc:
+        print(f"orchestrator: {exc}", file=sys.stderr)
+        return 2
+    if mode == "progress-management" and args.command not in {"daemon", "kanban"}:
+        print("orchestrator: command unavailable in progress-management", file=sys.stderr)
+        return 2
     home = default_home()
     if not os.environ.get("ORCH_HOME"):
         # Defaulting is legal but has burned an operator before: a CLI without
@@ -373,17 +665,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"orchestrator: {exc}", file=sys.stderr)
             return 2
 
+    if args.command == "kanban":
+        return _kanban(home, args)
+
     if args.command == "daemon":
         try:
             poll_interval = float(os.environ.get("ORCH_POLL_INTERVAL", "3"))
-            run_daemon(home, poll_interval=poll_interval)
+            run_daemon(home, poll_interval=poll_interval, mode=mode)
             return 0
         except UnattendedConsentError as exc:
             # Same wording and same exit code as the launcher check, so the two
             # gates are indistinguishable to whoever is reading the failure.
             print(f"orchestrator daemon: {exc}", file=sys.stderr)
             return 78  # EX_CONFIG
-        except (ControllerError, ContainmentError, IPCError, OSError, ValueError) as exc:
+        except (ControllerError, ContainmentError, IPCError, OSError, ValueError, sqlite3.Error) as exc:
             print(f"orchestrator: {exc}", file=sys.stderr)
             return 2
 
