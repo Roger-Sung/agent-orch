@@ -122,6 +122,29 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual([],page_snapshot(self.home)['cards']);self.assertEqual('backlog',page_snapshot(self.home,backlog=True)['queue_locations']['card'])
         self.assertEqual(before,legacy_rows(self.home));self.assertEqual(schema,legacy_schema(self.home));self.assertFalse((self.home/'execution-called').exists())
 
+    def test_decision_place_IPC_CAS_restart_question_preservation_zero_execution(self):
+        from orchestrator.kanban.read import page_snapshot
+        from orchestrator.kanban.view import project
+        before=legacy_rows(self.home);schema=legacy_schema(self.home)
+        proc=self.start();self.ready(proc);self.assertEqual('accepted',self.card()['result'])
+        payload={'card_id':'card','expected_revision':0,'actor':'operator:synthetic','destination':'board','user_request':'USER explicitly chooses card'}
+        self.assertEqual('accepted',self.send('place',payload)['result'])
+        report={'card_id':'card','expected_revision':1,'actor':'assistant:synthetic','report_status':'needs_decision','summary':'18 decisions await an explicit answer','decision':'Which entries may be public?','blocker':'No publication approval','next_step':'Await answer','source_refs':['synthetic:opaque-pointer']}
+        self.assertEqual('accepted',self.send('report-progress',report)['result'])
+        conn=db.connect(self.home/'orchestrator.db',read_only=True);card=dict(conn.execute("SELECT * FROM kanban_cards WHERE card_id='card'").fetchone());events=[tuple(r) for r in conn.execute('SELECT * FROM kanban_events ORDER BY rowid')];conn.close()
+        payload.update(expected_revision=2,destination='backlog',user_request='USER defers the unanswered decision to Backlog')
+        op=str(uuid.uuid4());self.assertEqual('accepted',self.send('place',payload,operation=op)['result']);self.assertTrue(self.send('place',payload,operation=op)['replayed'])
+        self.assertEqual('revision_conflict',self.send('place',payload)['reason']);self.stop(proc)
+        self.assertEqual([],page_snapshot(self.home)['cards'])
+        backlog=page_snapshot(self.home,backlog=True);item=project(backlog)[0];self.assertEqual('待決策',item['group']);self.assertEqual('Which entries may be public?',item['progress_report']['decision'])
+        detail=page_snapshot(self.home,backlog=True,detail=item['card']['_detail_token']);self.assertEqual(report['blocker'],project(detail)[0]['progress_report']['blocker'])
+        proc=self.start();self.ready(proc);payload.update(expected_revision=3,destination='board',user_request='USER explicitly reselects this decision')
+        self.assertEqual('accepted',self.send('place',payload)['result']);self.stop(proc)
+        item=project(page_snapshot(self.home))[0];self.assertEqual('待決策',item['group']);self.assertEqual(report['decision'],item['progress_report']['decision'])
+        conn=db.connect(self.home/'orchestrator.db',read_only=True);after=dict(conn.execute("SELECT * FROM kanban_cards WHERE card_id='card'").fetchone());self.assertEqual(events,[tuple(r) for r in conn.execute('SELECT * FROM kanban_events ORDER BY rowid LIMIT 3')]);conn.close()
+        self.assertEqual({k:v for k,v in card.items() if k not in {'revision','updated_at'}},{k:v for k,v in after.items() if k not in {'revision','updated_at'}})
+        self.assertEqual(4,after['revision']);self.assertEqual(before,legacy_rows(self.home));self.assertEqual(schema,legacy_schema(self.home));self.assertFalse((self.home/'execution-called').exists())
+
     def test_mixed_queue_restart_old_state_and_zero_execution(self):
         for folder in ('inbox','processing','processed','quarantine'):(self.home/folder).mkdir()
         retained={}

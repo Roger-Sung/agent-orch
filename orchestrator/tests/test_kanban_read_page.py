@@ -63,8 +63,8 @@ class BacklogTests(unittest.TestCase):
         self.create('remaining');self.send('archive',{'card_id':'new','expected_revision':2,'actor':'operator'})
         self.assertEqual([],read.page_snapshot(self.home)['cards']);self.assertEqual(['remaining'],[c['card_id'] for c in read.page_snapshot(self.home,backlog=True)['cards']])
         self.assertEqual('封存',self.item(read.page_snapshot(self.home,archived=True),'new')['group'])
-    def test_effective_pending_only_and_explicit_selection_required(self):
-        for state in ('done','needs_clarification','returned','mystery','archived'):
+    def test_unsafe_states_and_explicit_selection_required(self):
+        for state in ('done','mystery','archived'):
             self.card(state,state);self.assertEqual('rejected',self.place(state,'backlog')['result'])
         self.card('running');self.report('running','in_progress');self.assertEqual('backlog_requires_effective_pending',self.place('running','backlog',1)['reason'])
         self.card('c');payload={'card_id':'c','expected_revision':0,'actor':'operator','destination':'board','user_request':' '}
@@ -85,7 +85,9 @@ class BacklogTests(unittest.TestCase):
         for revision,fields in ((1,{'repo_path':'B'}),(2,{'repo_path':None}),(3,{'title':'description'})):
             self.assertEqual('accepted',self.send('edit',{'card_id':'c','expected_revision':revision,'actor':'operator','fields':fields})['result'])
         data=read.page_snapshot(self.home);item=self.item(data,'c');self.assertIsNone(item['progress_report']);self.assertIn('scope 已修改',item['progress_report_note']);self.assertEqual(2,len(data['events']))
-        self.place('c','backlog',4);self.assertEqual([],read.page_snapshot(self.home)['cards'])
+        self.assertEqual('backlog_requires_effective_pending',self.place('c','backlog',4)['reason'])
+        self.assertEqual(['c'],[c['card_id'] for c in read.page_snapshot(self.home)['cards']])
+        self.assertIsNone(self.item(read.page_snapshot(self.home),'c')['progress_report'])
     def test_descriptive_edit_and_place_keep_report_binding(self):
         self.card('c');self.report('c');self.place('c','backlog',1);self.send('edit',{'card_id':'c','expected_revision':2,'actor':'operator','fields':{'title':'renamed'}})
         item=self.item(read.page_snapshot(self.home,backlog=True),'c');self.assertEqual('not_started',item['progress_report']['report_status'])
@@ -166,6 +168,99 @@ class BacklogTests(unittest.TestCase):
         self.corrupt();self.conn.execute("UPDATE kanban_events SET metadata_delta='broken' WHERE kind='place'")
         result=call('list');self.assertEqual('unknown',result['queue_locations']['c']);self.assertEqual('待決策',result['projection'][0]['group'])
         self.assertEqual('backlog_requires_effective_pending',self.place('c','backlog',1)['reason'])
+
+    def task(self,ident,status,stop_reason=None):
+        self.conn.execute("INSERT INTO tasks(id,type,status,current_stage,profile_hash,input_hash,profile_snapshot_path,input_snapshot_path,artifact_dir,max_transitions,created_at,updated_at,stop_reason) VALUES (?,'apply',?,'review','pf','ih','synthetic-profile','synthetic-input','synthetic-artifact',8,1,2,?)",('task-'+ident,status,stop_reason))
+        self.conn.execute("UPDATE kanban_cards SET task_id=?,request_id=? WHERE card_id=?",('task-'+ident,'request-'+ident,ident))
+    def night(self,ident,phase):
+        self.conn.execute("INSERT INTO kanban_nights(night_id,window_start_ms,window_end_ms,card_id,approval_generation,approval_hash,task_id,request_id,workspace_dir,base_head,candidate_fingerprint,profile_hash,input_bytes,input_hash,pool_claims,reserved_at,phase,stop_reason) VALUES (?,1,2,?,1,'hash',?,?,'synthetic-workspace','head','fingerprint','pf',X'00','ih','{}',1,?,'synthetic')",('night-'+ident,ident,'night-task-'+ident,'night-request-'+ident,phase))
+    def test_known_decision_matrix_preserves_all_nonplacement_state(self):
+        cases=[('manual-clarification','needs_clarification',None,None),('manual-returned','returned',None,None),
+               ('report-decision','inbox',None,'needs_decision'),('report-blocked','inbox',None,'blocked'),
+               ('task-blocked','ready','blocked',None),('task-waiting','inbox','waiting_user',None),
+               ('linked-report','returned','waiting_user','needs_decision')]
+        for ident,manual,status,report_status in cases:
+            with self.subTest(ident=ident):
+                self.card(ident,manual)
+                if status:self.task(ident,status)
+                self.night(ident,'stopped')
+                # Frozen approval/binding/profile fields are synthetic opaque metadata.
+                approval='approval-'+ident
+                self.conn.execute("INSERT INTO kanban_events(operation_id,payload_hash,kind,card_id,actor,at,result,payload) VALUES (?,'hash','fixture',?,'synthetic',1,'accepted','{}')",(approval,ident))
+                self.conn.execute("UPDATE kanban_cards SET approval_generation=3,approval_hash='approval-hash',approval_actor='synthetic',approval_at=1,approval_event_id=?,repo_path='synthetic-repo',base_head='head',candidate_fingerprint='fingerprint',profile_name='synthetic-profile',profile_hash='pf',routing_digest='route',config_digest='config',note='Unanswered decision retained' WHERE card_id=?",(approval,ident))
+                revision=0
+                if report_status:
+                    self.assertEqual('accepted',self.send('report-progress',{'card_id':ident,'expected_revision':0,'actor':'assistant','report_status':report_status,'summary':'Waiting for explicit answer','decision':'Which 18 entries? <script>question</script>','blocker':'No publication authorization','next_step':'Await answer','source_refs':['synthetic:opaque-pointer']})['result']);revision=1
+                before=dict(self.conn.execute('SELECT * FROM kanban_cards WHERE card_id=?',(ident,)).fetchone())
+                tables=[r[0] for r in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('kanban_cards','kanban_events','sqlite_sequence') ORDER BY name")]
+                rows={t:[tuple(r) for r in self.conn.execute('SELECT * FROM '+t+' ORDER BY rowid')] for t in tables}
+                schema=[tuple(r) for r in self.conn.execute('SELECT * FROM sqlite_master ORDER BY name')]
+                events=[tuple(r) for r in self.conn.execute('SELECT * FROM kanban_events WHERE card_id=? ORDER BY rowid',(ident,))]
+                op=str(uuid.uuid4());outcome=self.place(ident,'backlog',revision,op);self.assertEqual('accepted',outcome['result'])
+                self.assertTrue(self.place(ident,'backlog',revision,op)['replayed'])
+                self.assertEqual('idempotency_conflict',self.place(ident,'board',revision,op)['reason'])
+                self.assertEqual('revision_conflict',self.place(ident,'backlog',revision)['reason'])
+                after=dict(self.conn.execute('SELECT * FROM kanban_cards WHERE card_id=?',(ident,)).fetchone())
+                self.assertEqual({k:v for k,v in before.items() if k not in {'revision','updated_at'}},{k:v for k,v in after.items() if k not in {'revision','updated_at'}})
+                self.assertEqual(revision+1,after['revision'])
+                self.assertEqual(rows,{t:[tuple(r) for r in self.conn.execute('SELECT * FROM '+t+' ORDER BY rowid')] for t in tables})
+                self.assertEqual(schema,[tuple(r) for r in self.conn.execute('SELECT * FROM sqlite_master ORDER BY name')])
+                self.assertEqual(events,[tuple(r) for r in self.conn.execute('SELECT * FROM kanban_events WHERE card_id=? ORDER BY rowid LIMIT ?',(ident,len(events)))])
+                self.assertNotIn(ident,[c['card_id'] for c in read.page_snapshot(self.home)['cards']])
+                backlog=read.page_snapshot(self.home,backlog=True);item=self.item(backlog,ident);self.assertEqual('待決策',item['group']);self.assertIsNone(item['workflow_reason'])
+                detail=read.page_snapshot(self.home,backlog=True,detail=item['card']['_detail_token'])
+                if report_status:
+                    self.assertEqual('Which 18 entries? <script>question</script>',self.item(detail,ident)['progress_report']['decision'])
+                    fragment=detail_fragment(detail,backlog=True);self.assertIn('&lt;script&gt;question',fragment);self.assertNotIn('<script>',fragment)
+                self.assertEqual('accepted',self.place(ident,'board',revision+1)['result'])
+                self.assertEqual('待決策',self.item(read.page_snapshot(self.home),ident)['group'])
+                self.assertEqual(rows,{t:[tuple(r) for r in self.conn.execute('SELECT * FROM '+t+' ORDER BY rowid')] for t in tables})
+                reversed_card=dict(self.conn.execute('SELECT * FROM kanban_cards WHERE card_id=?',(ident,)).fetchone())
+                self.assertEqual({k:v for k,v in before.items() if k not in {'revision','updated_at'}},{k:v for k,v in reversed_card.items() if k not in {'revision','updated_at'}})
+                placed=self.conn.execute("SELECT metadata_delta,payload FROM kanban_events WHERE operation_id=?",(op,)).fetchone()
+                self.assertEqual({'queue_location':'backlog'},json.loads(placed['metadata_delta']));self.assertIn('USER explicitly selects',json.loads(placed['payload'])['user_request'])
+    def test_execution_completion_pending_and_active_nights_cannot_be_hidden(self):
+        cases=[('task-'+s,'inbox',s,'needs_decision',None,None) for s in ('queued','running','paused','failed','done','UserReview','user_review','mystery')]
+        cases += [('queued-no-report','inbox','queued',None,None,None),('running-no-report','inbox','running',None,None,None),
+                  ('manual-done','done',None,'needs_decision',None,None),('archived','archived',None,'needs_decision',None,None),
+                  ('reported-done','needs_clarification',None,'reported_done',None,None),('reported-running','returned',None,'in_progress',None,None),
+                  ('card-pending','returned',None,'needs_decision','card',None),('task-pending','returned','blocked','needs_decision','task',None)]
+        cases += [(phase+'-'+kind,'inbox',None,'needs_decision' if kind=='decision' else None,None,phase) for phase in ('reserved','submitted') for kind in ('decision','pending')]
+        for ident,manual,status,report_status,pending,phase in cases:
+            with self.subTest(ident=ident):
+                self.card(ident,manual)
+                if status:self.task(ident,status,'manual_pause_pending' if pending=='task' else None)
+                if pending=='card':self.conn.execute("UPDATE kanban_cards SET last_reason='manual_pause_pending' WHERE card_id=?",(ident,))
+                if phase:self.night(ident,phase)
+                if report_status:self.assertEqual('accepted',self.report(ident,report_status)['result'])
+                revision=1 if report_status else 0
+                before=dict(self.conn.execute('SELECT * FROM kanban_cards WHERE card_id=?',(ident,)).fetchone())
+                self.assertEqual('rejected',self.place(ident,'backlog',revision)['result'])
+                self.assertEqual(before,dict(self.conn.execute('SELECT * FROM kanban_cards WHERE card_id=?',(ident,)).fetchone()))
+                self.assertNotIn(ident,[c['card_id'] for c in read.page_snapshot(self.home,backlog=True)['cards']])
+    def test_orphan_anomalous_and_stale_decisions_cannot_be_hidden(self):
+        self.corrupt()
+        for kind in ('orphan','unknown-manual','unknown-night','bad-time','bad-report','stale-generation','stale-scope','bad-location','bad-edit','bad-revision'):
+            with self.subTest(kind=kind):
+                self.card(kind,'needs_clarification');self.assertEqual('accepted',self.report(kind,'needs_decision')['result']);revision=1
+                if kind=='orphan':
+                    self.conn.execute('PRAGMA foreign_keys=OFF');self.conn.execute("UPDATE kanban_cards SET task_id='missing' WHERE card_id=?",(kind,));self.conn.execute('PRAGMA foreign_keys=ON')
+                elif kind=='unknown-manual':self.conn.execute("UPDATE kanban_cards SET manual_state='mystery' WHERE card_id=?",(kind,))
+                elif kind=='unknown-night':self.night(kind,'unknown')
+                elif kind=='bad-time':self.conn.execute("UPDATE kanban_events SET at=-1 WHERE card_id=?",(kind,))
+                elif kind=='bad-report':self.conn.execute("UPDATE kanban_events SET payload='broken' WHERE card_id=?",(kind,))
+                elif kind=='stale-generation':self.conn.execute("UPDATE kanban_cards SET approval_generation=1 WHERE card_id=?",(kind,))
+                elif kind=='stale-scope':self.conn.execute("UPDATE kanban_cards SET repo_path='changed' WHERE card_id=?",(kind,))
+                elif kind=='bad-location':
+                    self.assertEqual('accepted',self.place(kind,'board',1)['result']);revision=2
+                    self.conn.execute("UPDATE kanban_events SET metadata_delta='broken' WHERE card_id=? AND kind='place'",(kind,))
+                elif kind=='bad-edit':
+                    self.assertEqual('accepted',self.send('edit',{'card_id':kind,'expected_revision':1,'actor':'operator','fields':{'note':'descriptive'}})['result']);revision=2
+                    self.conn.execute("UPDATE kanban_events SET metadata_delta='broken' WHERE card_id=? AND kind='edit'",(kind,))
+                elif kind=='bad-revision':self.conn.execute("UPDATE kanban_events SET result_revision=99 WHERE card_id=?",(kind,))
+                self.assertEqual('backlog_requires_effective_pending',self.place(kind,'backlog',revision)['reason'])
+                self.assertIn(kind,[c['card_id'] for c in read.page_snapshot(self.home)['cards']])
+                self.assertNotIn(kind,[c['card_id'] for c in read.page_snapshot(self.home,backlog=True)['cards']])
 
     def test_cli_place_payload_and_progress_allowlist(self):
         args=build_parser().parse_args(['kanban','place','--card','c','--expected-revision','2','--destination','board','--user-request','USER picks c','--actor','operator'])

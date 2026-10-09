@@ -720,7 +720,23 @@ def _place(conn, home, command, operation_id, digest, payload):
         from .read import _summaries
         summaries = _summaries(conn, [dict(card)])
         data.update(queue_locations=summaries["queue_locations"], summary_flags=summaries["summary_flags"])
-        if project(data)[0]["group"] != "待處理":
+        item = project(data)[0]
+        task = item["task"]
+        status = task.get("status") if task else None
+        report = item["progress_report"]
+        report_status = report["report_status"] if report else None
+        has_report = any(e.get("kind") == "report-progress" and e.get("result") == "accepted" for e in data["events"])
+        # Placement never suspends execution or repairs uncertain/stale evidence.
+        unsafe = (item["workflow_reason"] is not None or (has_report and report is None) or
+                  status in {"queued", "running"} or card["last_reason"] == "manual_pause_pending" or
+                  bool(task and task.get("stop_reason") == "manual_pause_pending") or
+                  any(n.get("phase") in {"reserved", "submitted"} for n in data["nights"]) or
+                  card["manual_state"] == "done" or status in {"done", "UserReview", "user_review"} or
+                  report_status in {"in_progress", "reported_done"})
+        decision = (item["group"] == "待決策" and status in {None, "blocked", "waiting_user"} and
+                    (card["manual_state"] in {"needs_clarification", "returned"} or
+                     status in {"blocked", "waiting_user"} or report_status in {"blocked", "needs_decision"}))
+        if unsafe or (item["group"] != "待處理" and not decision):
             return reject("backlog_requires_effective_pending")
     expected = payload["expected_revision"]
     if not _cas_update(conn, card["card_id"], expected, {}):
