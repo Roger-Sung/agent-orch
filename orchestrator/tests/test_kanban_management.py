@@ -54,14 +54,14 @@ raise SystemExit(cli.main(['daemon']))
 def legacy_rows(home):
     conn=db.connect(home/'orchestrator.db',read_only=True)
     try:
-        tables=[r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'kanban_%' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        tables=[r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'kanban_%' AND name NOT LIKE 'sqlite_%' AND name <> 'cli_quota_observation' ORDER BY name")]
         return {t:[tuple(r) for r in conn.execute('SELECT * FROM '+t+' ORDER BY rowid')] for t in tables}
     finally:conn.close()
 
 
 def legacy_schema(home):
     conn=sqlite3.connect(home/'orchestrator.db')
-    try:return conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE '%kanban_%' AND name <> 'sqlite_sequence' ORDER BY name").fetchall()
+    try:return conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE '%kanban_%' AND name <> 'sqlite_sequence' AND name <> 'cli_quota_observation' AND tbl_name <> 'cli_quota_observation' ORDER BY name").fetchall()
     finally:conn.close()
 
 
@@ -109,6 +109,12 @@ class ManagementTests(unittest.TestCase):
         return wait_for_result(home,path,4,.02)['kanban']
     def card(self,home=None):
         return self.send('create',{'actor':'assistant:synthetic','card_id':'card','fields':{'title':'中文合成卡'}},home)
+    def assert_cli_quota_empty(self,home=None):
+        # Management-only commands must never produce a CLI observation.
+        conn=db.connect((home or self.home)/'orchestrator.db',read_only=True)
+        try:self.assertEqual(0,conn.execute('SELECT count(*) FROM cli_quota_observation').fetchone()[0])
+        finally:conn.close()
+
     def test_place_durable_IPC_restart_reversal_and_zero_execution(self):
         from orchestrator.kanban.read import page_snapshot
         before=legacy_rows(self.home);schema=legacy_schema(self.home)
@@ -120,7 +126,7 @@ class ManagementTests(unittest.TestCase):
         proc=self.start();self.ready(proc);payload.update(expected_revision=1,destination='backlog',user_request='USER returns this pending card')
         self.assertEqual('accepted',self.send('place',payload)['result']);self.stop(proc)
         self.assertEqual([],page_snapshot(self.home)['cards']);self.assertEqual('backlog',page_snapshot(self.home,backlog=True)['queue_locations']['card'])
-        self.assertEqual(before,legacy_rows(self.home));self.assertEqual(schema,legacy_schema(self.home));self.assertFalse((self.home/'execution-called').exists())
+        self.assertEqual(before,legacy_rows(self.home));self.assertEqual(schema,legacy_schema(self.home));self.assert_cli_quota_empty();self.assertFalse((self.home/'execution-called').exists())
 
     def test_decision_place_IPC_CAS_restart_question_preservation_zero_execution(self):
         from orchestrator.kanban.read import page_snapshot
@@ -143,7 +149,7 @@ class ManagementTests(unittest.TestCase):
         item=project(page_snapshot(self.home))[0];self.assertEqual('待決策',item['group']);self.assertEqual(report['decision'],item['progress_report']['decision'])
         conn=db.connect(self.home/'orchestrator.db',read_only=True);after=dict(conn.execute("SELECT * FROM kanban_cards WHERE card_id='card'").fetchone());self.assertEqual(events,[tuple(r) for r in conn.execute('SELECT * FROM kanban_events ORDER BY rowid LIMIT 3')]);conn.close()
         self.assertEqual({k:v for k,v in card.items() if k not in {'revision','updated_at'}},{k:v for k,v in after.items() if k not in {'revision','updated_at'}})
-        self.assertEqual(4,after['revision']);self.assertEqual(before,legacy_rows(self.home));self.assertEqual(schema,legacy_schema(self.home));self.assertFalse((self.home/'execution-called').exists())
+        self.assertEqual(4,after['revision']);self.assertEqual(before,legacy_rows(self.home));self.assertEqual(schema,legacy_schema(self.home));self.assert_cli_quota_empty();self.assertFalse((self.home/'execution-called').exists())
 
     def test_mixed_queue_restart_old_state_and_zero_execution(self):
         for folder in ('inbox','processing','processed','quarantine'):(self.home/folder).mkdir()
@@ -167,7 +173,7 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual('accepted',self.send('archive',{'card_id':'card','expected_revision':2,'actor':'synthetic'})['result'])
         self.stop(proc)
         for path,contents in retained.items():self.assertEqual(contents,path.read_bytes(),str(path))
-        self.assertEqual(before,legacy_rows(self.home));self.assertEqual(schema,legacy_schema(self.home))
+        self.assertEqual(before,legacy_rows(self.home));self.assertEqual(schema,legacy_schema(self.home));self.assert_cli_quota_empty()
         self.assertEqual('PRIVATE-file-unchanged',(self.home/'old-artifact.txt').read_text())
         self.assertEqual([],list((self.home/'quarantine').iterdir()))
         self.assertFalse((self.home/'execution-called').exists());self.assertNotIn('PRIVATE-',(self.home/'daemon-test.log').read_text())
@@ -191,7 +197,7 @@ class ManagementTests(unittest.TestCase):
                 self.stop(proc)
                 conn=db.connect(home/'orchestrator.db',read_only=True)
                 self.assertEqual(1,conn.execute('SELECT count(*) FROM kanban_cards').fetchone()[0]);self.assertEqual(1,conn.execute('SELECT count(*) FROM kanban_events').fetchone()[0]);conn.close()
-                self.assertEqual(before,legacy_rows(home));self.assertEqual(raw,retained.read_bytes());self.assertFalse((home/'execution-called').exists())
+                self.assertEqual(before,legacy_rows(home));self.assert_cli_quota_empty(home);self.assertEqual(raw,retained.read_bytes());self.assertFalse((home/'execution-called').exists())
     def test_poison_integer_then_valid_request_and_restart(self):
         before=legacy_rows(self.home);schema=legacy_schema(self.home)
         proc=self.start();self.ready(proc);self.assertEqual('accepted',self.card()['result'])
@@ -213,14 +219,14 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(2,conn.execute("SELECT revision FROM kanban_cards WHERE card_id='card'").fetchone()[0])
         self.assertEqual(11,conn.execute('SELECT count(*) FROM kanban_events').fetchone()[0]);conn.close()
         self.assertEqual([],list((self.home/'processing').iterdir()))
-        self.assertEqual(before,legacy_rows(self.home));self.assertEqual(schema,legacy_schema(self.home))
+        self.assertEqual(before,legacy_rows(self.home));self.assertEqual(schema,legacy_schema(self.home));self.assert_cli_quota_empty()
         self.assertFalse((self.home/'execution-called').exists());self.assertNotIn('Traceback',(self.home/'daemon-test.log').read_text())
     def test_lock_exclusion_and_mode_errors(self):
         proc=self.start();self.ready(proc)
         other=self.start();self.assertEqual(2,other.wait(timeout=4));self.assertIsNone(proc.poll());self.card();self.stop(proc)
         for mode in ('','bogus'):
             proc=self.start(ORCH_DAEMON_MODE=mode);self.assertEqual(2,proc.wait(timeout=4))
-        self.assertFalse((self.home/'execution-called').exists())
+        self.assertFalse((self.home/'execution-called').exists());self.assert_cli_quota_empty()
     def test_missing_schema_active_and_extra_schema_fail_closed(self):
         for case in ('missing','wrong-legacy','partial-kanban','extra-kanban','queued','running-stage','unknown-night'):
             with self.subTest(case=case):
@@ -258,4 +264,4 @@ class ManagementTests(unittest.TestCase):
         output=self.root/'board.html'
         result=subprocess.run([sys.executable,'-m','orchestrator','kanban','render','--output',str(output)],env=self.environment(self.home),capture_output=True,text=True,timeout=4)
         self.assertEqual(0,result.returncode);html=output.read_text();self.assertIn(str(self.home/'orchestrator.db'),html);self.assertNotIn('演示資料',html);self.assertNotIn('90%',html)
-        self.stop(proc);self.assertFalse((self.home/'execution-called').exists())
+        self.stop(proc);self.assertFalse((self.home/'execution-called').exists());self.assert_cli_quota_empty()
