@@ -324,6 +324,12 @@ def _add_kanban_parsers(subparsers: argparse._SubParsersAction) -> None:
     report.add_argument("--source-ref", action="append", default=[], dest="source_refs",
                         help="source pointer as text only; repeat as needed")
 
+    place = commands.add_parser("place", help="explicit USER placement; display metadata only")
+    place.add_argument("--card", required=True)
+    common(place)
+    place.add_argument("--destination", required=True, choices=("board", "backlog"))
+    place.add_argument("--user-request", required=True, help="the explicit user instruction selecting this card")
+
     approve = commands.add_parser(
         "approve", help="operator approval: freeze the scope and move the card to Ready")
     approve.add_argument("--card", required=True)
@@ -408,6 +414,8 @@ def _kanban_payload(args: argparse.Namespace) -> dict:
             except json.JSONDecodeError as exc:
                 raise ControllerError(f"{flag} is not valid JSON: {exc}") from exc
         payload["fields"] = collected
+    if command == "place":
+        payload.update(destination=args.destination, user_request=args.user_request)
     if command == "report-progress":
         payload.update({key: getattr(args, key) for key in (
             "report_status", "summary", "blocker", "decision", "next_step", "source_refs")})

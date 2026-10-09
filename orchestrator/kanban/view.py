@@ -14,6 +14,8 @@ PANEL_SCRIPT = r"""(() => {
   const cards = Array.from(document.querySelectorAll('.select-card'));
   const narrow = window.matchMedia('(max-width: 760px)');
   let selected = null;
+  let requestGeneration = 0;
+  let controller = null;
   function syncMode() {
     const modal = narrow.matches && !panel.hidden;
     panel.setAttribute('aria-modal', modal ? 'true' : 'false');
@@ -22,6 +24,8 @@ PANEL_SCRIPT = r"""(() => {
     if (modal && !panel.contains(document.activeElement)) closeButton.focus();
   }
   function closePanel() {
+    requestGeneration += 1;
+    if (controller) controller.abort();
     panel.hidden = true;
     content.replaceChildren();
     document.body.classList.remove('panel-open');
@@ -29,17 +33,36 @@ PANEL_SCRIPT = r"""(() => {
     syncMode();
     if (selected) selected.focus();
   }
-  cards.forEach(card => card.addEventListener('click', () => {
-    const template = document.getElementById(card.getAttribute('data-detail'));
-    if (!template) return;
+  cards.forEach(card => card.addEventListener('click', async () => {
+    const target = card.getAttribute('data-detail');
+    const generation = ++requestGeneration;
+    if (controller) controller.abort();
     selected = card;
-    content.replaceChildren(template.content.cloneNode(true));
+    content.replaceChildren();
     cards.forEach(other => other.setAttribute('aria-expanded', other === card ? 'true' : 'false'));
     panel.hidden = false;
     document.body.classList.add('panel-open');
     syncMode();
     panel.scrollTop = 0;
     closeButton.focus();
+    if (/^\/detail\/(board|backlog|archived)\/(0|-?[1-9][0-9]{0,18})$/.test(target)) {
+      content.textContent = '載入明細…';
+      controller = new AbortController();
+      try {
+        const response = await fetch(target, {method: 'GET', mode: 'same-origin', credentials: 'omit', cache: 'no-store', redirect: 'error', signal: controller.signal});
+        if (!response.ok) throw new Error('unavailable');
+        const parsed = new DOMParser().parseFromString(await response.text(), 'text/html');
+        const template = parsed.querySelector('template');
+        if (!template) throw new Error('unavailable');
+        if (generation !== requestGeneration || panel.hidden || selected !== card) return;
+        content.replaceChildren(template.content.cloneNode(true));
+      } catch (error) {
+        if (generation === requestGeneration && !panel.hidden && selected === card) content.textContent = '明細暫不可用，請重新整理看板。';
+      }
+    } else {
+      const template = document.getElementById(target);
+      if (template) content.replaceChildren(template.content.cloneNode(true));
+    }
   }));
   closeButton.addEventListener('click', closePanel);
   document.addEventListener('keydown', event => {
@@ -134,12 +157,18 @@ def project(data: dict) -> list[dict]:
         task = tasks.get(card.get("task_id"))
         status = task.get("status") if task else None
         manual = card["manual_state"]
-        events = [e for e in data["events"] if e.get("card_id") == card["card_id"]]
+        events = [e for e in data.get('summary_events', data["events"]) if e.get("card_id") == card["card_id"]]
         nights = [n for n in data["nights"] if n.get("card_id") == card["card_id"]]
         pending = card.get("last_reason") == "manual_pause_pending" or bool(task and task.get("stop_reason") == "manual_pause_pending")
         truncation = data.get('history_truncated', {}).get(card['card_id'], {})
-        report, report_note = progress_report(card, events) if not truncation.get('events') else (None, '事件歷史限量；助手回報與既有決策完整性未知')
+        report, report_note = progress_report(card, events) if data.get('summary_flags') is not None or not truncation.get('events') else (None, '事件歷史限量；助手回報與既有決策完整性未知')
+        flags = data.get("summary_flags", {}).get(card["card_id"], {})
         anomalies = []
+        if any(flags.get(key) for key in ("bad_card", "bad_time", "bad_revision", "bad_edit", "bad_night")):
+            anomalies.append("摘要證據含未知／格式不符資料")
+        location = data.get("queue_locations", {}).get(card["card_id"], "board")
+        if location not in {"board", "backlog"}:
+            anomalies.append("位置日誌未知／格式不符")
         if manual not in {"inbox", "ready", "needs_clarification", "returned", "done", "archived"}:
             anomalies.append("卡片狀態未知")
         if card.get("task_id") and task is None:
@@ -148,7 +177,7 @@ def project(data: dict) -> list[dict]:
             anomalies.append("任務狀態未知")
         if any(n.get("phase") not in {"reserved", "submitted", "stopped"} for n in nights):
             anomalies.append("夜間狀態未知")
-        if any(truncation.values()):
+        if any(truncation.values()) and data.get("summary_flags") is None:
             anomalies.append("歷史限量，完整狀態未知")
         if "未知" in report_note or any(not event_time_known(e) for e in events):
             anomalies.append("回報或事件歷史無法確認")
@@ -165,10 +194,10 @@ def project(data: dict) -> list[dict]:
             group = "完成"
         elif status == "running" or report and report["report_status"] == "in_progress":
             group = "實作中"
-        result.append({"progress_report": report, "progress_report_note": report_note, "card": card, "task": task, "events": events, "nights": nights, "pending": "pending（尚未生效）" if pending else "未從 task reason 觀測到 pending；不保證沒有待處理請求", "group": group, "workflow_reason": workflow_reason, "completion_evidence": "未驗證", "liveness": "未知（running 不保證存活）", "updated_sources": {"card": card.get("updated_at"), "task": task.get("updated_at") if task else None, "events": max((e["at"] for e in events), default=None) if all(event_time_known(e) for e in events) else None}})
+        result.append({"progress_report": report, "progress_report_note": report_note, "card": card, "task": task, "events": [e for e in data["events"] if e.get("card_id") == card["card_id"]], "nights": nights, "queue_location": location, "pending": "pending（尚未生效）" if pending else "未從 task reason 觀測到 pending；不保證沒有待處理請求", "group": group, "workflow_reason": workflow_reason, "completion_evidence": "未驗證", "liveness": "未知（running 不保證存活）", "updated_sources": {"card": card.get("updated_at"), "task": task.get("updated_at") if task else None, "events": flags.get("latest_event_at") if flags and not flags.get("bad_time") else max((e["at"] for e in events), default=None) if all(event_time_known(e) for e in events) else None}})
     return result
 
-def render(data: dict, *, demo: bool = False, archived: bool = False) -> str:
+def render(data: dict, *, demo: bool = False, archived: bool = False, backlog: bool = False, lazy: bool = False) -> str:
     """Offline board with compact selectors and local-only detail panel."""
     def value(raw):
         return escape("未知／缺資料" if raw is None else str(raw), quote=True)
@@ -202,6 +231,11 @@ def render(data: dict, *, demo: bool = False, archived: bool = False) -> str:
         return '<details class="raw"><summary>' + label + '</summary><pre>' + escape(json.dumps(raw, ensure_ascii=False, indent=2), quote=True) + '</pre></details>'
 
     cards = project(data)
+    if data.get('queue_locations') is not None:
+        if archived:
+            cards = [item for item in cards if item['group'] == '封存']
+        else:
+            cards = [item for item in cards if item['group'] != '封存' and (item['queue_location'] == 'backlog') == backlog]
     templates = []
     card_index = 0
     script_hash = base64.b64encode(hashlib.sha256(PANEL_SCRIPT.encode()).digest()).decode()
@@ -268,7 +302,7 @@ def render(data: dict, *, demo: bool = False, archived: bool = False) -> str:
         return ''.join(parts)
 
     title = "進度看板" + (" — 演示資料" if demo else "")
-    parts = ['<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; style-src &#39;unsafe-inline&#39;; script-src &#39;sha256-' + script_hash + '&#39;"><title>' + title + '</title><style>' + styles + '</style></head><body><div id="board-page">', '<header class="header-grid"><div class="header-intro"><h1>' + title + '</h1>']
+    parts = ['<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; connect-src &#39;self&#39;; style-src &#39;unsafe-inline&#39;; script-src &#39;sha256-' + script_hash + '&#39;"><title>' + title + '</title><style>' + styles + '</style></head><body><div id="board-page">', '<header class="header-grid"><div class="header-intro"><h1>' + title + '</h1>']
     if demo:
         parts.append('<p><span class="demo">演示資料 · 合成 snapshot · 尚未接正式任務</span></p>')
     quota_content = quota_panel() if data.get('quota') or data.get('usage_observation') else '<section class="quota-section" aria-label="額度摘要"><p class="quota-summary-head"><span>額度</span><strong>暫無資料</strong></p></section>'
@@ -276,15 +310,15 @@ def render(data: dict, *, demo: bool = False, archived: bool = False) -> str:
     parts.append('<p class="muted source">更新於 ' + when(data.get('generated_at_ms')) + ' Asia/Taipei</p><details class="board-explanation"><summary>說明</summary><p class="source">資料來源：' + value(data.get('source')) + '</p><p>點選卡片查看明細；Enter／空白鍵開啟，Esc 關閉。</p><p>此頁顯示產生當下的資料，重新整理取得新快照。來源引用只作文字顯示。</p></details><noscript><p class="notice">JavaScript 未啟用，卡片明細無法開啟。</p></noscript></div>' + quota + '</header><main>')
     if archived:
         parts.append('<div class="archive-list" role="region" aria-label="封存卡片">')
-    display_groups = ('封存',) if archived else ((('待決策',) if any(item['group'] == '待決策' for item in cards) else ()) + GROUPS)
+    display_groups = ('Backlog',) if backlog else ('封存',) if archived else ((('待決策',) if any(item['group'] == '待決策' for item in cards) else ()) + GROUPS)
     for group in display_groups:
         if not archived and group == GROUPS[0]:
             parts.append('<div class="board" tabindex="0" role="region" aria-label="狀態欄，可橫向捲動">')
-        entries = [item for item in cards if item['group'] == group]
+        entries = cards if backlog else [item for item in cards if item['group'] == group]
         if group == '待決策':
-            parts.append('<section class="priority-section" aria-label="本頁待決策"><div class="priority-heading"><h2>本頁待決策</h2><span class="count">' + str(len(entries)) + ' 張</span></div><div class="priority-cards">')
-        elif group == '封存':
-            parts.append('<section class="archive-cards"><h2>封存</h2>')
+            parts.append('<section class="priority-section" aria-label="待決策"><div class="priority-heading"><h2>待決策</h2><span class="count">' + str(len(entries)) + ' 張</span></div><div class="priority-cards">')
+        elif group in {'封存', 'Backlog'}:
+            parts.append('<section class="archive-cards"><h2>' + group + '</h2>')
         else:
             parts.append('<section class="lane"><div class="lane-heading"><h2>' + group + '</h2><span class="count">' + str(len(entries)) + ' 張</span></div>')
         if not entries:
@@ -292,7 +326,7 @@ def render(data: dict, *, demo: bool = False, archived: bool = False) -> str:
         for item in entries:
             card = item['card']
             task = item['task']
-            detail_id = 'card-detail-' + str(card_index)
+            detail_id = ('/detail/' + ('backlog' if backlog else 'archived' if archived else 'board') + '/' + str(card['_detail_token'])) if lazy else 'card-detail-' + str(card_index)
             card_index += 1
             progress = state(task.get('status'), task_names) if task else ('任務關聯缺失；進度未知' if card.get('task_id') else '尚無回報')
             report = item['progress_report']
@@ -322,6 +356,8 @@ def render(data: dict, *, demo: bool = False, archived: bool = False) -> str:
                 raw_alert = report.get('blocker') or report.get('decision')
                 alert = value(str(raw_alert)[:90])
             parts.append('<article class="card"><button type="button" class="select-card" aria-controls="card-panel" aria-expanded="false" data-detail="' + detail_id + '"><span class="badge">' + value(manual_names.get(card.get('manual_state'), '未知狀態')) + '</span><span class="card-title">' + value(card.get('title')) + '</span><span class="short-progress">' + progress + '</span>' + ('<span class="short-progress">' + value(str(report.get('summary') or '未知／缺資料')[:140]) + '</span>' if report else '') + ('<span class="card-alert">' + alert + '</span>' if alert else '') + '<span class="card-id">ID：' + value(card.get('card_id')) + '</span></button></article>')
+            if lazy:
+                continue
             # Detail content is pre-rendered, escaped inert HTML. The fixed script
             # clones its DOM; data never enters executable JavaScript or innerHTML.
             templates.append('<template id="' + detail_id + '"><div class="detail-content"><h3 class="detail-title">' + value(card.get('title')) + '</h3><p class="muted">卡片 ID：<code>' + value(card.get('card_id')) + '</code></p><dl>')
@@ -378,3 +414,13 @@ def render(data: dict, *, demo: bool = False, archived: bool = False) -> str:
     parts.extend(templates)
     parts.append('<script>' + PANEL_SCRIPT + '</script></body></html>')
     return ''.join(parts)
+
+
+def detail_fragment(data: dict, *, archived=False, backlog=False) -> str:
+    """One server-escaped inert template; no executable script or raw routes."""
+    import re
+    html = render(data, archived=archived, backlog=backlog)
+    match = re.search(r'<template id="card-detail-0">.*?</template>', html, re.S)
+    if match is None:
+        raise ValueError('detail unavailable')
+    return match.group(0)

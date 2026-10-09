@@ -239,7 +239,7 @@ def _print_controller_event(event: str, payload: dict[str, Any]) -> None:
     print(f"[orchestrator-daemon] event {event}: {payload}", flush=True)
 
 
-PROGRESS_COMMANDS = frozenset({"create", "edit", "report-progress", "archive"})
+PROGRESS_COMMANDS = frozenset({"create", "edit", "report-progress", "archive", "place"})
 
 
 def daemon_mode(mode: str | None = None) -> str:

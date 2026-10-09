@@ -109,6 +109,19 @@ class ManagementTests(unittest.TestCase):
         return wait_for_result(home,path,4,.02)['kanban']
     def card(self,home=None):
         return self.send('create',{'actor':'assistant:synthetic','card_id':'card','fields':{'title':'中文合成卡'}},home)
+    def test_place_durable_IPC_restart_reversal_and_zero_execution(self):
+        from orchestrator.kanban.read import page_snapshot
+        before=legacy_rows(self.home);schema=legacy_schema(self.home)
+        proc=self.start();self.ready(proc);self.assertEqual('accepted',self.card()['result'])
+        self.assertEqual([],page_snapshot(self.home)['cards'])
+        payload={'card_id':'card','expected_revision':0,'actor':'operator:synthetic','destination':'board','user_request':'USER explicitly chooses this card'}
+        op=str(uuid.uuid4());self.assertEqual('accepted',self.send('place',payload,operation=op)['result']);self.assertTrue(self.send('place',payload,operation=op)['replayed'])
+        self.stop(proc);self.assertEqual('board',page_snapshot(self.home)['queue_locations']['card'])
+        proc=self.start();self.ready(proc);payload.update(expected_revision=1,destination='backlog',user_request='USER returns this pending card')
+        self.assertEqual('accepted',self.send('place',payload)['result']);self.stop(proc)
+        self.assertEqual([],page_snapshot(self.home)['cards']);self.assertEqual('backlog',page_snapshot(self.home,backlog=True)['queue_locations']['card'])
+        self.assertEqual(before,legacy_rows(self.home));self.assertEqual(schema,legacy_schema(self.home));self.assertFalse((self.home/'execution-called').exists())
+
     def test_mixed_queue_restart_old_state_and_zero_execution(self):
         for folder in ('inbox','processing','processed','quarantine'):(self.home/folder).mkdir()
         retained={}

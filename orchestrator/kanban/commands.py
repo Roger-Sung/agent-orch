@@ -88,6 +88,7 @@ COMMANDS = (
     "quota-snapshot",
     "quota-invalidate",
     "report-progress",
+    "place",
 )
 
 PROGRESS_STATUSES = ("not_started", "in_progress", "blocked", "needs_decision", "reported_done")
@@ -465,6 +466,7 @@ def _dispatch(
         "done": _done,
         "archive": _archive,
         "report-progress": _report_progress,
+        "place": _place,
     }[command]
     return handler(conn, home, command, operation_id, digest, payload)
 
@@ -691,6 +693,43 @@ def _report_progress(conn, home, command, operation_id, digest, payload):
                    metadata_delta={"progress_reported": True, "execution_verified": False})
 
 
+def _place(conn, home, command, operation_id, digest, payload):
+    """Placement is reversible display metadata; never change lifecycle/binding."""
+    card, reason = _guard(conn, payload, allow_terminal=True, allow_claimed=True)
+    reject = lambda why: _reject(conn, command, operation_id, digest, payload,
+                                 card_id=payload.get("card_id"), card_exists=card is not None, reason=why)
+    if reason:
+        return reject(reason)
+    if card["manual_state"] == "archived":
+        return reject("card_is_archived")
+    if set(payload) != {"card_id", "expected_revision", "actor", "destination", "user_request"}:
+        return reject("invalid_place_payload")
+    if payload.get("destination") not in {"board", "backlog"}:
+        return reject("invalid_destination")
+    request = payload.get("user_request")
+    if (not isinstance(request, str) or not request.strip() or len(request) > 4000 or
+        reserved_marker_in(request) or len(payload["actor"]) > 500 or reserved_marker_in(payload["actor"])):
+        return reject("explicit_user_request_required")
+    if payload["destination"] == "backlog":
+        from .view import project
+        from .read import COLUMNS
+        data = {"cards": [dict(card)], "quota": []}
+        for key, table in (("events", "kanban_events"), ("nights", "kanban_nights")):
+            data[key] = [dict(row) for row in conn.execute("SELECT " + ','.join(COLUMNS[key]) + " FROM " + table + " WHERE card_id=?", (card["card_id"],))]
+        data["tasks"] = [dict(row) for row in conn.execute("SELECT " + ','.join(COLUMNS['tasks']) + " FROM tasks WHERE id=?", (card["task_id"],))] if card["task_id"] else []
+        from .read import _summaries
+        summaries = _summaries(conn, [dict(card)])
+        data.update(queue_locations=summaries["queue_locations"], summary_flags=summaries["summary_flags"])
+        if project(data)[0]["group"] != "待處理":
+            return reject("backlog_requires_effective_pending")
+    expected = payload["expected_revision"]
+    if not _cas_update(conn, card["card_id"], expected, {}):
+        return reject("revision_conflict")
+    return _accept(conn, command, operation_id, digest, payload,
+                   card_id=card["card_id"], result_revision=expected + 1,
+                   metadata_delta={"queue_location": payload["destination"]})
+
+
 def _create(conn, home, command, operation_id, digest, payload):
     card_id = payload.get("card_id")
     existing = _card(conn, card_id)
@@ -730,7 +769,7 @@ def _create(conn, home, command, operation_id, digest, payload):
     return _accept(
         conn, command, operation_id, digest, payload,
         card_id=card_id, result_revision=0,
-        metadata_delta={"manual_state": "inbox", **_storable(fields)},
+        metadata_delta={"manual_state": "inbox", **_storable(fields), "queue_location": "backlog"},
     )
 
 
