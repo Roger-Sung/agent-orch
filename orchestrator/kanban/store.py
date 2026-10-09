@@ -52,6 +52,27 @@ import sqlite3
 WEEK_MS = 7 * 24 * 60 * 60 * 1000
 
 SCHEMA = f"""
+-- Display-only CLI projection: never consulted by admission or manual pools.
+-- Name deliberately outside kanban_*: progress preflight compares that legacy
+-- namespace exactly. Existing setup creates this atomically after preflight.
+CREATE TABLE IF NOT EXISTS cli_quota_observation(
+ source TEXT NOT NULL PRIMARY KEY CHECK(source = 'codex-cli'),
+ attempted_at_ms INTEGER NOT NULL CHECK(attempted_at_ms > 0),
+ outcome TEXT NOT NULL CHECK(outcome IN ('ok','failed')),
+ error TEXT CHECK(error IN ('timeout','authentication','rpc','protocol','invalid_quota','transport','storage','environment','interrupted')),
+ observed_at_ms INTEGER,
+ remaining_percent INTEGER CHECK(remaining_percent BETWEEN 0 AND 100),
+ reset_at_ms INTEGER,
+ CHECK(outcome <> 'ok' OR observed_at_ms IS NOT NULL),
+ CHECK((outcome='ok' AND error IS NULL) OR (outcome='failed' AND error IS NOT NULL)),
+ CHECK((observed_at_ms IS NULL AND remaining_percent IS NULL AND reset_at_ms IS NULL)
+ OR (observed_at_ms IS NOT NULL AND remaining_percent IS NOT NULL AND reset_at_ms IS NOT NULL
+     AND typeof(observed_at_ms)='integer' AND typeof(remaining_percent)='integer' AND typeof(reset_at_ms)='integer'
+     AND observed_at_ms > 0 AND observed_at_ms <= attempted_at_ms
+     AND reset_at_ms > observed_at_ms AND reset_at_ms <= observed_at_ms + 604800000)),
+ CHECK(typeof(attempted_at_ms)='integer' AND attempted_at_ms <= 253402300799999)
+);
+
 CREATE TABLE IF NOT EXISTS kanban_cards(
   card_id TEXT PRIMARY KEY,
   revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
@@ -227,9 +248,12 @@ END;
 
 
 def create_schema_in_transaction(conn: sqlite3.Connection) -> None:
-    """Create only our four tables inside the caller's preflight transaction."""
+    """Create kanban tables and CLI display projection in the preflight transaction."""
     if not conn.in_transaction:
         raise RuntimeError("kanban schema creation requires a transaction")
+    # Independently validate this namespace before any additive DDL.
+    from .observation import validate_schema
+    validate_schema(conn, SCHEMA)
     statement = ""
     for character in SCHEMA:
         statement += character

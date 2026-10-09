@@ -44,7 +44,7 @@ def _objects(conn: sqlite3.Connection, *, kanban: bool) -> dict[str, str]:
     out = {}
     for row in conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name"):
         name = row["name"]
-        is_kanban = "kanban_" in name or name == "sqlite_sequence"
+        is_kanban = "kanban_" in name or "cli_quota_observation" in name or name == "sqlite_sequence"
         if is_kanban is kanban:
             out[name] = row["sql"]
     return out
@@ -55,7 +55,7 @@ def _dump(conn: sqlite3.Connection) -> dict[str, list[tuple]]:
         r["name"]
         for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
-            " AND name NOT LIKE 'kanban_%' AND name NOT LIKE 'sqlite_%'"
+            " AND name NOT LIKE 'kanban_%' AND name NOT LIKE 'sqlite_%' AND name <> 'cli_quota_observation'"
             " ORDER BY name"
         )
     ]

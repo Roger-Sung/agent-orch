@@ -112,7 +112,7 @@ class BacklogTests(unittest.TestCase):
         before=list(self.conn.iterdump())
         with patch.object(read,'connect',side_effect=instrument):data=read.page_snapshot(self.home)
         self.assertEqual(25,len(data['cards']));self.assertEqual([],data['events']);self.assertEqual([],data['nights']);self.assertFalse(any('LIMIT 51' in q for q in queries))
-        self.assertEqual(1,queries.count('BEGIN'));self.assertEqual(1,queries.count('COMMIT'));self.assertLess(len(queries),15)
+        self.assertEqual(1,queries.count('BEGIN'));self.assertEqual(1,queries.count('COMMIT'));self.assertLess(len(queries),16) # three fixed singleton validation/read queries
         token=data['cards'][0]['_detail_token'];queries.clear()
         with patch.object(read,'connect',side_effect=instrument):detail=read.page_snapshot(self.home,detail=token)
         self.assertEqual(50,len(detail['events']));self.assertEqual(1,len(detail['cards']));self.assertTrue(detail['history_truncated']['c00']['events']);self.assertEqual([],detail['nights'])

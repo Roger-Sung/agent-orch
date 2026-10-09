@@ -85,6 +85,7 @@ COMMANDS = (
     "pause",
     "done",
     "archive",
+    "quota-cli-attempt",
     "quota-snapshot",
     "quota-invalidate",
     "report-progress",
@@ -351,6 +352,10 @@ def build_request(
     """
     if command not in COMMANDS:
         raise KanbanError(f"unsupported kanban command: {command!r}")
+    if command == "quota-cli-attempt":
+        from .observation import validate_attempt
+        if not validate_attempt(payload):
+            raise KanbanError("invalid CLI quota attempt")
     request_id = request_id or str(uuid.uuid4())
     return {
         "request_id": request_id,
@@ -382,10 +387,16 @@ def handle_request(controller: Any, request: dict[str, Any]) -> dict[str, Any]:
         if str(uuid.UUID(operation_id)) != operation_id:
             raise ValueError
     except ValueError as exc:
-        raise KanbanError(f"invalid operation_id: {operation_id!r}") from exc
+        raise KanbanError("invalid CLI quota operation id" if command == "quota-cli-attempt" else f"invalid operation_id: {operation_id!r}") from exc
     payload = request.get("payload")
     if not isinstance(payload, dict):
         raise KanbanError("kanban request requires a payload object")
+    # Validate before hashing/journaling: malformed CLI payloads must never
+    # persist arbitrary account data or secret strings in rejected events.
+    if command == "quota-cli-attempt":
+        from .observation import validate_attempt
+        if set(request) != {"request_id", "action", "command", "operation_id", "payload"} or not validate_attempt(payload):
+            raise KanbanError("invalid CLI quota attempt")
     actor = payload.get("actor")
     if not isinstance(actor, str) or not actor.strip():
         raise KanbanError("kanban request requires an actor")
@@ -448,6 +459,9 @@ def _dispatch(
     digest: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
+    if command == "quota-cli-attempt":
+        from .observation import attempt_command
+        return attempt_command(conn, operation_id, digest, payload)
     if command in {"quota-snapshot", "quota-invalidate"}:
         from .quota import invalidate_command, snapshot_command
 

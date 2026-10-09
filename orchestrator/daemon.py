@@ -103,6 +103,10 @@ def _handle(controller: Controller, req_path: Path, processed: Path) -> None:
     outcome: dict[str, Any]
     try:
         req = json.loads(req_path.read_text(encoding="utf-8"))
+        if req.get("action") == "kanban" and req.get("command") == "quota-cli-attempt":
+            from .kanban.observation import validate_request
+            if not validate_request(req):
+                return  # Leave malformed bytes at intake; never echo or archive them.
         request_id = req["request_id"]
         if str(uuid.UUID(request_id)) != request_id:
             raise ValueError(f"invalid request_id: {request_id!r}")
@@ -239,7 +243,7 @@ def _print_controller_event(event: str, payload: dict[str, Any]) -> None:
     print(f"[orchestrator-daemon] event {event}: {payload}", flush=True)
 
 
-PROGRESS_COMMANDS = frozenset({"create", "edit", "report-progress", "archive", "place"})
+PROGRESS_COMMANDS = frozenset({"create", "edit", "report-progress", "archive", "place", "quota-cli-attempt"})
 
 
 def daemon_mode(mode: str | None = None) -> str:
@@ -259,10 +263,18 @@ def _progress_request(path: Path) -> tuple[dict | None, str]:
         return None, "unreadable_or_bad_json"
     if not isinstance(request, dict) or request.get("action") != "kanban" or not isinstance(request.get("command"), str) or request["command"] not in PROGRESS_COMMANDS:
         return None, "not_allowed"
+    if request["command"] == "quota-cli-attempt":
+        from .kanban.observation import validate_request
+        if not validate_request(request):
+            return None, "not_allowed"
     return request, "allowed"
 
 
 def _progress_handle(context, path: Path, processed: Path, request: dict) -> bool:
+    if request.get("command") == "quota-cli-attempt":
+        checked, classification = _progress_request(path)
+        if checked != request or classification != "allowed":
+            return False
     result_path = processed / (path.stem + ".progress.result.json")
     request_path = processed / (path.stem + ".progress.request.json")
     if result_path.exists():
@@ -318,7 +330,7 @@ def _progress_scan(context, inbox: Path, processing: Path, processed: Path) -> d
 def _progress_code_hash() -> str:
     root = Path(__file__).parent
     digest = hashlib.sha256()
-    for name in ("cli.py", "daemon.py", "db.py", "kanban/__init__.py", "kanban/store.py", "kanban/commands.py", "kanban/quota.py", "kanban/read.py", "kanban/view.py"):
+    for name in ("cli.py", "daemon.py", "db.py", "kanban/__init__.py", "kanban/store.py", "kanban/commands.py", "kanban/quota.py", "kanban/observation.py", "kanban/read.py", "kanban/view.py"):
         digest.update(name.encode() + b"\0" + (root / name).read_bytes())
     return digest.hexdigest()
 

@@ -176,7 +176,9 @@ def page_snapshot(home: Path, *, archived=False, backlog=False, after=None, befo
         has_previous = paginated and bool(cards) and exists('<', cards[0]['card_id'])
         has_next = paginated and bool(cards) and exists('>', cards[-1]['card_id'])
         selected = {c['card_id'] for c in cards}
-        data = {**summaries, 'cards': cards, 'history_truncated': {}, 'summary_only': detail is None}
+        from .observation import read_projection
+        cli_quota = read_projection(conn)
+        data = {**summaries, 'cli_quota': cli_quota, 'cards': cards, 'history_truncated': {}, 'summary_only': detail is None}
         data['events'] = [e for e in summaries['events'] if e['card_id'] in selected]
         data['tasks'] = [t for t in summaries['tasks'] if t['id'] in {c['task_id'] for c in cards}]
         for key in ('summary_flags','queue_locations'):

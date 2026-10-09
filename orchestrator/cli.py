@@ -374,6 +374,15 @@ def _add_kanban_parsers(subparsers: argparse._SubParsersAction) -> None:
     snapshot.add_argument("--observed-at-ms", required=True, type=int)
     snapshot.add_argument("--reset-at-ms", required=True, type=int)
 
+    attempt = commands.add_parser("quota-cli-attempt", help="record one display-only CLI observation attempt")
+    common(attempt, revision=False)
+    attempt.add_argument("--attempted-at-ms", required=True, type=int)
+    attempt.add_argument("--outcome", required=True, choices=("ok", "failed"))
+    attempt.add_argument("--error")
+    attempt.add_argument("--remaining-percent", type=int)
+    attempt.add_argument("--observed-at-ms", type=int)
+    attempt.add_argument("--reset-at-ms", type=int)
+
     invalidate = commands.add_parser(
         "quota-invalidate", help="mark one exact manual snapshot stale without deleting it"
     )
@@ -384,6 +393,14 @@ def _add_kanban_parsers(subparsers: argparse._SubParsersAction) -> None:
 def _kanban_payload(args: argparse.Namespace) -> dict:
     payload: dict = {"actor": args.actor or f"local:{getpass.getuser()}"}
     command = args.kanban_command
+    if command == "quota-cli-attempt":
+        payload = {"actor": "quota-updater", "source": "codex-cli", "attempted_at_ms": args.attempted_at_ms,
+                   "outcome": args.outcome, "error": args.error}
+        if args.outcome == "ok":
+            payload.update(observed_at_ms=args.observed_at_ms, remaining_percent=args.remaining_percent, reset_at_ms=args.reset_at_ms)
+        elif any(getattr(args, key) is not None for key in ("observed_at_ms", "remaining_percent", "reset_at_ms")):
+            raise ControllerError("failed attempt cannot carry an observation")
+        return payload
     if command not in {"create", "quota-snapshot", "quota-invalidate"}:
         payload["expected_revision"] = args.expected_revision
     if command in {"quota-snapshot", "quota-invalidate"}:
