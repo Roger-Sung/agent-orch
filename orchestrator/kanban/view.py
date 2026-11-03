@@ -2,6 +2,7 @@
 import json
 import base64
 import hashlib
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from html import escape
@@ -226,6 +227,35 @@ def _user_attributed(event):
         return False
 
 
+def _legacy_acceptance_record(payload):
+    """Recognize one bounded historical record form, never generic USER prose.
+
+    The caller still owns common event validation, sources and current scope.
+    Quoted instructions are provenance; only the exact affirmative record and
+    matching decision clauses below identify this legacy display format.
+    """
+    if payload.get('blocker') is not None or payload.get('next_step') is not None:
+        return False
+    words = r'[A-Za-z0-9](?:[A-Za-z0-9._ -]*[A-Za-z0-9])?'
+    summary = re.fullmatch(
+        r'使用者對「([^「」\r\n]+)」回覆「([^「」\r\n]+)」（([^（）\r\n]+)）；'
+        r'本次條件已核對通過，記錄 (' + words + r') 限定 (' + words + r') 受控驗收。(.+)',
+        payload['summary'], re.DOTALL)
+    if not summary or any(not part.strip() for part in summary.groups()):
+        return False
+    prompt, reply, reference, subject, environment, evidence = summary.groups()
+    decision = payload.get('decision') or ''
+    prefix = 'USER 依已同意的條件接受 ' + subject + ' ' + environment + ' 受控驗收並准予本卡結案封存；'
+    accepted = re.fullmatch(re.escape(prefix) + r'保留([^。；\r\n]+)，不宣稱([^。；\r\n]+)。', decision)
+    if not accepted or any(not part.strip() for part in accepted.groups()):
+        return False
+    # Fail closed on contradictory/pending assertions. This only narrows the
+    # full grammar; finding an acceptance keyword never makes a record valid.
+    denied = (r'不接受|未接受|尚未接受|待接受|拒絕|不同意|尚未驗收|待驗收|等待驗收|'
+              r'尚未通過|未通過驗收|若|如果|假如|預計驗收|將驗收|擬驗收|準備接受|有待驗收|尚待驗收')
+    return re.search(denied, reply + '\n' + evidence + '\n' + decision) is None
+
+
 def report_presentation(card, events, flags, *, user):
     """Separate attributed records for display; never feeds writer placement."""
     result = {'state': 'missing', 'record': None, 'scope': 'unknown', 'raw_payload': None,
@@ -252,8 +282,9 @@ def report_presentation(card, events, flags, *, user):
         current = worker_scope_current(card, payload['progress_binding'], events, started_revision=latest['result_revision'])
         result['scope'] = 'current' if current else 'historical'
         prefix = '使用者驗收通過：'
+        standard = payload['summary'].startswith(prefix) and bool(payload['summary'][len(prefix):].strip())
         acceptance = (user and payload['report_status'] == 'reported_done' and
-                      payload['summary'].startswith(prefix) and bool(payload['summary'][len(prefix):].strip()) and
+                      (standard or _legacy_acceptance_record(payload)) and
                       bool(payload.get('decision') and payload['decision'].strip()) and bool(payload['source_refs']))
         result['is_acceptance'] = bool(acceptance)
         if not current:

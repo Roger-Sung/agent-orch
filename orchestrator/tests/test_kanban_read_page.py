@@ -13,6 +13,17 @@ from orchestrator.kanban.commands import build_request, handle_request
 from orchestrator.kanban.view import project, render, detail_fragment, PANEL_SCRIPT
 from orchestrator.cli import build_parser, _kanban_payload
 
+def legacy_acceptance(**changes):
+    """Synthetic fields with the real T1.3 historical sentence structure."""
+    return {'summary': '使用者對「必要驗證通過後即可結案封存」回覆「確認都沒問題就可以關單」'
+                       '（synthetic:user-instruction）；本次條件已核對通過，記錄 T1.3 限定 Mac mini 受控驗收。'
+                       '獨立審查與通知回執已核對；此驗收不涵蓋完全不可達或人已讀，未發布限制保留。',
+            'decision': 'USER 依已同意的條件接受 T1.3 Mac mini 受控驗收並准予本卡結案封存；'
+                        '保留完全不可達分支未驗、有限容量與未發布限制，不宣稱全失效模式或無限運行。',
+            'blocker': None, 'next_step': None,
+            'source_refs': ['synthetic:user-instruction','synthetic:independent-review','synthetic:receipt','synthetic:thread'],
+            **changes}
+
 class BacklogTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
@@ -43,6 +54,69 @@ class BacklogTests(unittest.TestCase):
     def user_accept(self,ident,**changes):
         revision=self.conn.execute('SELECT revision FROM kanban_cards WHERE card_id=?',(ident,)).fetchone()[0]
         return self.send('report-progress',{'card_id':ident,'expected_revision':revision,'actor':'USER','report_status':'reported_done','summary':'使用者驗收通過：synthetic instruction and timestamp','decision':'接受此候選範圍；正式驗證另列','source_refs':['synthetic:user-instruction'],**changes})
+    def test_legacy_USER_record_survives_worker_and_over_50_reports(self):
+        from orchestrator.tests.test_kanban_commands import worker_sample,worker_handoff
+        self.card('c');accepted=self.user_accept('c',**legacy_acceptance());self.assertEqual('accepted',accepted['result'])
+        observation=worker_sample();first=self.worker('c',observation)
+        observation={**observation,'previous_observation_operation_id':first['operation_id'],'state':'completed','source_ref':'synthetic:terminal-read','handoff':worker_handoff(True)}
+        self.assertEqual('accepted',self.worker('c',observation)['result'])
+        for revision in range(3,64):self.assertEqual('accepted',self.report('c','blocked',revision)['result'])
+        before=list(self.conn.iterdump());page=read.page_snapshot(self.home);item=self.item(page,'c');detail=read.page_snapshot(self.home,detail=item['card']['_detail_token'])
+        self.assertLessEqual(len(page['events']),3)
+        for snapshot in (page,detail):
+            item=self.item(snapshot,'c');record=item['user_acceptance']
+            self.assertTrue(record['acceptance_recorded']);self.assertEqual('已記錄使用者驗收',record['label'])
+            self.assertEqual(accepted['operation_id'],record['record']['operation_id']);self.assertEqual('未綁目前候選',record['candidate_binding'])
+            self.assertEqual('completed',item['worker_observation']['state']);self.assertEqual('blocked',item['delivery_report']['record']['report_status'])
+            self.assertTrue(item['formal_verification_note'].startswith('未有可核對紀錄'))
+        self.assertEqual(before,list(self.conn.iterdump()))
+    def test_legacy_summary_detail_backlog_archive_are_readonly_and_consistent(self):
+        self.card('board');self.create('backlog')
+        for ident,backlog in (('board',False),('backlog',True)):
+            self.assertEqual('accepted',self.user_accept(ident,**legacy_acceptance())['result']);self.report(ident,'reported_done',1)
+            for archived in (False,True):
+                if archived:self.assertEqual('accepted',self.send('archive',{'card_id':ident,'expected_revision':2,'actor':'fixture-owner'})['result'])
+                options={'archived':True} if archived else {'backlog':backlog}
+                before=list(self.conn.iterdump());page=read.page_snapshot(self.home,**options);item=self.item(page,ident)
+                detail=read.page_snapshot(self.home,detail=item['card']['_detail_token'],**options)
+                self.assertEqual(item['user_acceptance'],self.item(detail,ident)['user_acceptance'])
+                for html in (render(page,**options),render(page,lazy=True,**options),detail_fragment(detail,**options)):
+                    self.assertIn('已記錄使用者驗收',html);self.assertIn('未綁目前候選',html)
+                    self.assertIn('使用者驗收已記錄；技術／正式驗證另列',html);self.assertNotIn('未驗收',html)
+                self.assertEqual(before,list(self.conn.iterdump()))
+    def test_legacy_latest_incomplete_or_malformed_USER_never_falls_back(self):
+        cases=[{'source_refs':[]},{'decision':None},{'summary':'最新 USER 進度說明'},{'report_status':'in_progress'}]
+        for index,changes in enumerate(cases):
+            ident='incomplete-'+str(index);self.card(ident);self.user_accept(ident,**legacy_acceptance())
+            latest=self.user_accept(ident,**legacy_acceptance(**changes));self.assertEqual('accepted',latest['result'])
+            item=self.item(read.page_snapshot(self.home),ident);self.assertFalse(item['user_acceptance']['acceptance_recorded'])
+            self.assertEqual('incomplete',item['user_acceptance']['state']);self.assertEqual(latest['operation_id'],item['user_acceptance']['record']['operation_id'])
+        self.corrupt()
+        for index,kind in enumerate(('payload-actor','event-actor','malformed','unknown-field','binding')):
+            ident='malformed-'+str(index);self.card(ident);self.user_accept(ident,**legacy_acceptance());latest=self.user_accept(ident,**legacy_acceptance())
+            event=self.conn.execute('SELECT payload FROM kanban_events WHERE operation_id=?',(latest['operation_id'],)).fetchone();payload=json.loads(event[0]);actor='USER'
+            if kind=='payload-actor':payload['actor']='assistant'
+            elif kind=='event-actor':actor='assistant'
+            elif kind=='unknown-field':payload['unrecognized']=True
+            elif kind=='binding':payload['progress_binding']=None
+            raw='not JSON' if kind=='malformed' else json.dumps(payload)
+            self.conn.execute('UPDATE kanban_events SET payload=?,actor=? WHERE operation_id=?',(raw,actor,latest['operation_id']))
+            page=read.page_snapshot(self.home);item=self.item(page,ident);detail=read.page_snapshot(self.home,detail=item['card']['_detail_token'])
+            for snapshot in (page,detail):
+                record=self.item(snapshot,ident)['user_acceptance'];self.assertEqual('unknown',record['state']);self.assertFalse(record['acceptance_recorded']);self.assertIn('不回退',record['note'])
+    def test_legacy_scope_ABA_generation_and_bad_barrier_never_revive(self):
+        self.card('c');self.user_accept('c',**legacy_acceptance())
+        self.send('edit',{'card_id':'c','expected_revision':1,'actor':'owner','fields':{'title':'description'}})
+        self.assertTrue(self.item(read.page_snapshot(self.home),'c')['user_acceptance']['acceptance_recorded'])
+        for revision,path in ((2,'B'),(3,None)):self.send('edit',{'card_id':'c','expected_revision':revision,'actor':'owner','fields':{'repo_path':path}})
+        page=read.page_snapshot(self.home);detail=read.page_snapshot(self.home,detail=self.item(page,'c')['card']['_detail_token'])
+        for snapshot in (page,detail):
+            record=self.item(snapshot,'c')['user_acceptance'];self.assertEqual('歷史驗收；不適用目前 scope',record['label']);self.assertFalse(record['acceptance_recorded'])
+        self.card('generation');self.user_accept('generation',**legacy_acceptance());self.conn.execute("UPDATE kanban_cards SET approval_generation=1 WHERE card_id='generation'")
+        self.assertFalse(self.item(read.page_snapshot(self.home),'generation')['user_acceptance']['acceptance_recorded'])
+        self.card('barrier');self.user_accept('barrier',**legacy_acceptance());edit=self.send('edit',{'card_id':'barrier','expected_revision':1,'actor':'owner','fields':{'note':'description'}})
+        self.corrupt();self.conn.execute('UPDATE kanban_events SET metadata_delta=? WHERE operation_id=?',('null',edit['operation_id']))
+        self.assertEqual('unknown',self.item(read.page_snapshot(self.home),'barrier')['user_acceptance']['state'])
     def test_USER_record_survives_worker_and_over_50_reports_readonly(self):
         from orchestrator.tests.test_kanban_commands import worker_sample,worker_handoff
         self.card('c');accepted=self.user_accept('c');self.assertEqual('accepted',accepted['result'])

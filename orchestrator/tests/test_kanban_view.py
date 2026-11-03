@@ -579,6 +579,58 @@ class AcceptanceViewTests(unittest.TestCase):
         return page_snapshot(self.home)
     def parser(self,d,**options):
         parser=BoardParser();parser.feed(render(d,**options));return parser
+    def test_legacy_acceptance_requires_full_affirmative_grammar(self):
+        from orchestrator.tests.test_kanban_read_page import legacy_acceptance
+        fields=legacy_acceptance();summary=fields['summary'];decision=fields['decision']
+        self.assertEqual('accepted',self.accept(**fields)['result'])
+        self.assertTrue(project(self.snapshot())[0]['user_acceptance']['acceptance_recorded'])
+        cases=[
+            {'summary':summary.replace('本次條件已核對通過','本次條件尚未通過')},
+            {'summary':summary.replace('本次條件已核對通過','若本次條件核對通過')},
+            {'summary':summary.replace('本次條件已核對通過','本次條件待核對通過')},
+            {'decision':decision.replace('條件接受','條件不接受')},
+            {'decision':decision.replace('USER 依','USER 若依')},
+            {'decision':decision.replace('條件接受','條件待接受')},
+            {'decision':'「'+decision+'」'},
+            {'decision':decision+'等待驗收。'},
+            {'decision':decision.replace('T1.3','T1.4')},
+            {'decision':decision.replace('保留完全不可達分支未驗、有限容量與未發布限制','保留 ')},
+            {'summary':summary.replace('確認都沒問題就可以關單','不同意接受')},
+            {'summary':summary+'但尚未接受。'},
+            {'summary':summary.split('受控驗收。')[0]+'受控驗收。   '},
+            {'summary':'USER reported_done 接受'},
+            {'source_refs':[]}, {'blocker':'待接受'}, {'next_step':'等待驗收'},
+        ]
+        for changes in cases:
+            with self.subTest(changes=changes):
+                self.assertEqual('accepted',self.accept(**legacy_acceptance(**changes))['result'])
+                record=project(self.snapshot())[0]['user_acceptance']
+                self.assertFalse(record['acceptance_recorded']);self.assertEqual('incomplete',record['state'])
+        # The established format is unaffected, and does not fall back to legacy.
+        self.accept();self.assertTrue(project(self.snapshot())[0]['user_acceptance']['acceptance_recorded'])
+    def test_legacy_USER_escaping_CSP_lazy_and_detail_keep_unverified_axes(self):
+        from orchestrator.tests.test_kanban_read_page import legacy_acceptance
+        from orchestrator.kanban.read import page_snapshot
+        from orchestrator.kanban.view import detail_fragment
+        attack='</template><img src=x onerror="evil()">'
+        fields=legacy_acceptance();fields['summary']+=attack;fields['source_refs'].append('javascript:'+attack)
+        self.assertEqual('accepted',self.accept(**fields)['result']);d=self.snapshot()
+        for lazy in (False,True):
+            parser=self.parser(d,lazy=lazy);html=render(d,lazy=lazy)
+            self.assertEqual([],parser.bad_tags);self.assertEqual(1,len(parser.scripts));self.assertIn('已記錄使用者驗收',' '.join(parser.visible))
+            self.assertEqual(PANEL_SCRIPT,html.split('<script>')[1].split('</script>')[0])
+            digest=base64.b64encode(hashlib.sha256(PANEL_SCRIPT.encode()).digest()).decode();self.assertIn("script-src 'sha256-"+digest+"'",parser.csp)
+        detail=page_snapshot(self.home,detail=d['cards'][0]['_detail_token']);parser=BoardParser();parser.feed(detail_fragment(detail))
+        text=' '.join(parser.detail_text)
+        for value in (attack,'javascript:'+attack,'未綁目前候選','未有可核對紀錄','不是身份驗證','未發布限制'):self.assertIn(value,text)
+        self.assertEqual([],parser.bad_tags);self.assertEqual([],parser.scripts)
+    def test_legacy_display_does_not_change_writer_group_or_placement(self):
+        from orchestrator.tests.test_kanban_read_page import legacy_acceptance
+        self.send(self.payload());self.accept(**legacy_acceptance());item=project(self.snapshot())[0]
+        self.assertTrue(item['user_acceptance']['acceptance_recorded']);self.assertEqual('完成',item['group'])
+        self.assertIsNone(item['workflow_reason']);self.assertEqual('實作中',item['display_group'])
+        placement=self.send({'card_id':'c','expected_revision':2,'actor':'owner','destination':'backlog','user_request':'synthetic selection'},command='place')
+        self.assertEqual('backlog_requires_effective_pending',placement['reason'])
     def test_acceptance_delivery_and_formal_evidence_are_distinct(self):
         self.assertEqual('accepted',self.accept()['result'])
         self.assertEqual('accepted',self.send(self.payload(expected_revision=1,report_status='reported_done',summary='Candidate delivery only'))['result'])
