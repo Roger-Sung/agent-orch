@@ -115,6 +115,31 @@ class ManagementTests(unittest.TestCase):
         try:self.assertEqual(0,conn.execute('SELECT count(*) FROM cli_quota_observation').fetchone()[0])
         finally:conn.close()
 
+    def test_worker_metadata_IPC_restart_preserves_lifecycle_and_zero_execution(self):
+        from orchestrator.tests.test_kanban_commands import worker_sample,worker_handoff
+        from orchestrator.kanban.read import page_snapshot
+        from orchestrator.kanban.view import project
+        before=legacy_rows(self.home);schema=legacy_schema(self.home)
+        proc=self.start();self.ready(proc);self.assertEqual('accepted',self.card()['result'])
+        conn=db.connect(self.home/'orchestrator.db',read_only=True)
+        baseline=dict(conn.execute("SELECT * FROM kanban_cards WHERE card_id='card'").fetchone());conn.close()
+        o=worker_sample();payload={'card_id':'card','expected_revision':0,'actor':'assistant','report_status':'in_progress','summary':'Synthetic observation','source_refs':[o['source_ref']],'worker_observation':o}
+        first=self.send('report-progress',payload);self.assertEqual('accepted',first['result'])
+        self.stop(proc);proc=self.start();self.ready(proc)
+        o={**o,'previous_observation_operation_id':first['operation_id'],'state':'completed','source_ref':'synthetic:terminal-read','handoff':worker_handoff(True)}
+        payload.update(expected_revision=1,worker_observation=o,source_refs=[o['source_ref']]);terminal=self.send('report-progress',payload);self.assertEqual('accepted',terminal['result'])
+        self.assertTrue(self.send('report-progress',payload,operation=terminal['operation_id'])['replayed'])
+        self.assertEqual('accepted',self.send('report-progress',{'card_id':'card','expected_revision':2,'actor':'assistant','report_status':'blocked','summary':'Ordinary follow-up without worker metadata'})['result'])
+        self.stop(proc);page=page_snapshot(self.home,backlog=True);item=project(page)[0]
+        self.assertEqual('completed',item['worker_observation']['state']);self.assertEqual('acknowledged',item['worker_observation']['handoff']['state'])
+        self.assertEqual('blocked',item['progress_report']['report_status'])
+        conn=db.connect(self.home/'orchestrator.db',read_only=True)
+        after=dict(conn.execute("SELECT * FROM kanban_cards WHERE card_id='card'").fetchone())
+        delta=json.loads(conn.execute('SELECT metadata_delta FROM kanban_events WHERE operation_id=?',(terminal['operation_id'],)).fetchone()[0]);conn.close()
+        self.assertIs(False,delta['execution_verified'])
+        self.assertEqual({k:v for k,v in baseline.items() if k not in {'revision','updated_at'}},{k:v for k,v in after.items() if k not in {'revision','updated_at'}})
+        self.assertEqual(before,legacy_rows(self.home));self.assertEqual(schema,legacy_schema(self.home));self.assert_cli_quota_empty();self.assertFalse((self.home/'execution-called').exists())
+
     def test_place_durable_IPC_restart_reversal_and_zero_execution(self):
         from orchestrator.kanban.read import page_snapshot
         before=legacy_rows(self.home);schema=legacy_schema(self.home)

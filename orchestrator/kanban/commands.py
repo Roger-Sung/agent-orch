@@ -660,6 +660,101 @@ def progress_scope_digest(card: Any) -> str:
     return hashlib.sha256(canonical_json({key: card.get(key) for key in fields})).hexdigest()
 
 
+WORKER_TERMINAL_STATES = frozenset(('completed', 'failed', 'stopped'))
+WORKER_EVENT_PREDICATE = "kind='report-progress' AND CASE WHEN json_valid(payload) THEN json_type(payload)<>'object' OR json_type(payload,'$.worker_observation') IS NOT NULL OR json_type(payload,'$.worker_binding') IS NOT NULL ELSE 1 END"
+
+
+def validate_worker_observation(observation, refs):
+    """Strict provenance metadata only; never fetch or authenticate a reference."""
+    keys = {'schema_version', 'attempt_id', 'supersedes_attempt_id',
+            'previous_observation_operation_id', 'provider', 'thread_id', 'turn_id',
+            'coordinator', 'observed_at_ms', 'state', 'source_ref', 'handoff'}
+    if not isinstance(observation, dict) or set(observation) != keys:
+        raise ValueError('invalid_worker_observation')
+    def text(value, limit, nullable=False):
+        return value is None and nullable or isinstance(value, str) and bool(value.strip()) and len(value) <= limit and not reserved_marker_in(value)
+    def identifier(value, nullable=False):
+        if value is None:
+            return nullable
+        try:
+            return isinstance(value, str) and str(uuid.UUID(value)) == value
+        except ValueError:
+            return False
+    o = observation
+    if (type(o['schema_version']) is not int or o['schema_version'] != 1 or
+        not identifier(o['attempt_id']) or not identifier(o['supersedes_attempt_id'], True) or
+        not identifier(o['previous_observation_operation_id'], True) or
+        not text(o['provider'], 100) or not text(o['thread_id'], 500) or
+        not text(o['turn_id'], 500, True) or not text(o['coordinator'], 500) or
+        type(o['observed_at_ms']) is not int or not 0 <= o['observed_at_ms'] <= MAX_REVISION or
+        not isinstance(o['state'], str) or o['state'] not in {'submitted', 'running', 'unknown'} | WORKER_TERMINAL_STATES or
+        not text(o['source_ref'], 1000) or o['source_ref'] not in refs):
+        raise ValueError('invalid_worker_observation')
+    h = o['handoff']
+    if o['state'] not in WORKER_TERMINAL_STATES:
+        if h is not None:
+            raise ValueError('unexpected_worker_handoff')
+        return
+    if (not isinstance(h, dict) or set(h) != {'state', 'owner', 'next_step', 'result_source_ref'} or
+        not isinstance(h['state'], str) or h['state'] not in {'pending', 'acknowledged'} or
+        not text(h['owner'], 500, True) or not text(h['next_step'], 4000, True) or
+        not text(h['result_source_ref'], 1000, True) or
+        h['result_source_ref'] is not None and h['result_source_ref'] not in refs or
+        h['state'] == 'acknowledged' and any(h[k] is None for k in ('owner', 'next_step', 'result_source_ref'))):
+        raise ValueError('invalid_worker_handoff')
+
+
+def _worker_binding(conn, card, observation):
+    """Validate lineage in the surrounding canonical writer transaction."""
+    from .read import _summaries
+    from .view import latest_worker_event, worker_scope_current
+    data = _summaries(conn, [dict(card)])
+    flags = data['summary_flags'].get(card['card_id'], {})
+    if any(flags.get(k) for k in ('bad_card', 'bad_revision', 'bad_edit', 'bad_worker')):
+        raise ValueError('worker_history_unknown')
+    latest = latest_worker_event(dict(card), data['events'])
+    o = observation
+    if latest is None:
+        if o['supersedes_attempt_id'] is not None or o['previous_observation_operation_id'] is not None or o['state'] != 'submitted':
+            raise ValueError('worker_initial_submission_required')
+    else:
+        event, payload = latest
+        previous = payload['worker_observation']
+        for edit in data['events']:
+            if edit.get('kind') == 'edit' and edit.get('result') == 'accepted' and edit['result_revision'] > payload['worker_binding']['started_revision']:
+                try:
+                    if not isinstance(json.loads(edit.get('metadata_delta') or 'null'), dict):
+                        raise ValueError('worker_history_unknown')
+                except (ValueError, TypeError):
+                    raise ValueError('worker_history_unknown') from None
+        if o['previous_observation_operation_id'] != event['operation_id']:
+            raise ValueError('worker_observation_conflict')
+        if o['attempt_id'] == previous['attempt_id']:
+            if any(o[k] != previous[k] for k in ('supersedes_attempt_id', 'provider', 'thread_id', 'coordinator')) or previous['turn_id'] is not None and o['turn_id'] != previous['turn_id']:
+                raise ValueError('worker_identity_conflict')
+            current = worker_scope_current(dict(card), payload['worker_binding'], data['events'])
+            if not current and o['state'] not in WORKER_TERMINAL_STATES:
+                raise ValueError('worker_scope_reconciliation_required')
+            if previous['state'] in WORKER_TERMINAL_STATES:
+                if any(o[k] != previous[k] for k in o if k not in {'handoff', 'previous_observation_operation_id'}):
+                    raise ValueError('worker_terminal_immutable')
+                before, after = previous['handoff'], o['handoff']
+                if before['state'] == 'acknowledged' and after != before or any(before[k] is not None and before[k] != after[k] for k in ('owner', 'next_step', 'result_source_ref')):
+                    raise ValueError('worker_handoff_regression')
+            elif o['state'] == 'submitted' and previous['state'] != 'submitted':
+                raise ValueError('worker_state_regression')
+            return payload['worker_binding']
+        if o['supersedes_attempt_id'] != previous['attempt_id'] or o['state'] != 'submitted':
+            raise ValueError('worker_supersession_required')
+        if previous['state'] not in WORKER_TERMINAL_STATES or previous['handoff']['state'] != 'acknowledged':
+            raise ValueError('worker_handoff_required')
+    reused = conn.execute("SELECT 1 FROM kanban_events WHERE card_id=? AND result='accepted' AND kind='report-progress' AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.worker_observation.attempt_id')=? ELSE 0 END LIMIT 1", (card['card_id'], o['attempt_id'])).fetchone()
+    if reused:
+        raise ValueError('worker_attempt_reused')
+    return {'schema_version': 1, 'approval_generation': card['approval_generation'],
+            'scope_digest': progress_scope_digest(card), 'started_revision': card['revision'] + 1}
+
+
 def _report_progress(conn, home, command, operation_id, digest, payload):
     # Reporting is event metadata, safe even for linked/terminal cards; it is
     # never authority to change their lifecycle or their execution records.
@@ -672,7 +767,7 @@ def _report_progress(conn, home, command, operation_id, digest, payload):
     if reason is not None:
         return reject(reason)
     allowed = {"card_id", "expected_revision", "actor", "report_status", "summary",
-               "blocker", "decision", "next_step", "source_refs"}
+               "blocker", "decision", "next_step", "source_refs", "worker_observation"}
     if set(payload) - allowed:
         return reject("unsupported_progress_fields")
     if payload.get("report_status") not in PROGRESS_STATUSES:
@@ -698,6 +793,12 @@ def _report_progress(conn, home, command, operation_id, digest, payload):
         "approval_generation": card["approval_generation"],
         "scope_digest": progress_scope_digest(card),
     }}
+    if 'worker_observation' in payload:
+        try:
+            validate_worker_observation(payload['worker_observation'], refs)
+            event['worker_binding'] = _worker_binding(conn, card, payload['worker_observation'])
+        except (ValueError, TypeError, KeyError) as exc:
+            return reject(str(exc) if isinstance(exc, ValueError) else 'worker_history_unknown')
     expected = payload["expected_revision"]
     if not _cas_update(conn, card["card_id"], expected, {}):
         return reject("revision_conflict")

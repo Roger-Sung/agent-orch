@@ -10,18 +10,18 @@ def test_empty_and_escape():
     assert html.count('<script>') == 1 and '<img' not in html and 'href=' not in html
     assert html.split('<script>')[1].split('</script>')[0] == PANEL_SCRIPT
     assert '演示資料' in html and 'Asia/Taipei' in html
-    assert project(d)[0]['group']=='完成'
+    assert project(d)[0]['display_group']=='完成'
     assert html==render(d,demo=True)
 
 def test_unknown_pending_and_decisions():
     d=data(); d['cards']=[{'card_id':'a','title':'a','manual_state':'ready','task_id':'missing','updated_at':1}]
-    assert project(d)[0]['group']=='待決策'
+    assert project(d)[0]['display_group']=='狀態待核對'
     d['tasks']=[{'id':'missing','status':'paused','updated_at':2}]
     d['events']=[{'card_id':'a','at':3,'kind':'pause','result':'accepted','payload':'pending'}, {'card_id':'a','at':4,'kind':'decision','result':'rejected','reason':'needs_user_decision'}]
-    assert project(d)[0]['group']=='待決策'
+    assert project(d)[0]['display_group']=='已暫停'
     assert 'pending' in render(d) and 'needs_user_decision' in render(d)
     d['tasks'][0]['status']='mystery'
-    assert project(d)[0]['group']=='待決策'
+    assert project(d)[0]['display_group']=='狀態待核對'
 
 def test_quota_stale_and_reported_done():
     d=data(); d['quota']=[{'snapshot_id':'q','pool_key':'test','source':'manual','observed_at':0,'recorded_at':0,'reset_at':999,'stale':0}]
@@ -39,19 +39,19 @@ class ProjectionBoundaryTests(unittest.TestCase):
     def test_running_pending_and_user_review(self):
         d=data(); d['cards']=[{'card_id':'c','title':'卡片','manual_state':'ready','task_id':'t','updated_at':1}]
         d['tasks']=[{'id':'t','status':'running','updated_at':2,'stop_reason':'manual_pause_pending'}]
-        self.assertEqual('待決策',project(d)[0]['group'])
+        self.assertEqual('暫停待確認',project(d)[0]['display_group'])
         self.assertIn('pending（尚未生效）',render(d))
         d['tasks'][0]['stop_reason']='no_pending'
         self.assertFalse(project(d)[0]['pending'].startswith('pending（'))
-        self.assertEqual('實作中',project(d)[0]['group'])
+        self.assertEqual('實作中',project(d)[0]['display_group'])
         d['tasks'][0]['stop_reason']=None
         d['cards'][0]['last_reason']='manual_pause_pending'
-        self.assertEqual('待決策',project(d)[0]['group'])
+        self.assertEqual('暫停待確認',project(d)[0]['display_group'])
         d['tasks'][0]['status']='UserReview'
-        self.assertEqual('待決策',project(d)[0]['group'])
+        self.assertEqual('暫停待確認',project(d)[0]['display_group'])
         d['cards'][0]['last_reason']=None
-        self.assertEqual('完成',project(d)[0]['group'])
-        self.assertNotEqual('已驗',project(d)[0]['group'])
+        self.assertEqual('完成',project(d)[0]['display_group'])
+        self.assertNotEqual('已驗',project(d)[0]['display_group'])
 
 from html.parser import HTMLParser
 
@@ -89,7 +89,7 @@ class ReadableBoardTests(unittest.TestCase):
         parser=BoardParser(); parser.feed(render(d,demo=True)); visible=' '.join(parser.visible)
         self.assertEqual(4,parser.lanes); self.assertEqual(1,parser.cards)
         self.assertFalse(parser.json_outside_details); self.assertFalse(parser.open_details); self.assertEqual([],parser.bad_tags)
-        for text in ['演示資料','尚未接正式任務','等待確認規格','case','實作中','進行中','pending（尚未生效）','待決策','Asia/Taipei']:
+        for text in ['演示資料','尚未接正式任務','等待確認規格','case','實作中','進行中','pending（尚未生效）','暫停待確認','Asia/Taipei']:
             self.assertIn(text,visible)
         self.assertNotIn('"updated_sources"',visible)
         self.assertNotIn('中文備註',visible)
@@ -173,7 +173,7 @@ class ArchiveAndQuotaTests(unittest.TestCase):
     def test_archive_exact_state_and_no_completion_promotion(self):
         d=data(); d['cards']=[{'card_id':'a','title':'封存卡','manual_state':'archived','task_id':'t','updated_at':1}, {'card_id':'b','title':'回報完成','manual_state':'done','task_id':None,'updated_at':1}]
         d['tasks']=[{'id':'t','status':'done','updated_at':1}]
-        self.assertEqual(['封存','完成'],[c['group'] for c in project(d)])
+        self.assertEqual(['封存','完成'],[c['display_group'] for c in project(d)])
         html=render(d); parser=BoardParser(); parser.feed(html)
         self.assertEqual(4,parser.lanes);self.assertFalse(parser.open_details);self.assertTrue(parser.panel_hidden)
         self.assertNotIn('封存卡',' '.join(parser.visible))
@@ -189,7 +189,7 @@ class ArchiveAndQuotaTests(unittest.TestCase):
         before=json.dumps(d,ensure_ascii=False)
         html=render(d);parser=BoardParser();parser.feed(html)
         self.assertEqual(5,parser.cards);self.assertEqual(5,len(parser.templates))
-        self.assertEqual(1,len({c['group'] for c in project(d)}))
+        self.assertEqual(1,len({c['display_group'] for c in project(d)}))
         self.assertNotIn('完整備註',' '.join(parser.visible));self.assertIn('完整備註',' '.join(parser.detail_text))
         self.assertEqual(before,json.dumps(d,ensure_ascii=False))
     def test_quota_top_distinct_sources_and_no_fake_defaults(self):
@@ -235,7 +235,7 @@ class ProgressViewTests(unittest.TestCase):
         payload={'card_id':'c','expected_revision':0,'actor':'assistant:fixture','report_status':status,'summary':'<script>摘要</script>','blocker':'缺資料','decision':'確認範圍','next_step':'隔離驗證','source_refs':['javascript:alert(1)'],'progress_binding':{'schema_version':1,'approval_generation':0,'scope_digest':progress_scope_digest(card)}}
         d['events']=[{'card_id':'c','kind':'report-progress','result':'accepted','result_revision':1,'operation_id':'report','at':100,'actor':'assistant:fixture','payload':json.dumps(payload)}];return d
     def test_report_completion_remains_unverified_and_text(self):
-        d=self.sample();item=project(d)[0];self.assertEqual('完成',item['group']);self.assertEqual('未驗證',item['completion_evidence'])
+        d=self.sample();item=project(d)[0];self.assertEqual('完成',item['display_group']);self.assertEqual('未驗證',item['completion_evidence'])
         html=render(d);parser=BoardParser();parser.feed(html)
         self.assertEqual([],parser.bad_tags);self.assertEqual(1,len(parser.scripts));self.assertIn('助手回報完成（未驗證）',' '.join(parser.visible));self.assertIn('摘要',' '.join(parser.visible))
         for text in ['assistant:fixture','來源引用（純文字，未讀取／未驗證）','確認範圍','隔離驗證','引擎原始進度','javascript:alert(1)']:self.assertIn(text,' '.join(parser.detail_text))
@@ -245,10 +245,10 @@ class ProgressViewTests(unittest.TestCase):
         for raw in ['not-json','null','{}']:
             d=self.sample();d['events'][0]['payload']=raw;self.assertIsNone(project(d)[0]['progress_report']);render(d)
     def test_engine_holds_and_archive_remain_distinct(self):
-        d=self.sample();d['cards'][0]['manual_state']='archived';self.assertEqual('封存',project(d)[0]['group'])
+        d=self.sample();d['cards'][0]['manual_state']='archived';self.assertEqual('封存',project(d)[0]['display_group'])
         d=self.sample();d['cards'][0]['task_id']='t';d['tasks']=[{'id':'t','status':'blocked','updated_at':1}]
         payload=json.loads(d['events'][0]['payload']);payload['progress_binding']['scope_digest']=progress_scope_digest(d['cards'][0]);d['events'][0]['payload']=json.dumps(payload)
-        self.assertEqual('待決策',project(d)[0]['group']);self.assertEqual('blocked',project(d)[0]['task']['status']);self.assertIn('引擎：',render(d))
+        self.assertEqual('工程受阻',project(d)[0]['display_group']);self.assertEqual('blocked',project(d)[0]['task']['status']);self.assertIn('引擎：',render(d))
 
     def test_malformed_revisions_fail_closed_without_fallback(self):
         for revision in ['2', True, None, -1, 0, 2]:
@@ -312,27 +312,27 @@ class WorkflowLaneTests(unittest.TestCase):
         for name in names:self.assertNotIn('<h2>'+name,h)
         self.assertIn('<section class="archive-cards">',h)
     def test_normal_and_explicit_engine_holds(self):
-        for status,group in [(None,'待處理'),('queued','待處理'),('running','實作中'),('blocked','待決策'),('waiting_user','待決策'),('failed','待決策'),('paused','待決策'),('done','完成'),('UserReview','完成'),('mystery','待決策')]:
-            with self.subTest(status=status):self.assertEqual(group,project(self.sample(status))[0]['group'])
+        for status,group in [(None,'待處理'),('queued','待處理'),('running','實作中'),('blocked','工程受阻'),('waiting_user','狀態待核對'),('failed','工程受阻'),('paused','已暫停'),('done','完成'),('UserReview','完成'),('mystery','狀態待核對')]:
+            with self.subTest(status=status):self.assertEqual(group,project(self.sample(status))[0]['display_group'])
         self.assertIn('尚無回報',render(self.sample()))
         self.assertIn('排隊',render(self.sample('queued')))
         self.assertIn('進行中',render(self.sample('running')))
     def test_valid_reports_and_hold_priority(self):
-        for status,group in [('not_started','待處理'),('in_progress','實作中'),('blocked','待決策'),('needs_decision','待決策'),('reported_done','完成')]:
-            d=ProgressViewTests().sample(status);self.assertEqual(group,project(d)[0]['group'])
+        for status,group in [('not_started','待處理'),('in_progress','實作中'),('blocked','工程受阻'),('needs_decision','待使用者'),('reported_done','完成')]:
+            d=ProgressViewTests().sample(status);self.assertEqual(group,project(d)[0]['display_group'])
         self.assertIn('尚未開始',render(ProgressViewTests().sample('not_started')))
         # Failure words alone never change a current valid in-progress report.
         d=ProgressViewTests().sample('in_progress');p=json.loads(d['events'][0]['payload']);p['summary']='error fail 已自行修正，繼續實作';d['events'][0]['payload']=json.dumps(p)
-        self.assertEqual('實作中',project(d)[0]['group'])
-        for status in ['blocked','waiting_user','failed','paused']:
+        self.assertEqual('實作中',project(d)[0]['display_group'])
+        for status,group in [('blocked','工程受阻'),('waiting_user','狀態待核對'),('failed','工程受阻'),('paused','已暫停')]:
             d=ProgressViewTests().sample();d['cards'][0]['task_id']='t';d['tasks']=[{'id':'t','status':status,'updated_at':1}]
             p=json.loads(d['events'][0]['payload']);p['progress_binding']['scope_digest']=progress_scope_digest(d['cards'][0]);d['events'][0]['payload']=json.dumps(p)
-            self.assertEqual('待決策',project(d)[0]['group'])
-        for manual in ['needs_clarification','returned']:
+            self.assertEqual(group,project(d)[0]['display_group'])
+        for manual,group in [('needs_clarification','狀態待核對'),('returned','工程受阻')]:
             d=ProgressViewTests().sample('not_started');d['cards'][0]['manual_state']=manual
-            self.assertEqual('待決策',project(d)[0]['group'])
+            self.assertEqual(group,project(d)[0]['display_group'])
         d=self.sample('done');d['cards'][0]['last_reason']='manual_pause_pending'
-        self.assertEqual('待決策',project(d)[0]['group']);self.assertIn('pending（尚未生效）',render(d))
+        self.assertEqual('暫停待確認',project(d)[0]['display_group']);self.assertIn('pending（尚未生效）',render(d))
     def test_anomalies_precede_completion_and_never_fake_verified(self):
         cases=[]
         d=self.sample('done');d['tasks']=[];cases.append(d)
@@ -345,9 +345,9 @@ class WorkflowLaneTests(unittest.TestCase):
         d=ProgressViewTests().sample();d['cards'][0]['revision']=2;d['events'].append({'card_id':'c','kind':'edit','result':'accepted','result_revision':2,'at':101,'metadata_delta':'null'});cases.append(d)
         for d in cases:
             with self.subTest(data=d):
-                item=project(d)[0];self.assertEqual('待決策',item['group']);self.assertIn('狀態待確認',item['workflow_reason']);self.assertIn('狀態待確認',render(d));self.assertEqual('未驗證',item['completion_evidence'])
-        d=self.sample('done');d['cards'][0]['note']='PASS verified 已验收';self.assertEqual('完成',project(d)[0]['group'])
-        self.assertIn('未驗收',render(d));self.assertNotEqual('已驗',project(d)[0]['group'])
+                item=project(d)[0];self.assertEqual('狀態待核對',item['display_group']);self.assertIn('狀態待確認',item['workflow_reason']);self.assertIn('狀態待確認',render(d));self.assertEqual('未驗證',item['completion_evidence'])
+        d=self.sample('done');d['cards'][0]['note']='PASS verified 已验收';self.assertEqual('完成',project(d)[0]['display_group'])
+        self.assertIn('未驗收',render(d));self.assertNotEqual('已驗',project(d)[0]['display_group'])
 
 
 class PrioritySectionTests(unittest.TestCase):
@@ -357,10 +357,10 @@ class PrioritySectionTests(unittest.TestCase):
         html=render(d);parser=BoardParser();parser.feed(html)
         self.assertEqual(4,parser.lanes);self.assertEqual(2,parser.cards)
         self.assertEqual(1,html.count('<section class="priority-section"'))
-        self.assertIn('<h2>待決策</h2>',html)
+        self.assertIn('<h2>工程受阻</h2>',html)
         self.assertLess(html.index('class="priority-section"'),html.index('class="board"'))
         self.assertEqual(2,len(parser.selectors));self.assertEqual(2,len(set(parser.templates)))
-        self.assertEqual(1,html.count('<h2>待決策</h2>'))
+        self.assertEqual(1,html.count('<h2>工程受阻</h2>'))
         self.assertNotIn('全部待決策',html)
         clean=render(WorkflowLaneTests().sample('running'))
         self.assertNotIn('<section class="priority-section"',clean)
@@ -378,6 +378,145 @@ class RestoredQuotaTests(unittest.TestCase):
         self.assertLess(header.index('header-intro'),header.index('header-quota'))
         self.assertIn('.header-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,340px)',html)
         self.assertIn('@media(max-width:1000px){.header-grid{grid-template-columns:1fr',html)
+
+
+class HonestStatusTests(unittest.TestCase):
+    def sample(self, status='blocked', *, task_status=None, reason=None, **fields):
+        d=ProgressViewTests().sample(status)
+        if task_status is not None:
+            d['cards'][0]['task_id']='t'
+            d['tasks']=[{'id':'t','status':task_status,'stop_reason':reason,'updated_at':1}]
+        else:
+            d['cards'][0]['last_reason']=reason
+        payload=json.loads(d['events'][0]['payload'])
+        payload.update(fields)
+        payload['progress_binding']['scope_digest']=progress_scope_digest(d['cards'][0])
+        d['events'][0]['payload']=json.dumps(payload)
+        return d
+
+    def parsed(self, d, **options):
+        parser=BoardParser();parser.feed(render(d,**options));return parser
+    def test_needs_decision_question_first_and_blocker_retained_full_lazy(self):
+        question='選哪個範圍？ <img src=x onerror="evil()">'
+        blocker='缺少授權 <script>evil()</script>'
+        for status,first,second in (('needs_decision',question,blocker),('blocked',blocker,question)):
+            d=self.sample(status,decision=question,blocker=blocker);d['cards'][0]['_detail_token']=1
+            for lazy in (False,True):
+                with self.subTest(status=status,lazy=lazy):
+                    parser=self.parsed(d,lazy=lazy);visible=' '.join(parser.visible)
+                    self.assertIn(first,visible);self.assertIn(second,visible);self.assertLess(visible.index(first),visible.index(second))
+                    self.assertEqual([],parser.bad_tags);self.assertEqual(1,len(parser.scripts))
+
+    def test_display_classification_preserves_writer_placement_contract(self):
+        for status,expected in (('blocked','工程受阻'),('failed','工程受阻'),('waiting_user','狀態待核對'),('paused','已暫停')):
+            with self.subTest(status=status):
+                d=self.sample('not_started',task_status=status,decision=None)
+                item=project(d)[0]
+                self.assertEqual('待決策',item['group'])
+                self.assertIsNone(item['workflow_reason'])
+                self.assertEqual(expected,item['display_group'])
+        d=self.sample('needs_decision',decision=None)
+        self.assertEqual('待決策',project(d)[0]['group'])
+        self.assertIsNone(project(d)[0]['workflow_reason'])
+        self.assertIn('待答問題未記錄',project(d)[0]['display_reason'])
+
+    def test_engineering_holds_do_not_invent_a_human_question(self):
+        for status in ('blocked','failed','waiting_user'):
+            with self.subTest(status=status):
+                d=self.sample('not_started',task_status=status,reason='dirty_tree',decision=None)
+                self.assertEqual('工程受阻',project(d)[0]['display_group'])
+                visible=' '.join(self.parsed(d).visible)
+                self.assertIn('工程受阻',visible)
+                self.assertNotIn('<h2>待使用者</h2>',render(d))
+                self.assertIn('dirty_tree',visible)
+        d=self.sample('in_progress',summary='dirty_tree mentioned in prose; already fixed',decision=None)
+        self.assertEqual('實作中',project(d)[0]['display_group'])
+        # A reason with a similar spelling is not the known machine code.
+        d=self.sample('not_started',task_status='waiting_user',reason='dirty_tree-ish',decision=None)
+        self.assertEqual('狀態待核對',project(d)[0]['display_group'])
+
+    def test_question_requires_explicit_report_and_recorded_text(self):
+        d=self.sample('needs_decision',task_status='blocked',decision='要保留哪一個範圍？',blocker=None)
+        self.assertEqual('待使用者',project(d)[0]['display_group'])
+        for text in ('待使用者','要保留哪一個範圍？'):
+            self.assertIn(text,' '.join(self.parsed(d).visible))
+        for decision in (None,'','   '):
+            with self.subTest(decision=decision):
+                d=self.sample('needs_decision',decision=decision)
+                self.assertEqual('狀態待核對',project(d)[0]['display_group'])
+        # Text in an ordinary report is not itself a decision request.
+        d=self.sample('blocked',decision='無使用者待答；由工程 owner 處理')
+        self.assertEqual('工程受阻',project(d)[0]['display_group'])
+
+    def test_optional_null_is_unrecorded_and_not_an_explicit_no(self):
+        d=self.sample('not_started',blocker=None,decision=None,next_step=None)
+        parser=self.parsed(d);detail=' '.join(parser.detail_text)
+        self.assertIn('所需決策 未記錄',detail)
+        self.assertIn('回報卡點 未記錄',detail)
+        self.assertIn('下一步 未記錄',detail)
+        self.assertNotIn('關聯任務缺失',detail)
+        self.assertIsNone(project(d)[0]['workflow_reason'])
+        self.assertEqual('待處理',project(d)[0]['display_group'])
+        d=self.sample('not_started',decision='明確不需決策',blocker=None,next_step=None)
+        self.assertIn('所需決策 明確不需決策',' '.join(self.parsed(d).detail_text))
+        d['cards'][0]['task_id']='missing'
+        self.assertEqual('狀態待核對',project(d)[0]['display_group'])
+        self.assertIn('關聯任務缺失',render(d))
+
+    def test_specific_blocker_precedes_warnings_in_lazy_and_full_cards(self):
+        blocker='engine owner：確認受阻原因 <script>evil()</script>'
+        d=self.sample('in_progress',task_status='running',reason='manual_pause_pending',blocker=blocker,decision='需要選範圍')
+        d['cards'][0]['_detail_token']=7
+        self.assertEqual('暫停待確認',project(d)[0]['display_group'])
+        for lazy in (False,True):
+            with self.subTest(lazy=lazy):
+                parser=self.parsed(d,lazy=lazy);visible=' '.join(parser.visible)
+                self.assertLess(visible.index(blocker),visible.index('pending（尚未生效）'))
+                self.assertIn('worker 停止尚未確認',visible)
+                self.assertIn('running 不保證存活',visible)
+                self.assertNotIn('已暫停',visible)
+                self.assertEqual([],parser.bad_tags)
+        d['summary_flags']={'c':{'bad_time':True}}
+        self.assertEqual('狀態待核對',project(d)[0]['display_group'])
+        visible=' '.join(self.parsed(d).visible)
+        self.assertLess(visible.index(blocker),visible.index('狀態待確認'))
+        self.assertIn('pending（尚未生效）',visible)
+
+    def test_archive_and_unverified_delivery_keep_blockers_and_warnings(self):
+        for manual,expected in (('archived','封存'),('inbox','完成')):
+            d=self.sample('reported_done',blocker='正式部署尚未執行')
+            d['cards'][0]['manual_state']=manual
+            parser=self.parsed(d,archived=manual=='archived');visible=' '.join(parser.visible)
+            self.assertEqual(expected,project(d)[0]['display_group'])
+            self.assertIn('正式部署尚未執行',visible)
+            self.assertIn('完成證據未驗證',visible)
+            self.assertLess(visible.index('正式部署尚未執行'),visible.index('完成證據未驗證'))
+        d['cards'][0]['manual_state']='archived';d['summary_flags']={'c':{'bad_time':True}}
+        self.assertEqual('封存',project(d)[0]['display_group'])
+        self.assertIn('狀態待確認',render(d,archived=True))
+
+    def test_in_progress_is_a_report_without_worker_liveness_evidence(self):
+        d=self.sample('in_progress',blocker=None,decision=None)
+        parser=self.parsed(d)
+        self.assertEqual('實作中',project(d)[0]['display_group'])
+        for text in ('助手回報進行中','無引擎執行證據','worker 狀態未觀測','是否仍存活未知'):
+            self.assertIn(text,' '.join(parser.visible))
+        self.assertIn('worker 狀態未觀測',' '.join(parser.detail_text))
+        d=self.sample('not_started',task_status='paused')
+        self.assertEqual('已暫停',project(d)[0]['display_group'])
+        self.assertIn('worker 停止尚未確認',' '.join(self.parsed(d).visible))
+
+    def test_new_alert_surfaces_escape_decision_and_keep_fixed_csp(self):
+        text='</template><img src=x onerror="evil()"> & "question"'
+        d=self.sample('needs_decision',blocker=None,decision=text)
+        html=render(d);parser=self.parsed(d)
+        self.assertIn(text,' '.join(parser.visible))
+        self.assertEqual([],parser.bad_tags)
+        self.assertEqual(1,len(parser.scripts))
+        digest=base64.b64encode(hashlib.sha256(PANEL_SCRIPT.encode()).digest()).decode()
+        self.assertIn("script-src 'sha256-"+digest+"'",parser.csp)
+        self.assertIn("default-src 'none'",parser.csp)
+        self.assertEqual(PANEL_SCRIPT,html.split('<script>')[1].split('</script>')[0])
         self.assertLess(html.index('header-quota'),html.index('</header>'))
         self.assertLess(html.index('</header>'),html.index('<main>'))
         self.assertEqual(html,render(d))
@@ -386,3 +525,102 @@ class RestoredQuotaTests(unittest.TestCase):
         fresh=render(d);self.assertIn('90%',fresh);self.assertIn('觀測：',fresh);self.assertNotIn('<strong>暫無資料</strong>',fresh)
         d['usage_observation']['weekly']['reset_at_ms']=999
         stale=render(d);self.assertIn('reset 已過；觀測過期',stale);self.assertIn('觀測：',stale)
+
+
+from orchestrator.tests import test_kanban_commands as worker_fixtures
+from orchestrator.tests.test_kanban_commands import worker_sample,worker_handoff
+
+class WorkerViewTests(unittest.TestCase):
+    setUp=worker_fixtures.WorkerObservationTests.setUp
+    payload=worker_fixtures.WorkerObservationTests.payload
+    send=worker_fixtures.WorkerObservationTests.send
+    card=worker_fixtures.WorkerObservationTests.card
+    emit=worker_fixtures.WorkerObservationTests.emit
+    advance=worker_fixtures.WorkerObservationTests.advance
+    def snapshot(self):
+        from orchestrator.kanban.read import page_snapshot
+        return page_snapshot(self.home)
+    def test_observed_running_time_source_and_handoff_are_separate_and_escaped(self):
+        attack='</template><img src=x onerror="evil()">'
+        o=worker_sample(thread_id=attack,coordinator='owner '+attack,source_ref='dispatch:'+attack);r=self.emit(o)
+        o=self.advance(r,o,state='running',observed_at_ms=200);r=self.emit(o)
+        d=self.snapshot();parser=BoardParser();parser.feed(render(d));visible=' '.join(parser.visible)
+        self.assertIn('觀測到 running',visible);self.assertIn('1970/01/01',visible);self.assertIn('非即時監控',visible)
+        self.assertNotIn('worker 狀態未觀測',visible);self.assertIn('dispatch:'+attack,' '.join(parser.detail_text));self.assertEqual([],parser.bad_tags)
+        h={**worker_handoff(True),'owner':'next '+attack,'next_step':'review '+attack,'result_source_ref':'read:'+attack}
+        o=self.advance(r,o,state='failed',source_ref='terminal:'+attack,handoff=h);self.assertEqual('accepted',self.emit(o)['result'])
+        html=render(self.snapshot());parser=BoardParser();parser.feed(html);detail=' '.join(parser.detail_text)
+        for text in ('觀測到 failed','acknowledged','next '+attack,'review '+attack,'read:'+attack):self.assertIn(text,detail)
+        self.assertEqual([],parser.bad_tags);self.assertEqual(1,len(parser.scripts))
+        digest=base64.b64encode(hashlib.sha256(PANEL_SCRIPT.encode()).digest()).decode();self.assertIn("script-src 'sha256-"+digest+"'",parser.csp)
+        self.assertEqual(PANEL_SCRIPT,html.split('<script>')[1].split('</script>')[0])
+    def test_pause_pending_is_distinct_from_observed_stopped(self):
+        o=worker_sample();r=self.emit(o)
+        self.assertEqual('accepted',self.send({'card_id':'c','expected_revision':1,'actor':'owner'},command='pause')['result'])
+        page=self.snapshot();item=project(page)[0];self.assertEqual('暫停待確認',item['display_group']);self.assertEqual('submitted',item['worker_observation']['state'])
+        self.assertNotIn('觀測到 stopped',render(page))
+        o=self.advance(r,o,state='stopped',handoff=worker_handoff(),source_ref='synthetic:terminal-read');self.assertEqual('accepted',self.emit(o)['result'])
+        page=self.snapshot();item=project(page)[0];self.assertEqual('暫停待確認',item['display_group']);self.assertEqual('stopped',item['worker_observation']['state'])
+        html=render(page);self.assertIn('觀測到 stopped',html);self.assertIn('pending（尚未生效）',html)
+
+
+class AcceptanceViewTests(unittest.TestCase):
+    setUp=worker_fixtures.WorkerObservationTests.setUp
+    payload=worker_fixtures.WorkerObservationTests.payload
+    send=worker_fixtures.WorkerObservationTests.send
+    card=worker_fixtures.WorkerObservationTests.card
+    emit=worker_fixtures.WorkerObservationTests.emit
+    advance=worker_fixtures.WorkerObservationTests.advance
+    def accept(self,**changes):
+        fields={'expected_revision':self.card()['revision'],'actor':'USER','report_status':'reported_done','summary':'使用者驗收通過：synthetic acceptance','decision':'接受目前範圍；正式驗證另列','source_refs':['synthetic:user'],**changes}
+        return self.send(self.payload(**fields))
+    def snapshot(self):
+        from orchestrator.kanban.read import page_snapshot
+        return page_snapshot(self.home)
+    def parser(self,d,**options):
+        parser=BoardParser();parser.feed(render(d,**options));return parser
+    def test_acceptance_delivery_and_formal_evidence_are_distinct(self):
+        self.assertEqual('accepted',self.accept()['result'])
+        self.assertEqual('accepted',self.send(self.payload(expected_revision=1,report_status='reported_done',summary='Candidate delivery only'))['result'])
+        d=self.snapshot();p=project(d)[0];parser=self.parser(d);visible=' '.join(parser.visible);detail=' '.join(parser.detail_text)
+        self.assertEqual('delivered',p['delivery_report']['state']);self.assertTrue(p['user_acceptance']['acceptance_recorded']);self.assertEqual('完成',p['display_group'])
+        for text in ('助手回報交付','已記錄使用者驗收','未綁目前候選','正式驗證：未有可核對紀錄','使用者驗收已記錄；技術／正式驗證另列'):self.assertIn(text,visible)
+        self.assertNotIn('未驗收',visible);self.assertNotIn('未驗收',detail);self.assertIn('USER 僅為來源歸屬標記，不是身份驗證',detail)
+        self.assertIn('不表示從未執行',detail);self.assertNotEqual('已驗',p['display_group'])
+    def test_latest_USER_does_not_masquerade_as_assistant_delivery_or_change_writer(self):
+        self.assertEqual('accepted',self.send(self.payload())['result']);self.assertEqual('accepted',self.accept()['result'])
+        d=self.snapshot();p=project(d)[0]
+        self.assertEqual('完成',p['group']);self.assertIsNone(p['workflow_reason']) # unchanged writer classification
+        self.assertEqual('實作中',p['display_group']);self.assertEqual('in_progress',p['delivery_report']['record']['report_status'])
+        visible=' '.join(self.parser(d).visible);self.assertIn('助手回報進行中',visible);self.assertIn('已記錄使用者驗收',visible)
+        placement=self.send({'card_id':'c','expected_revision':2,'actor':'owner','destination':'backlog','user_request':'synthetic selection'},command='place')
+        self.assertEqual('backlog_requires_effective_pending',placement['reason'])
+    def test_later_nonacceptance_USER_report_does_not_imply_withdrawal(self):
+        self.accept();self.accept(report_status='in_progress',summary='最新 USER 進度說明')
+        self.assertEqual('accepted',self.send(self.payload(expected_revision=2,report_status='reported_done'))['result'])
+        p=project(self.snapshot())[0];self.assertFalse(p['user_acceptance']['acceptance_recorded']);self.assertEqual('incomplete',p['user_acceptance']['state'])
+        parser=self.parser(self.snapshot());visible=' '.join(parser.visible);detail=' '.join(parser.detail_text)
+        self.assertIn('USER 回報／驗收資料不足',visible);self.assertIn('不由此推定目前是否驗收',visible)
+        self.assertNotIn('未驗收',visible);self.assertNotIn('未驗收',detail);self.assertIn('不解讀為批准或撤回',detail)
+    def test_USER_text_escaping_CSP_lazy_and_detail(self):
+        attack='</template><img src=x onerror="evil()">'
+        # Build a canonical fixture event, retaining the existing USER protocol.
+        p=self.payload(actor='USER',report_status='reported_done',summary='使用者驗收通過：'+attack,decision=attack,source_refs=['javascript:'+attack])
+        self.assertEqual('accepted',self.send(p)['result']);d=self.snapshot()
+        for lazy in (False,True):
+            parser=self.parser(d,lazy=lazy);html=render(d,lazy=lazy)
+            self.assertEqual([],parser.bad_tags);self.assertEqual(1,len(parser.scripts));self.assertIn('已記錄使用者驗收',' '.join(parser.visible))
+            digest=base64.b64encode(hashlib.sha256(PANEL_SCRIPT.encode()).digest()).decode();self.assertIn("script-src 'sha256-"+digest+"'",parser.csp)
+            self.assertEqual(PANEL_SCRIPT,html.split('<script>')[1].split('</script>')[0])
+        from orchestrator.kanban.read import page_snapshot
+        from orchestrator.kanban.view import detail_fragment
+        detail=page_snapshot(self.home,detail=d['cards'][0]['_detail_token']);fragment=detail_fragment(detail);parser=BoardParser();parser.feed(fragment)
+        self.assertEqual([],parser.bad_tags);self.assertEqual([],parser.scripts);self.assertIn(attack,' '.join(parser.detail_text));self.assertIn('javascript:'+attack,' '.join(parser.detail_text))
+    def test_scope_closed_hint_is_not_a_new_reconciliation_todo(self):
+        o=worker_sample();first=self.emit(o);o=self.advance(first,o,state='completed',source_ref='synthetic:terminal-read',handoff=worker_handoff(True));terminal=self.emit(o)
+        self.assertEqual('accepted',self.send({'card_id':'c','expected_revision':2,'actor':'owner','fields':{'repo_path':'B'}},command='edit')['result'])
+        d=self.snapshot();p=project(d)[0];self.assertIsNone(p['worker_observation']);self.assertIn('舊 scope 已收尾',p['worker_observation_note']);self.assertNotIn('reconciliation',p['worker_observation_note'])
+        self.assertIn('舊 scope 已收尾',' '.join(self.parser(d).visible));self.assertNotIn('需 reconciliation',' '.join(self.parser(d).detail_text))
+        new=worker_sample(supersedes_attempt_id=o['attempt_id'],previous_observation_operation_id=terminal['operation_id']);self.assertEqual('accepted',self.emit(new)['result'])
+        self.assertEqual('accepted',self.send({'card_id':'c','expected_revision':4,'actor':'owner','fields':{'repo_path':'C'}},command='edit')['result'])
+        p=project(self.snapshot())[0];self.assertIsNone(p['worker_observation']);self.assertIn('需 reconciliation',p['worker_observation_note'])

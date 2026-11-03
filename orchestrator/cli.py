@@ -321,6 +321,7 @@ def _add_kanban_parsers(subparsers: argparse._SubParsersAction) -> None:
     report.add_argument("--blocker")
     report.add_argument("--decision")
     report.add_argument("--next-step")
+    report.add_argument("--worker-observation", help="versioned observation JSON; metadata only")
     report.add_argument("--source-ref", action="append", default=[], dest="source_refs",
                         help="source pointer as text only; repeat as needed")
 
@@ -436,6 +437,14 @@ def _kanban_payload(args: argparse.Namespace) -> dict:
     if command == "report-progress":
         payload.update({key: getattr(args, key) for key in (
             "report_status", "summary", "blocker", "decision", "next_step", "source_refs")})
+        if args.worker_observation is not None:
+            try:
+                observation = json.loads(args.worker_observation)
+                if not isinstance(observation, dict):
+                    raise ValueError('object required')
+            except ValueError as exc:
+                raise ControllerError(f"--worker-observation must be a JSON object: {exc}") from exc
+            payload['worker_observation'] = observation
     if command == "done":
         try:
             binding = json.loads(args.binding.read_text(encoding="utf-8"))

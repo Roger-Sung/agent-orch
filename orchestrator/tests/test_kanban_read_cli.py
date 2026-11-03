@@ -52,3 +52,12 @@ class ProgressCliTests(unittest.TestCase):
             for argv in [self.args()[:-4]+['--report-status','verified_done'],['kanban','report-progress','--card','c','--expected-revision','0','--report-status','in_progress']]:
                 with self.assertRaises(SystemExit) as error:cli.build_parser().parse_args(argv)
                 self.assertEqual(2,error.exception.code)
+    def test_optional_worker_JSON_payload_and_legacy_omission(self):
+        from orchestrator.tests.test_kanban_commands import worker_sample
+        observation=worker_sample()
+        parsed=cli.build_parser().parse_args(self.args()+['--worker-observation',json.dumps(observation)])
+        self.assertEqual(observation,cli._kanban_payload(parsed)['worker_observation'])
+        self.assertNotIn('worker_observation',cli._kanban_payload(cli.build_parser().parse_args(self.args())))
+        for raw in ('not JSON','null','[]','true'):
+            with self.subTest(raw=raw):
+                with self.assertRaises(cli.ControllerError):cli._kanban_payload(cli.build_parser().parse_args(self.args()+['--worker-observation',raw]))

@@ -1385,3 +1385,127 @@ class ReportProgressConcurrencyTests(unittest.TestCase):
         outcome=self.send(operation=operation)
         self.assertTrue(outcome['replayed']);self.assertEqual(2,self.card()['revision'])
         self.assertIsNone(progress_project(progress_snapshot(self.home,at_ms=1000))[0]['progress_report'])
+
+
+def worker_sample(**changes):
+    return {'schema_version':1,'attempt_id':str(uuid.uuid4()),'supersedes_attempt_id':None,
+            'previous_observation_operation_id':None,'provider':'openai','thread_id':'synthetic-thread',
+            'turn_id':None,'coordinator':'synthetic-owner','observed_at_ms':100,'state':'submitted',
+            'source_ref':'synthetic:dispatch','handoff':None,**changes}
+
+
+def worker_handoff(acknowledged=False):
+    return {'state':'acknowledged' if acknowledged else 'pending','owner':'next-owner' if acknowledged else None,
+            'next_step':'Read candidate' if acknowledged else None,'result_source_ref':'synthetic:terminal-read' if acknowledged else None}
+
+
+class WorkerObservationTests(unittest.TestCase):
+    setUp=ReportProgressTests.setUp
+    payload=ReportProgressTests.payload
+    send=ReportProgressTests.send
+    card=ReportProgressTests.card
+    def emit(self, observation, operation=None, **changes):
+        refs=[observation['source_ref']] if isinstance(observation,dict) and isinstance(observation.get('source_ref'),str) else []
+        h=observation.get('handoff') if isinstance(observation,dict) else None
+        if isinstance(h,dict) and h.get('result_source_ref'):refs.append(h['result_source_ref'])
+        return self.send(self.payload(expected_revision=self.card()['revision'],worker_observation=observation,source_refs=refs,**changes),operation)
+    def advance(self, previous, observation, **changes):
+        return {**observation,'previous_observation_operation_id':previous['operation_id'],**changes}
+    def terminal(self,state='completed',acknowledged=True):
+        o=worker_sample();r=self.emit(o);o=self.advance(r,o,state=state,handoff=worker_handoff(acknowledged),source_ref='synthetic:terminal-read');return o,self.emit(o)
+    def test_first_observation_requires_submitted_with_null_predecessors(self):
+        for changes in ({'state':'running'},{'previous_observation_operation_id':str(uuid.uuid4())},{'supersedes_attempt_id':str(uuid.uuid4())},{'state':'completed','handoff':worker_handoff(True)}):
+            with self.subTest(changes=changes):
+                self.assertEqual('worker_initial_submission_required',self.emit(worker_sample(**changes))['reason'])
+                self.assertEqual(0,self.card()['revision'])
+        self.assertEqual('accepted',self.emit(worker_sample())['result'])
+    def test_lineage_ordinary_reports_and_metadata_only(self):
+        before=self.card();o=worker_sample();first=self.emit(o);self.assertEqual('accepted',first['result'])
+        self.assertEqual('accepted',self.send(self.payload(expected_revision=1))['result'])
+        o=self.advance(first,o,state='running',turn_id='turn-1',observed_at_ms=90);running=self.emit(o)
+        self.assertEqual('accepted',running['result']) # canonical revision wins over caller time
+        item=progress_project(progress_snapshot(self.home))[0];self.assertEqual('running',item['worker_observation']['state'])
+        o=self.advance(running,o,state='completed',handoff=worker_handoff(),source_ref='synthetic:terminal-read');terminal=self.emit(o);self.assertEqual('accepted',terminal['result'])
+        new=worker_sample(supersedes_attempt_id=o['attempt_id'],previous_observation_operation_id=terminal['operation_id'])
+        self.assertEqual('worker_handoff_required',self.emit(new)['reason'])
+        o=self.advance(terminal,o,handoff=worker_handoff(True));ack=self.emit(o);self.assertEqual('accepted',ack['result'])
+        new['previous_observation_operation_id']=ack['operation_id'];self.assertEqual('accepted',self.emit(new)['result'])
+        after=self.card()
+        self.assertEqual({k:v for k,v in before.items() if k not in {'revision','updated_at'}},{k:v for k,v in after.items() if k not in {'revision','updated_at'}})
+        for row in self.conn.execute("SELECT metadata_delta FROM kanban_events WHERE result='accepted' AND kind='report-progress'"):
+            self.assertIs(False,json.loads(row[0])['execution_verified'])
+    def test_strict_nested_grammar_and_sources(self):
+        import copy
+        invalid=[]
+        for key,value in [('schema_version',True),('schema_version',1.0),('schema_version',2),('attempt_id','not-uuid'),('observed_at_ms',True),('observed_at_ms',-1),('observed_at_ms',1<<63),('state',[]),('state','paused'),('provider',''),('thread_id','x'*501),('turn_id',False),('coordinator',''),('source_ref',''),('source_ref',PLAN_BEGIN)]:
+            invalid.append(worker_sample(**{key:value}))
+        invalid.extend([None,[],{**worker_sample(),'extra':1},worker_sample(handoff=worker_handoff()),worker_sample(state='completed'),worker_sample(state='completed',handoff={'state':'pending'})])
+        for key in ('state','owner','next_step','result_source_ref'):
+            h=worker_handoff(True);h[key]=True;invalid.append(worker_sample(state='failed',handoff=h))
+        invalid.extend([worker_sample(state='completed',handoff={**worker_handoff(True),'extra':1}),worker_sample(state='completed',handoff={**worker_handoff(True),'owner':None}),worker_sample(state='completed',handoff={**worker_handoff(True),'next_step':PLAN_BEGIN})])
+        for o in invalid:
+            with self.subTest(observation=o):
+                before=self.card();self.assertEqual('rejected',self.emit(copy.deepcopy(o))['result']);self.assertEqual(before,self.card())
+        o=worker_sample();p=self.payload(worker_observation=o,source_refs=[]);self.assertEqual('invalid_worker_observation',self.send(p)['reason'])
+        o=worker_sample(state='failed',handoff={**worker_handoff(True),'result_source_ref':'missing:source'})
+        self.assertEqual('invalid_worker_handoff',self.send(self.payload(worker_observation=o,source_refs=[o['source_ref']]))['reason'])
+    def test_predecessors_identity_turn_and_late_submitted(self):
+        o=worker_sample();first=self.emit(o)
+        for change in ({'provider':'other'},{'thread_id':'other'},{'coordinator':'other'},{'supersedes_attempt_id':str(uuid.uuid4())}):
+            self.assertEqual('worker_identity_conflict',self.emit(self.advance(first,o,**change))['reason'])
+        running=self.advance(first,o,state='running',turn_id='turn-1');r=self.emit(running)
+        self.assertEqual('worker_observation_conflict',self.emit(o)['reason']) # late old submitted, even with fresh card revision
+        self.assertEqual('worker_observation_conflict',self.emit(self.advance(first,o,state='running'))['reason'])
+        self.assertEqual('worker_identity_conflict',self.emit(self.advance(r,running,turn_id='turn-2'))['reason'])
+        self.assertEqual('worker_state_regression',self.emit(self.advance(r,running,state='submitted'))['reason'])
+        new=worker_sample(supersedes_attempt_id=o['attempt_id'],previous_observation_operation_id=r['operation_id'])
+        self.assertEqual('worker_handoff_required',self.emit(new)['reason'])
+    def test_terminal_states_only_supplement_handoff(self):
+        o,r=self.terminal('failed',False)
+        for state in ('submitted','running','unknown','completed','stopped'):
+            h=worker_handoff() if state in ('completed','stopped') else None
+            self.assertEqual('worker_terminal_immutable',self.emit(self.advance(r,o,state=state,handoff=h))['reason'])
+        for change in ({'source_ref':'new:source'},{'observed_at_ms':101},{'turn_id':'new-turn'}):
+            self.assertEqual('worker_terminal_immutable',self.emit(self.advance(r,o,**change))['reason'])
+        o=self.advance(r,o,handoff=worker_handoff(True));ack=self.emit(o)
+        self.assertEqual('accepted',ack['result'])
+        self.assertEqual('worker_handoff_regression',self.emit(self.advance(ack,o,handoff=worker_handoff()))['reason'])
+        h={**o['handoff'],'owner':'changed'};self.assertEqual('worker_handoff_regression',self.emit(self.advance(ack,o,handoff=h))['reason'])
+    def test_replay_payload_conflict_and_historical_attempt_reuse(self):
+        o,r=self.terminal();new=worker_sample(supersedes_attempt_id=o['attempt_id'],previous_observation_operation_id=r['operation_id'])
+        op=str(uuid.uuid4());p=self.payload(expected_revision=self.card()['revision'],worker_observation=new,source_refs=[new['source_ref']]);accepted=self.send(p,op)
+        self.assertEqual('accepted',accepted['result']);self.assertTrue(self.send(p,op)['replayed'])
+        self.assertEqual('idempotency_conflict',self.send({**p,'worker_observation':{**new,'thread_id':'different'}},op)['reason'])
+        terminal=self.advance(accepted,new,state='stopped',handoff=worker_handoff(True),source_ref='synthetic:terminal-read');done=self.emit(terminal)
+        reused=worker_sample(attempt_id=o['attempt_id'],supersedes_attempt_id=new['attempt_id'],previous_observation_operation_id=done['operation_id'])
+        self.assertEqual('worker_attempt_reused',self.emit(reused)['reason'])
+    def test_scope_ABA_terminal_cleanup_does_not_revive_old_attempt(self):
+        o=worker_sample();first=self.emit(o)
+        for fields in ({'repo_path':'scope-B'},{'repo_path':None},{'title':'description'}):
+            self.assertEqual('accepted',self.send({'card_id':'c','expected_revision':self.card()['revision'],'actor':'owner','fields':fields},command='edit')['result'])
+        self.assertEqual('accepted',self.send(self.payload(expected_revision=self.card()['revision']))['result'])
+        self.assertIsNone(progress_project(progress_snapshot(self.home))[0]['worker_observation'])
+        self.assertEqual('worker_scope_reconciliation_required',self.emit(self.advance(first,o,state='running'))['reason'])
+        terminal=self.advance(first,o,state='completed',handoff=worker_handoff(True),source_ref='synthetic:terminal-read');r=self.emit(terminal);self.assertEqual('accepted',r['result'])
+        item=progress_project(progress_snapshot(self.home))[0];self.assertIsNone(item['worker_observation']);self.assertIn('失效',item['worker_observation_note'])
+        event=json.loads(self.conn.execute('SELECT payload FROM kanban_events WHERE operation_id=?',(r['operation_id'],)).fetchone()[0]);self.assertEqual(1,event['worker_binding']['started_revision'])
+        reused=worker_sample(attempt_id=o['attempt_id'],supersedes_attempt_id=o['attempt_id'],previous_observation_operation_id=r['operation_id'])
+        self.assertEqual('worker_identity_conflict',self.emit(reused)['reason'])
+        new=worker_sample(supersedes_attempt_id=o['attempt_id'],previous_observation_operation_id=r['operation_id']);self.assertEqual('accepted',self.emit(new)['result'])
+        self.assertEqual(new['attempt_id'],progress_project(progress_snapshot(self.home))[0]['worker_observation']['attempt_id'])
+    def test_competing_new_attempts_have_one_CAS_winner(self):
+        o,r=self.terminal();revision=self.card()['revision'];barrier=threading.Barrier(2);results=[];errors=[]
+        def writer_thread():
+            conn=sqlite3.connect(self.home/'orchestrator.db',isolation_level=None,timeout=5);conn.row_factory=sqlite3.Row
+            try:
+                new=worker_sample(supersedes_attempt_id=o['attempt_id'],previous_observation_operation_id=r['operation_id'])
+                payload=self.payload(expected_revision=revision,worker_observation=new,source_refs=[new['source_ref']]);barrier.wait(timeout=5)
+                results.append(handle_request(SimpleNamespace(conn=conn,home=self.home),build_request('report-progress',payload)))
+            except Exception as exc:errors.append(exc)
+            finally:conn.close()
+        threads=[threading.Thread(target=writer_thread) for _ in range(2)]
+        for thread in threads:thread.start()
+        for thread in threads:thread.join(timeout=10)
+        self.assertFalse(any(t.is_alive() for t in threads));self.assertEqual([],errors)
+        self.assertEqual(['accepted','rejected'],sorted(x['result'] for x in results));self.assertEqual(revision+1,self.card()['revision'])
+        self.assertEqual(['revision_conflict'],[x['reason'] for x in results if x['result']=='rejected'])

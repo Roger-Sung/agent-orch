@@ -35,6 +35,148 @@ class BacklogTests(unittest.TestCase):
         return self.send('report-progress',{'card_id':ident,'expected_revision':revision,'actor':'assistant','report_status':status,'summary':'safe summary','source_refs':[]})
     def item(self,data,ident):
         return next(p for p in project(data) if p['card']['card_id']==ident)
+    def worker(self,ident,observation):
+        revision=self.conn.execute('SELECT revision FROM kanban_cards WHERE card_id=?',(ident,)).fetchone()[0]
+        refs=[observation['source_ref']]
+        if observation['handoff'] and observation['handoff']['result_source_ref']:refs.append(observation['handoff']['result_source_ref'])
+        return self.send('report-progress',{'card_id':ident,'expected_revision':revision,'actor':'assistant','report_status':'in_progress','summary':'Worker observation, synthetic only','source_refs':refs,'worker_observation':observation})
+    def user_accept(self,ident,**changes):
+        revision=self.conn.execute('SELECT revision FROM kanban_cards WHERE card_id=?',(ident,)).fetchone()[0]
+        return self.send('report-progress',{'card_id':ident,'expected_revision':revision,'actor':'USER','report_status':'reported_done','summary':'使用者驗收通過：synthetic instruction and timestamp','decision':'接受此候選範圍；正式驗證另列','source_refs':['synthetic:user-instruction'],**changes})
+    def test_USER_record_survives_worker_and_over_50_reports_readonly(self):
+        from orchestrator.tests.test_kanban_commands import worker_sample,worker_handoff
+        self.card('c');accepted=self.user_accept('c');self.assertEqual('accepted',accepted['result'])
+        o=worker_sample();first=self.worker('c',o);o={**o,'previous_observation_operation_id':first['operation_id'],'state':'completed','source_ref':'synthetic:terminal-read','handoff':worker_handoff(True)}
+        self.assertEqual('accepted',self.worker('c',o)['result'])
+        for revision in range(3,64):self.assertEqual('accepted',self.report('c','blocked',revision)['result'])
+        before=list(self.conn.iterdump());page=read.page_snapshot(self.home);p=self.item(page,'c');detail=read.page_snapshot(self.home,detail=p['card']['_detail_token'])
+        self.assertLessEqual(len(page['events']),3);self.assertTrue(detail['history_truncated']['c']['events'])
+        for snapshot in (page,detail):
+            item=self.item(snapshot,'c');u=item['user_acceptance'];self.assertTrue(u['acceptance_recorded']);self.assertEqual(accepted['operation_id'],u['record']['operation_id'])
+            self.assertEqual('未綁目前候選',u['candidate_binding']);self.assertEqual('completed',item['worker_observation']['state'])
+            self.assertEqual('blocked',item['delivery_report']['record']['report_status']);self.assertEqual('progress',item['delivery_report']['state']);self.assertEqual('工程受阻',item['display_group'])
+            self.assertTrue(item['formal_verification_note'].startswith('未有可核對紀錄'))
+        self.assertIn('已記錄使用者驗收',render(page,lazy=True));self.assertIn('synthetic:user-instruction',detail_fragment(detail))
+        self.assertEqual(before,list(self.conn.iterdump()))
+    def test_USER_acceptance_summary_detail_backlog_and_archive_consistent(self):
+        self.card('board');self.create('backlog')
+        for ident,backlog in (('board',False),('backlog',True)):
+            accepted=self.user_accept(ident);self.assertEqual('accepted',accepted['result']);self.assertEqual('accepted',self.report(ident,'reported_done',1)['result'])
+            before=list(self.conn.iterdump());page=read.page_snapshot(self.home,backlog=backlog);item=self.item(page,ident);detail=read.page_snapshot(self.home,backlog=backlog,detail=item['card']['_detail_token'])
+            self.assertEqual(item['user_acceptance'],self.item(detail,ident)['user_acceptance'])
+            for html in (render(page,backlog=backlog),detail_fragment(detail,backlog=backlog)):
+                self.assertIn('使用者驗收已記錄；技術／正式驗證另列',html);self.assertIn('未綁目前候選',html)
+            self.assertEqual(before,list(self.conn.iterdump()))
+            self.assertEqual('accepted',self.send('archive',{'card_id':ident,'expected_revision':2,'actor':'fixture-owner'})['result'])
+            page=read.page_snapshot(self.home,archived=True);item=self.item(page,ident);detail=read.page_snapshot(self.home,archived=True,detail=item['card']['_detail_token'])
+            self.assertEqual('封存',item['display_group']);self.assertTrue(item['user_acceptance']['acceptance_recorded'])
+            self.assertIn('使用者驗收已記錄；技術／正式驗證另列',detail_fragment(detail,archived=True))
+    def test_latest_USER_incomplete_nonacceptance_or_malformed_never_falls_back(self):
+        self.card('c');old=self.user_accept('c');latest=self.user_accept('c',source_refs=[]);self.assertEqual('accepted',latest['result'])
+        self.assertEqual('accepted',self.report('c','blocked',2)['result'])
+        item=self.item(read.page_snapshot(self.home),'c');u=item['user_acceptance'];self.assertEqual('incomplete',u['state']);self.assertFalse(u['acceptance_recorded']);self.assertEqual(latest['operation_id'],u['record']['operation_id'])
+        self.corrupt();original=json.loads(self.conn.execute('SELECT payload FROM kanban_events WHERE operation_id=?',(latest['operation_id'],)).fetchone()[0])
+        cases=[('not JSON','USER'),(json.dumps({**original,'actor':'assistant'}),'USER'),(json.dumps(original),'assistant'),(json.dumps({**original,'progress_binding':None}),'USER')]
+        for raw,actor in cases:
+            with self.subTest(raw=raw,actor=actor):
+                self.conn.execute('UPDATE kanban_events SET payload=?,actor=? WHERE operation_id=?',(raw,actor,latest['operation_id']))
+                page=read.page_snapshot(self.home);p=self.item(page,'c');detail=read.page_snapshot(self.home,detail=p['card']['_detail_token'])
+                for snapshot in (page,detail):
+                    u=self.item(snapshot,'c')['user_acceptance'];self.assertEqual('unknown',u['state']);self.assertFalse(u['acceptance_recorded']);self.assertIn('不回退',u['note']);self.assertEqual(raw,u['raw_payload'])
+        # A later legitimate USER report is content, neither acceptance nor withdrawal.
+        newer=self.user_accept('c',report_status='in_progress',summary='最新 USER 進度說明',decision='仍在討論範圍');self.assertEqual('accepted',newer['result'])
+        u=self.item(read.page_snapshot(self.home),'c')['user_acceptance'];self.assertEqual('incomplete',u['state']);self.assertFalse(u['acceptance_recorded']);self.assertEqual('最新 USER 進度說明',u['record']['summary']);self.assertIn('不解讀為批准或撤回',u['note'])
+    def test_USER_scope_ABA_and_generation_invalidate_but_description_does_not(self):
+        self.card('c');self.user_accept('c')
+        self.assertEqual('accepted',self.send('edit',{'card_id':'c','expected_revision':1,'actor':'owner','fields':{'title':'description'}})['result'])
+        self.assertTrue(self.item(read.page_snapshot(self.home),'c')['user_acceptance']['acceptance_recorded'])
+        for revision,fields in ((2,{'repo_path':'B'}),(3,{'repo_path':None}),(4,{'note':'later description'})):
+            self.assertEqual('accepted',self.send('edit',{'card_id':'c','expected_revision':revision,'actor':'owner','fields':fields})['result'])
+        self.assertEqual('accepted',self.report('c','in_progress',5)['result'])
+        page=read.page_snapshot(self.home);p=self.item(page,'c');detail=read.page_snapshot(self.home,detail=p['card']['_detail_token'])
+        for snapshot in (page,detail):
+            u=self.item(snapshot,'c')['user_acceptance'];self.assertEqual('historical',u['state']);self.assertEqual('歷史驗收；不適用目前 scope',u['label']);self.assertFalse(u['acceptance_recorded'])
+        self.assertEqual('accepted',self.user_accept('c')['result']);self.assertTrue(self.item(read.page_snapshot(self.home),'c')['user_acceptance']['acceptance_recorded'])
+        self.conn.execute("UPDATE kanban_cards SET approval_generation=approval_generation+1 WHERE card_id='c'")
+        self.assertEqual('historical',self.item(read.page_snapshot(self.home),'c')['user_acceptance']['state'])
+    def test_USER_unknown_scope_barrier_is_not_effective_acceptance(self):
+        self.card('c');self.user_accept('c');edit=self.send('edit',{'card_id':'c','expected_revision':1,'actor':'owner','fields':{'note':'descriptive edit'}})
+        self.assertEqual('accepted',edit['result']);self.corrupt();self.conn.execute('UPDATE kanban_events SET metadata_delta=? WHERE operation_id=?',('null',edit['operation_id']))
+        self.assertEqual('accepted',self.report('c','blocked',2)['result'])
+        page=read.page_snapshot(self.home);item=self.item(page,'c');detail=read.page_snapshot(self.home,detail=item['card']['_detail_token'])
+        for snapshot in (page,detail):
+            u=self.item(snapshot,'c')['user_acceptance'];self.assertFalse(u['acceptance_recorded']);self.assertEqual('unknown',u['state'])
+    def test_USER_record_does_not_bind_current_candidate_or_imply_formal_PASS(self):
+        self.card('c');self.conn.execute("UPDATE kanban_cards SET candidate_fingerprint=? WHERE card_id='c'",('a'*64,));self.user_accept('c')
+        self.assertEqual('accepted',self.send('report-progress',{'card_id':'c','expected_revision':1,'actor':'assistant','report_status':'reported_done','summary':'PASS 部署成功 is unverified source prose','source_refs':['synthetic:claim']})['result'])
+        before=list(self.conn.iterdump());item=self.item(read.page_snapshot(self.home),'c')
+        self.assertEqual('delivered',item['delivery_report']['state']);self.assertTrue(item['user_acceptance']['acceptance_recorded'])
+        self.assertEqual('未綁目前候選',item['user_acceptance']['candidate_binding']);self.assertNotIn('candidate_fingerprint',item['user_acceptance']['record'])
+        self.assertNotEqual('已驗',item['group']);self.assertNotEqual('已驗',item['display_group']);self.assertTrue(item['formal_verification_note'].startswith('未有可核對紀錄'));self.assertIn('不表示從未執行',item['formal_verification_note'])
+        self.assertEqual(before,list(self.conn.iterdump()))
+    def test_worker_survives_ordinary_reports_over_history_limit(self):
+        from orchestrator.tests.test_kanban_commands import worker_sample
+        self.card('c');o=worker_sample();r=self.worker('c',o);self.assertEqual('accepted',r['result'])
+        o={**o,'state':'running','previous_observation_operation_id':r['operation_id'],'observed_at_ms':50};r=self.worker('c',o)
+        for revision in range(2,63):self.assertEqual('accepted',self.report('c','in_progress',revision)['result'])
+        summary=read.page_snapshot(self.home);item=self.item(summary,'c');detail=read.page_snapshot(self.home,detail=item['card']['_detail_token'])
+        self.assertLessEqual(len(summary['events']),3)
+        self.assertTrue(detail['history_truncated']['c']['events']);self.assertEqual(50,len(detail['events']))
+        self.assertEqual(item['worker_observation'],self.item(detail,'c')['worker_observation'])
+        self.assertEqual(r['operation_id'],item['worker_observation']['operation_id']);self.assertEqual('running',item['worker_observation']['state'])
+        self.assertEqual('safe summary',item['progress_report']['summary'])
+        self.assertIn('synthetic:dispatch',detail_fragment(detail));self.assertIn('觀測到 running',render(summary,lazy=True))
+    def test_scope_barrier_cleanup_remains_historical_in_both_views(self):
+        from orchestrator.tests.test_kanban_commands import worker_sample,worker_handoff
+        self.card('c');o=worker_sample();r=self.worker('c',o)
+        for revision,fields in ((1,{'repo_path':'B'}),(2,{'repo_path':None}),(3,{'title':'new title'})):
+            self.assertEqual('accepted',self.send('edit',{'card_id':'c','expected_revision':revision,'actor':'owner','fields':fields})['result'])
+        o={**o,'state':'completed','source_ref':'synthetic:terminal-read','handoff':worker_handoff(True),'previous_observation_operation_id':r['operation_id']};terminal=self.worker('c',o);self.assertEqual('accepted',terminal['result'])
+        self.assertEqual('accepted',self.report('c','blocked',5)['result'])
+        summary=read.page_snapshot(self.home);item=self.item(summary,'c');detail=read.page_snapshot(self.home,detail=item['card']['_detail_token'])
+        for snapshot in (summary,detail):
+            p=self.item(snapshot,'c');self.assertIsNone(p['worker_observation']);self.assertIn('失效',p['worker_observation_note'])
+            self.assertEqual('blocked',p['progress_report']['report_status'])
+        new=worker_sample(supersedes_attempt_id=o['attempt_id'],previous_observation_operation_id=terminal['operation_id'])
+        self.assertEqual('accepted',self.worker('c',new)['result'])
+        self.assertEqual(new['attempt_id'],self.item(read.page_snapshot(self.home),'c')['worker_observation']['attempt_id'])
+    def test_malformed_latest_observation_never_falls_back_after_plain_report(self):
+        from orchestrator.tests.test_kanban_commands import worker_sample
+        self.card('c');o=worker_sample();first=self.worker('c',o);o={**o,'state':'running','previous_observation_operation_id':first['operation_id']};latest=self.worker('c',o)
+        self.corrupt();row=self.conn.execute('SELECT payload FROM kanban_events WHERE operation_id=?',(latest['operation_id'],)).fetchone();payload=json.loads(row[0]);payload['worker_observation']['schema_version']=True
+        self.conn.execute('UPDATE kanban_events SET payload=? WHERE operation_id=?',(json.dumps(payload),latest['operation_id']))
+        self.assertEqual('accepted',self.report('c','in_progress',2)['result'])
+        summary=read.page_snapshot(self.home);item=self.item(summary,'c');detail=read.page_snapshot(self.home,detail=item['card']['_detail_token'])
+        for snapshot in (summary,detail):
+            p=self.item(snapshot,'c');self.assertIsNone(p['worker_observation']);self.assertIn('不回退',p['worker_observation_note']);self.assertIsNotNone(p['progress_report'])
+        # Invalid JSON and valid non-object JSON cannot disappear in summary SQL.
+        for raw in ('null','[]','not JSON'):
+            self.conn.execute('UPDATE kanban_events SET payload=? WHERE operation_id=?',(raw,latest['operation_id']))
+            page=read.page_snapshot(self.home);p=self.item(page,'c');self.assertIsNone(p['worker_observation']);self.assertIn('不回退',p['worker_observation_note'])
+            self.assertIsNotNone(p['progress_report'])
+    def test_backlog_reported_done_keeps_unverified_warning_in_detail(self):
+        self.create('c');self.assertEqual('accepted',self.report('c','reported_done')['result'])
+        page=read.page_snapshot(self.home,backlog=True);item=self.item(page,'c');self.assertEqual('完成',item['display_group'])
+        detail=read.page_snapshot(self.home,backlog=True,detail=item['card']['_detail_token'])
+        for html in (render(page,backlog=True),detail_fragment(detail,backlog=True)):
+            self.assertIn('未驗收',html);self.assertIn('完成證據未驗證',html)
+    def test_display_holds_match_summary_detail_and_preserve_raw_report(self):
+        self.card('engineering');self.task('engineering','waiting_user','dirty_tree')
+        self.assertEqual('accepted',self.send('report-progress',{'card_id':'engineering','expected_revision':0,'actor':'assistant','report_status':'blocked','summary':'Candidate waiting for engineering owner','blocker':'Owner must hand over the committed baseline','decision':None,'source_refs':[]})['result'])
+        self.card('question');self.assertEqual('accepted',self.send('report-progress',{'card_id':'question','expected_revision':0,'actor':'assistant','report_status':'needs_decision','summary':'Scope question','decision':'Which scope?','source_refs':[]})['result'])
+        self.card('manual');self.assertEqual('accepted',self.report('manual','in_progress')['result'])
+        summary=read.page_snapshot(self.home)
+        for ident,expected in (('engineering','工程受阻'),('question','待使用者'),('manual','實作中')):
+            with self.subTest(ident=ident):
+                item=self.item(summary,ident)
+                detail=read.page_snapshot(self.home,detail=item['card']['_detail_token'])
+                self.assertEqual(expected,item['display_group'])
+                self.assertEqual(expected,self.item(detail,ident)['display_group'])
+                self.assertEqual(item['progress_report'],self.item(detail,ident)['progress_report'])
+                fragment=detail_fragment(detail)
+                self.assertIn('未記錄' if ident=='engineering' else 'Which scope?' if ident=='question' else 'worker 狀態未觀測',fragment)
+        self.assertIsNone(self.item(summary,'manual')['workflow_reason'])
+        self.assertIsNone(self.item(summary,'manual')['card']['task_id'])
     def test_all_main_summaries_and_independent_backlog_archive_pages(self):
         for n in range(45):self.card(f'board-{n:03}')
         for n in range(23):self.create(f'backlog-{n:03}')
@@ -112,7 +254,7 @@ class BacklogTests(unittest.TestCase):
         before=list(self.conn.iterdump())
         with patch.object(read,'connect',side_effect=instrument):data=read.page_snapshot(self.home)
         self.assertEqual(25,len(data['cards']));self.assertEqual([],data['events']);self.assertEqual([],data['nights']);self.assertFalse(any('LIMIT 51' in q for q in queries))
-        self.assertEqual(1,queries.count('BEGIN'));self.assertEqual(1,queries.count('COMMIT'));self.assertLess(len(queries),16) # three fixed singleton validation/read queries
+        self.assertEqual(1,queries.count('BEGIN'));self.assertEqual(1,queries.count('COMMIT'));self.assertLess(len(queries),21) # D + C add five bounded observation/attribution/barrier checks, never full histories
         token=data['cards'][0]['_detail_token'];queries.clear()
         with patch.object(read,'connect',side_effect=instrument):detail=read.page_snapshot(self.home,detail=token)
         self.assertEqual(50,len(detail['events']));self.assertEqual(1,len(detail['cards']));self.assertTrue(detail['history_truncated']['c00']['events']);self.assertEqual([],detail['nights'])

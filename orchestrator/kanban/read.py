@@ -71,6 +71,7 @@ def _location(event, revision):
 def _summaries(conn, cards):
     """Batch current evidence and aggregates; never materialize card histories."""
     import json
+    from .commands import WORKER_EVENT_PREDICATE
     data = {"events": [], "nights": [], "tasks": [], "quota": [], "summary_flags": {}, "queue_locations": {}}
     if not cards:
         return data
@@ -81,7 +82,9 @@ def _summaries(conn, cards):
     columns = ','.join(COLUMNS['events'])
     # Current report only; retain the latest actual scope barrier, even if later
     # descriptive edits exist (A -> B -> A must invalidate the old A report).
-    for predicate in ("kind='report-progress'", "kind='edit' AND CASE WHEN json_valid(metadata_delta) THEN CASE WHEN json_type(metadata_delta,'$.scope_fields_changed')='array' THEN json_array_length(metadata_delta,'$.scope_fields_changed')>0 ELSE json_extract(metadata_delta,'$.scope_fields_changed') IS NOT NULL AND json_extract(metadata_delta,'$.scope_fields_changed') NOT IN (0,'') END ELSE 0 END", "kind IN ('place','create')"):
+    user_report = "kind='report-progress' AND (actor='USER' OR CASE WHEN json_valid(payload) THEN json_extract(payload,'$.actor')='USER' ELSE 0 END)"
+    nonuser_report = "kind='report-progress' AND (actor IS NULL OR actor<>'USER')"
+    for predicate in ("kind='report-progress'", user_report, nonuser_report, WORKER_EVENT_PREDICATE, "kind='edit' AND CASE WHEN json_valid(metadata_delta) THEN json_type(metadata_delta)<>'object' ELSE 1 END", "kind='edit' AND CASE WHEN json_valid(metadata_delta) THEN CASE WHEN json_type(metadata_delta,'$.scope_fields_changed')='array' THEN json_array_length(metadata_delta,'$.scope_fields_changed')>0 ELSE json_extract(metadata_delta,'$.scope_fields_changed') IS NOT NULL AND json_extract(metadata_delta,'$.scope_fields_changed') NOT IN (0,'') END ELSE 0 END", "kind IN ('place','create')"):
         query = "SELECT " + columns + " FROM (SELECT *,ROW_NUMBER() OVER (PARTITION BY card_id ORDER BY result_revision DESC,operation_id DESC) AS rn FROM kanban_events WHERE card_id IN (" + marks + ") AND result='accepted' AND " + predicate + ") WHERE rn=1"
         rows = [dict(row) for row in conn.execute(query, ids)]
         if predicate.startswith("kind IN"):
@@ -90,6 +93,9 @@ def _summaries(conn, cards):
                 data['queue_locations'][card['card_id']] = _location(by_id.get(card['card_id']), card['revision'])
         else:
             data['events'].extend(rows)
+    data['events'] = list({e['operation_id']: e for e in data['events']}.values())
+    for row in conn.execute("SELECT card_id, COUNT(*)>COUNT(DISTINCT result_revision) AS bad_worker FROM kanban_events WHERE card_id IN (" + marks + ") AND result='accepted' AND " + WORKER_EVENT_PREDICATE + " GROUP BY card_id", ids):
+        data['summary_flags'][row['card_id']]['bad_worker'] = row['bad_worker']
     def location_bad(raw, revision):
         return int(_location(json.loads(raw), revision) == 'unknown')
     conn.create_function('location_bad', 2, location_bad)
